@@ -124,7 +124,7 @@ pub struct Cli {
     #[arg(long = "from0", action = ArgAction::SetTrue, help = "Interpret files-from records as NUL-delimited")]
     from0: bool,
 
-    #[arg(long = "checksum", action = ArgAction::SetTrue, help = "Plan checksum-based updates")]
+    #[arg(short = 'c', long = "checksum", action = ArgAction::SetTrue, help = "Plan checksum-based updates")]
     checksum: bool,
 
     #[arg(long = "size-only", action = ArgAction::SetTrue, help = "Plan updates using file size only")]
@@ -747,6 +747,7 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     output.push_str(&format!("file bytes offered: {}\n", total_file_bytes));
     output.push_str(&format!("files sent: {}\n", stats.files));
     output.push_str(&format!("bytes sent: {}\n", stats.bytes));
+    append_remote_push_quick_check_note(&mut output, plan, file_count, total_file_bytes, stats);
     append_remote_messages(&mut output, &mux);
     Ok(output)
 }
@@ -826,6 +827,7 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     output.push_str(&format!("file bytes offered: {}\n", total_file_bytes));
     output.push_str(&format!("files sent: {}\n", stats.files));
     output.push_str(&format!("bytes sent: {}\n", stats.bytes));
+    append_remote_push_quick_check_note(&mut output, plan, file_count, total_file_bytes, stats);
     append_remote_messages(&mut output, &mux);
     Ok(output)
 }
@@ -1215,6 +1217,31 @@ fn remote_entries_file_summary(entries: &[RemoteSourceEntry]) -> (usize, u64) {
         .fold((0_usize, 0_u64), |(count, bytes), entry| {
             (count + 1, bytes + entry.wire.len)
         })
+}
+
+fn append_remote_push_quick_check_note(
+    output: &mut String,
+    plan: &TransferPlan,
+    file_count: usize,
+    total_file_bytes: u64,
+    stats: RemoteExecutionStats,
+) {
+    if plan.dry_run
+        || plan.update_mode != UpdateMode::QuickCheck
+        || file_count == 0
+        || total_file_bytes == 0
+        || stats.files != 0
+        || stats.bytes != 0
+    {
+        return;
+    }
+
+    output.push_str(
+        "transfer note: no file data was sent; remote quick-check treated the destination as up-to-date by size and mtime\n",
+    );
+    output.push_str(
+        "hint: if the remote file may be corrupt, rerun with -c/--checksum or --ignore-times to force content verification or retransmission\n",
+    );
 }
 
 fn log_source_storage_notes(progress: ProgressLog, sources: &[PathBuf]) {
@@ -3614,7 +3641,7 @@ mod tests {
         let output = parse_and_render([
             "rsync-win",
             "-r",
-            "--checksum",
+            "-c",
             "--numeric-ids",
             "--chmod",
             "F600,D700",
@@ -3735,6 +3762,37 @@ mod tests {
             .written
             .windows("file.txt".len())
             .any(|window| window == b"file.txt"));
+        assert!(!output.contains("transfer note: no file data was sent"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_push_protocol31_notes_when_quick_check_skips_all_file_data() {
+        let root = unique_temp_dir("rsync-cli-remote-push-quick-check-skip");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            source.to_string_lossy().into_owned(),
+            "host:/tmp/dest".to_string(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_push_dry_run_input());
+
+        let output = execute_remote_push(&cli, &plan, &mut transport).unwrap();
+
+        assert!(output.contains("files sent: 0"));
+        assert!(output.contains("bytes sent: 0"));
+        assert!(output.contains(
+            "transfer note: no file data was sent; remote quick-check treated the destination as up-to-date by size and mtime"
+        ));
+        assert!(output.contains(
+            "hint: if the remote file may be corrupt, rerun with -c/--checksum or --ignore-times"
+        ));
 
         fs::remove_dir_all(root).unwrap();
     }
