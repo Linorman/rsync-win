@@ -5,11 +5,11 @@
 
 `rsync-win` is a native Windows rsync-compatible command line application written in Rust. It aims to provide useful rsync-style local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
 
-This is an early development release. Version `v0.1.2` maps to Cargo package version `0.1.2` and focuses on ordinary files, directories, explicit metadata degradation, and a clean-room protocol implementation.
+This is an early development release. Version `v0.1.3` maps to Cargo package version `0.1.3` and focuses on ordinary files, directories, explicit metadata degradation, and a clean-room protocol implementation.
 
 ## Status
 
-| Area | v0.1.2 status |
+| Area | v0.1.3 status |
 | --- | --- |
 | Local Windows sync | Supported for ordinary files and directories, including multiple source operands. |
 | Recursion and mtimes | `-r`, `-t`, and `-a` planning are supported, with unsupported archive metadata reported. |
@@ -19,11 +19,11 @@ This is an early development release. Version `v0.1.2` maps to Cargo package ver
 | Large files | Local copies and remote whole-file token IO stream through bounded buffers instead of staging whole files in memory. |
 | Remote shell | Experimental ordinary-file push/pull path over SSH with protocol 31 work, protocol 27 compatibility fallback, and multiple local-source push support. |
 | Windows-native metadata | Long path, collision, link, and metadata policy work is in progress. |
-| Daemon mode | Planned, not implemented in v0.1.2. |
+| Daemon mode | Planned, not implemented in v0.1.3. |
 
 ## Install
 
-Download the Windows x64 zip from the `v0.1.2` GitHub Release, extract it, and run:
+Download the Windows x64 zip from the `v0.1.3` GitHub Release, extract it, and run:
 
 ```powershell
 .\rsync-win.exe --version
