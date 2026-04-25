@@ -1,0 +1,18 @@
+[package]
+name = "rsync-delta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+digest = { version = "0.10", optional = true }
+md4 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+
+[features]
+default = []
+md4 = ["dep:digest", "dep:md4"]
+md5 = ["dep:digest", "dep:md-5"]

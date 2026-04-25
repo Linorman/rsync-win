@@ -1,0 +1,25 @@
+[package]
+name = "rsync-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rsync-win"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rsync-core = { path = "../rsync-core" }
+rsync-filter = { path = "../rsync-filter" }
+rsync-fs = { path = "../rsync-fs" }
+rsync-protocol = { path = "../rsync-protocol" }
+rsync-transport = { path = "../rsync-transport" }
+rsync-winfs = { path = "../rsync-winfs" }
+
+[[test]]
+name = "interop_discovery"
+path = "../../tests/interop/rsync_discovery.rs"
