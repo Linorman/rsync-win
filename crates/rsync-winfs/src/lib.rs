@@ -1,7 +1,9 @@
+pub mod drive;
 pub mod links;
 pub mod metadata;
 pub mod path;
 
+pub use drive::{drive_kind_for_path, WindowsDriveKind};
 pub use links::{
     classify_reparse_point, detect_link_capabilities, should_traverse_reparse_point,
     LinkCapabilities, ReparsePointKind,

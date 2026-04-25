@@ -25,8 +25,8 @@ pub use session::{
     rsync_whole_file_checksum_reader, validate_protocol_stream_prefix, write_multiplex_data_frame,
     write_rsync_i32, write_rsync_long_value, MultiplexReadState, MultiplexedReader,
     MultiplexedWriter, RemoteSessionError, RemoteShellHandshake, RemoteShellOperand,
-    RemoteShellOptions, SessionError, TransferDirection, REMOTE_SHELL_MODERN_PROTOCOL,
-    REMOTE_SHELL_MVP_PROTOCOL,
+    RemoteShellOptions, RsyncMd4Checksum, SessionError, TransferDirection,
+    REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL,
 };
 pub use version::{
     negotiate_protocol_version, negotiate_protocol_version_with_local, ProtocolVersion,

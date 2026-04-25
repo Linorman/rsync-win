@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,14 +26,15 @@ use rsync_protocol::{
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_options, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, MultiplexReadState,
     MultiplexedReader, MultiplexedWriter, RemoteSessionError, RemoteShellOperand,
-    RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, TransferDirection, WireFileType,
-    MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
+    RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, RsyncMd4Checksum, TransferDirection,
+    WireFileType, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
     REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE, RSYNC_REGULAR_FILE_MODE,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
     spawn_ssh_remote_command, SshRemoteCommand,
 };
+use rsync_winfs::WindowsDriveKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliMetadataPolicy {
@@ -287,6 +288,16 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
         output.push_str(&format!("from0: {}\n", cli.from0));
     }
     output.push_str(&format!("operands: {}\n", cli.paths.len()));
+    if let Some(direction) = plan.remote_direction {
+        output.push_str(&format!(
+            "remote direction: {} ({})\n",
+            transfer_direction_label(direction),
+            match direction {
+                TransferDirection::Push => "local -> remote",
+                TransferDirection::Pull => "remote -> local",
+            }
+        ));
+    }
 
     if let Some(argv) = &plan.remote_server_argv {
         output.push_str("remote --server argv:");
@@ -369,6 +380,31 @@ struct RemoteExecutionStats {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProgressLog {
+    verbosity: u8,
+}
+
+impl ProgressLog {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            verbosity: cli.verbosity,
+        }
+    }
+
+    fn info(self, message: impl AsRef<str>) {
+        if self.verbosity > 0 {
+            eprintln!("rsync-win: {}", message.as_ref());
+        }
+    }
+
+    fn detail(self, message: impl AsRef<str>) {
+        if self.verbosity > 1 {
+            eprintln!("rsync-win: {}", message.as_ref());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteWireProtocol {
     Compat27,
@@ -388,6 +424,13 @@ impl RemoteWireProtocol {
             Self::Compat27 => "protocol 27 compatibility mode",
             Self::Modern31 => "protocol 31 ordinary-file MVP",
         }
+    }
+}
+
+fn transfer_direction_label(direction: TransferDirection) -> &'static str {
+    match direction {
+        TransferDirection::Push => "upload",
+        TransferDirection::Pull => "download",
     }
 }
 
@@ -421,6 +464,7 @@ enum RemoteFileChecksum {
 fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     ensure_remote_execution_options_supported(cli, &plan)?;
 
+    let progress = ProgressLog::from_cli(cli);
     let direction = plan
         .remote_direction
         .context("remote-shell direction was not planned")?;
@@ -428,6 +472,11 @@ fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         .remote_ssh_command
         .as_ref()
         .context("remote-shell command was not planned")?;
+    progress.info(format!(
+        "remote-shell {} starting via {}",
+        transfer_direction_label(direction),
+        command.display_command()
+    ));
 
     let mut transport = spawn_ssh_remote_command(command)
         .with_context(|| format!("failed to spawn {}", command.display_command()))?;
@@ -479,6 +528,11 @@ fn execute_remote_shell_protocol27_fallback(
     direction: TransferDirection,
 ) -> Result<String> {
     let command = build_protocol27_fallback_command(cli, plan, direction)?;
+    ProgressLog::from_cli(cli).info(format!(
+        "remote-shell protocol 31 was not accepted; retrying {} via {}",
+        transfer_direction_label(direction),
+        command.display_command()
+    ));
     let mut transport = spawn_ssh_remote_command(&command)
         .with_context(|| format!("failed to spawn {}", command.display_command()))?;
 
@@ -625,8 +679,11 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
+    let progress = ProgressLog::from_cli(cli);
     let sources = local_source_paths(cli);
+    log_source_storage_notes(progress, &sources);
     let files_from = load_files_from(cli)?;
+    progress.info("building local file list for upload");
     let entries = collect_local_source_entries(
         &sources,
         plan.recursive,
@@ -636,8 +693,19 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         plan.update_mode == UpdateMode::Checksum,
     )?;
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
+    let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
+    progress.info(format!(
+        "upload file list ready: {} entries, {} files, {} bytes",
+        entries.len(),
+        file_count,
+        total_file_bytes
+    ));
 
     let handshake = exchange_remote_shell_mvp_handshake(transport)?;
+    progress.info(format!(
+        "remote rsync protocol {} negotiated",
+        handshake.selected_protocol.value()
+    ));
     if plan.delete {
         write_rsync_i32(transport, 0)?;
     }
@@ -656,6 +724,7 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         &entries,
         handshake.checksum_seed,
         plan.dry_run,
+        progress,
     )?;
 
     let remote = plan
@@ -664,7 +733,9 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         .context("remote operand was not planned")?;
     let mut output = String::new();
     output.push_str("rsync-win remote-shell push\n");
+    output.push_str("direction: upload (local -> remote)\n");
     append_sources_summary(&mut output, &sources);
+    append_source_storage_notes(&mut output, &sources);
     output.push_str(&format!("destination: {}:{}\n", remote.host, remote.path));
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
@@ -673,6 +744,7 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     ));
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     output.push_str(&format!("files offered: {}\n", entries.len()));
+    output.push_str(&format!("file bytes offered: {}\n", total_file_bytes));
     output.push_str(&format!("files sent: {}\n", stats.files));
     output.push_str(&format!("bytes sent: {}\n", stats.bytes));
     append_remote_messages(&mut output, &mux);
@@ -684,8 +756,11 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
+    let progress = ProgressLog::from_cli(cli);
     let sources = local_source_paths(cli);
+    log_source_storage_notes(progress, &sources);
     let files_from = load_files_from(cli)?;
+    progress.info("building local file list for upload");
     let entries = collect_local_source_entries(
         &sources,
         plan.recursive,
@@ -695,8 +770,19 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         plan.update_mode == UpdateMode::Checksum,
     )?;
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
+    let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
+    progress.info(format!(
+        "upload file list ready: {} entries, {} files, {} bytes",
+        entries.len(),
+        file_count,
+        total_file_bytes
+    ));
 
     let handshake = exchange_remote_shell_protocol31_handshake(transport)?;
+    progress.info(format!(
+        "remote rsync protocol {} negotiated",
+        handshake.selected_protocol.value()
+    ));
     {
         let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
         write_rsync31_file_list_with_options(
@@ -714,6 +800,7 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         &entries,
         plan.dry_run,
         plan.append_verify,
+        progress,
     )?;
 
     let remote = plan
@@ -722,7 +809,9 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         .context("remote operand was not planned")?;
     let mut output = String::new();
     output.push_str("rsync-win remote-shell push\n");
+    output.push_str("direction: upload (local -> remote)\n");
     append_sources_summary(&mut output, &sources);
+    append_source_storage_notes(&mut output, &sources);
     output.push_str(&format!("destination: {}:{}\n", remote.host, remote.path));
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
@@ -734,6 +823,7 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     }
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     output.push_str(&format!("files offered: {}\n", entries.len()));
+    output.push_str(&format!("file bytes offered: {}\n", total_file_bytes));
     output.push_str(&format!("files sent: {}\n", stats.files));
     output.push_str(&format!("bytes sent: {}\n", stats.bytes));
     append_remote_messages(&mut output, &mux);
@@ -870,6 +960,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
         .context("remote operand was not planned")?;
     let mut output = String::new();
     output.push_str("rsync-win remote-shell pull\n");
+    output.push_str("direction: download (remote -> local)\n");
     output.push_str(&format!("source: {}:{}\n", remote.host, remote.path));
     output.push_str(&format!("destination: {}\n", dest.display()));
     output.push_str(&format!(
@@ -1017,6 +1108,7 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
         .context("remote operand was not planned")?;
     let mut output = String::new();
     output.push_str("rsync-win remote-shell pull\n");
+    output.push_str("direction: download (remote -> local)\n");
     output.push_str(&format!("source: {}:{}\n", remote.host, remote.path));
     output.push_str(&format!("destination: {}\n", dest.display()));
     output.push_str(&format!(
@@ -1114,6 +1206,43 @@ fn append_sources_summary(output: &mut String, sources: &[PathBuf]) {
     for source in sources {
         output.push_str(&format!("- source {}\n", source.display()));
     }
+}
+
+fn remote_entries_file_summary(entries: &[RemoteSourceEntry]) -> (usize, u64) {
+    entries
+        .iter()
+        .filter(|entry| entry.wire.file_type == WireFileType::File)
+        .fold((0_usize, 0_u64), |(count, bytes), entry| {
+            (count + 1, bytes + entry.wire.len)
+        })
+}
+
+fn log_source_storage_notes(progress: ProgressLog, sources: &[PathBuf]) {
+    for note in source_storage_notes(sources) {
+        progress.info(note);
+    }
+}
+
+fn append_source_storage_notes(output: &mut String, sources: &[PathBuf]) {
+    for note in source_storage_notes(sources) {
+        output.push_str(&format!("{note}\n"));
+    }
+}
+
+fn source_storage_notes(sources: &[PathBuf]) -> Vec<String> {
+    sources
+        .iter()
+        .filter_map(|source| {
+            if rsync_winfs::drive_kind_for_path(source) == Some(WindowsDriveKind::Remote) {
+                Some(format!(
+                    "source storage: {} is on a Windows network drive; rsync-win reads it while uploading",
+                    source.display()
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn load_files_from(cli: &Cli) -> Result<Option<Vec<PathBuf>>> {
@@ -1496,6 +1625,7 @@ fn serve_remote_receiver_requests<T: Read + Write>(
     entries: &[RemoteSourceEntry],
     checksum_seed: i32,
     dry_run: bool,
+    progress: ProgressLog,
 ) -> Result<RemoteExecutionStats> {
     let mut phase_markers = 0_usize;
     let mut stats = RemoteExecutionStats::default();
@@ -1519,6 +1649,10 @@ fn serve_remote_receiver_requests<T: Read + Write>(
         }
 
         if dry_run {
+            progress.detail(format!(
+                "dry-run upload request for {}",
+                entry.wire.path.display()
+            ));
             write_rsync_i32(transport, index)?;
             stats.files += 1;
             continue;
@@ -1535,11 +1669,21 @@ fn serve_remote_receiver_requests<T: Read + Write>(
         write_rsync_i32(transport, block_len as i32)?;
         write_rsync_i32(transport, checksum_len as i32)?;
         write_rsync_i32(transport, remainder as i32)?;
+        progress.info(format!(
+            "uploading {} ({} bytes)",
+            entry.wire.path.display(),
+            entry.wire.len
+        ));
         let literal_bytes = write_file_tokens_from_path(
             transport,
             RemoteFileChecksum::SeededMd4(checksum_seed),
             &entry.local_path,
         )?;
+        progress.info(format!(
+            "uploaded {} ({} bytes)",
+            entry.wire.path.display(),
+            literal_bytes
+        ));
         stats.files += 1;
         stats.bytes += literal_bytes;
     }
@@ -1570,6 +1714,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
     entries: &[RemoteSourceEntry],
     dry_run: bool,
     append_verify: bool,
+    progress: ProgressLog,
 ) -> Result<RemoteExecutionStats> {
     let mut read_index_state = RsyncIndexState::default();
     let mut write_index_state = RsyncIndexState::default();
@@ -1625,6 +1770,10 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             return Err(RemoteSessionError::NonFileBlockRequest { index: entry_index }.into());
         }
         if dry_run {
+            progress.detail(format!(
+                "dry-run upload request for {}",
+                entry.wire.path.display()
+            ));
             let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
             write_rsync_index(&mut writer, &mut write_index_state, index)?;
             write_u16_le(&mut writer, iflags)?;
@@ -1653,6 +1802,12 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             write_u16_le(&mut writer, iflags)?;
             write_rsync31_optional_item_attrs(&mut writer, iflags, &attrs)?;
             write_sum_head(&mut writer, sum_head)?;
+            progress.info(format!(
+                "uploading {} ({} bytes{})",
+                entry.wire.path.display(),
+                entry.wire.len,
+                if append_verify { ", append-verify" } else { "" }
+            ));
             let literal_bytes = if append_verify {
                 write_append_verify_file_tokens_from_path(
                     &mut writer,
@@ -1668,6 +1823,11 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                 )?
             };
             writer.flush()?;
+            progress.info(format!(
+                "uploaded {} ({} bytes sent)",
+                entry.wire.path.display(),
+                literal_bytes
+            ));
             stats.bytes += literal_bytes;
         }
         stats.files += 1;
@@ -2348,10 +2508,9 @@ fn write_file_tokens_from_path<T: Write>(
     checksum: RemoteFileChecksum,
     path: &Path,
 ) -> Result<u64> {
-    let whole_file_checksum = remote_file_checksum_for_path(checksum, path)?;
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    write_literal_tokens_from_reader_with_checksum(transport, &mut file, whole_file_checksum)
+    write_literal_tokens_from_reader_with_checksum(transport, &mut file, checksum)
 }
 
 fn write_append_verify_file_tokens_from_path<T: Write>(
@@ -2360,19 +2519,19 @@ fn write_append_verify_file_tokens_from_path<T: Write>(
     path: &Path,
     prefix_len: usize,
 ) -> Result<u64> {
-    let whole_file_checksum = remote_file_checksum_for_path(checksum, path)?;
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    file.seek(SeekFrom::Start(prefix_len as u64))
-        .with_context(|| format!("failed to seek {}", path.display()))?;
-    write_literal_tokens_from_reader_with_checksum(transport, &mut file, whole_file_checksum)
+    write_append_verify_literal_tokens_from_reader_with_checksum(
+        transport, &mut file, checksum, prefix_len,
+    )
 }
 
 fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
     transport: &mut T,
     reader: &mut R,
-    whole_file_checksum: [u8; 16],
+    checksum: RemoteFileChecksum,
 ) -> Result<u64> {
+    let mut checksum = remote_file_checksum_builder(checksum);
     let mut buf = [0_u8; 32 * 1024];
     let mut total = 0_u64;
     loop {
@@ -2380,13 +2539,60 @@ fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
         if read == 0 {
             break;
         }
+        checksum.update(&buf[..read]);
         write_rsync_i32(transport, read as i32)?;
         transport.write_all(&buf[..read])?;
         total += read as u64;
     }
     write_rsync_i32(transport, 0)?;
-    transport.write_all(&whole_file_checksum)?;
+    transport.write_all(&checksum.finalize())?;
     Ok(total)
+}
+
+fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
+    transport: &mut T,
+    reader: &mut R,
+    checksum: RemoteFileChecksum,
+    prefix_len: usize,
+) -> Result<u64> {
+    let mut checksum = remote_file_checksum_builder(checksum);
+    let mut buf = [0_u8; 32 * 1024];
+    let mut remaining_prefix = prefix_len;
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buf[..read];
+        checksum.update(chunk);
+        let literal = if remaining_prefix >= read {
+            remaining_prefix -= read;
+            continue;
+        } else if remaining_prefix > 0 {
+            let offset = remaining_prefix;
+            remaining_prefix = 0;
+            &chunk[offset..]
+        } else {
+            chunk
+        };
+        write_rsync_i32(transport, literal.len() as i32)?;
+        transport.write_all(literal)?;
+        total += literal.len() as u64;
+    }
+    if remaining_prefix > 0 {
+        bail!("append-verify prefix length exceeds source file length");
+    }
+    write_rsync_i32(transport, 0)?;
+    transport.write_all(&checksum.finalize())?;
+    Ok(total)
+}
+
+fn remote_file_checksum_builder(checksum: RemoteFileChecksum) -> RsyncMd4Checksum {
+    match checksum {
+        RemoteFileChecksum::SeededMd4(seed) => RsyncMd4Checksum::seeded(seed),
+        RemoteFileChecksum::PlainMd4 => RsyncMd4Checksum::plain(),
+    }
 }
 
 fn read_file_tokens_to_path<T: Read>(
@@ -3222,7 +3428,7 @@ mod tests {
     fn renders_version_with_protocol_range() {
         let output = parse_and_render(["rsync-win", "--version"]);
 
-        assert!(output.contains("rsync-win 0.1.1"));
+        assert!(output.contains("rsync-win 0.1.2"));
         assert!(output.contains("protocol primitives range: 20-32"));
     }
 
@@ -3293,12 +3499,58 @@ mod tests {
         ]);
 
         assert!(output.contains("compress: true"));
+        assert!(output.contains("remote direction: upload (local -> remote)"));
         assert!(output.contains("remote ssh argv: ssh -p 10080 root@118.145.32.132"));
         assert!(output.contains("[info] I_REMOTE_SHELL"));
         assert!(output.contains("[warning] W_COMPRESS_UNSUPPORTED"));
         assert!(!output.contains("BatchMode=yes"));
         assert!(!output.contains("W_METADATA_OWNER"));
         assert!(!output.contains("W_METADATA_GROUP"));
+    }
+
+    #[test]
+    fn literal_token_writer_checksums_while_streaming() {
+        let mut output = Vec::new();
+        let mut input = &b"abcdef"[..];
+
+        let sent = write_literal_tokens_from_reader_with_checksum(
+            &mut output,
+            &mut input,
+            RemoteFileChecksum::PlainMd4,
+        )
+        .unwrap();
+
+        assert_eq!(sent, 6);
+        assert_eq!(i32::from_le_bytes(output[0..4].try_into().unwrap()), 6);
+        assert_eq!(&output[4..10], b"abcdef");
+        assert_eq!(i32::from_le_bytes(output[10..14].try_into().unwrap()), 0);
+        assert_eq!(
+            &output[14..30],
+            &rsync_protocol::rsync_plain_md4_checksum(b"abcdef")
+        );
+    }
+
+    #[test]
+    fn append_verify_token_writer_sends_suffix_but_checksums_whole_file() {
+        let mut output = Vec::new();
+        let mut input = &b"abcdef"[..];
+
+        let sent = write_append_verify_literal_tokens_from_reader_with_checksum(
+            &mut output,
+            &mut input,
+            RemoteFileChecksum::PlainMd4,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(sent, 3);
+        assert_eq!(i32::from_le_bytes(output[0..4].try_into().unwrap()), 3);
+        assert_eq!(&output[4..7], b"def");
+        assert_eq!(i32::from_le_bytes(output[7..11].try_into().unwrap()), 0);
+        assert_eq!(
+            &output[11..27],
+            &rsync_protocol::rsync_plain_md4_checksum(b"abcdef")
+        );
     }
 
     #[test]
