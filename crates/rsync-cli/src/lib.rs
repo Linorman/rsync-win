@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
@@ -434,7 +434,8 @@ fn transfer_direction_label(direction: TransferDirection) -> &'static str {
     }
 }
 
-const RSYNC31_MUX_FRAME_SIZE: usize = 32 * 1024;
+const RSYNC31_MUX_FRAME_SIZE: usize = 256 * 1024;
+const FILE_TOKEN_BUFFER_SIZE: usize = 256 * 1024;
 const RSYNC_ITEM_BASIS_TYPE_FOLLOWS: u16 = 1 << 11;
 const RSYNC_ITEM_XNAME_FOLLOWS: u16 = 1 << 12;
 const RSYNC_ITEM_IS_NEW: u16 = 1 << 13;
@@ -1219,6 +1220,15 @@ fn remote_entries_file_summary(entries: &[RemoteSourceEntry]) -> (usize, u64) {
         })
 }
 
+fn transfer_rate_label(bytes: u64, elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= f64::EPSILON {
+        return "instant".to_string();
+    }
+
+    format!("{:.2} MiB/s", bytes as f64 / seconds / 1024.0 / 1024.0)
+}
+
 fn append_remote_push_quick_check_note(
     output: &mut String,
     plan: &TransferPlan,
@@ -1262,7 +1272,7 @@ fn source_storage_notes(sources: &[PathBuf]) -> Vec<String> {
         .filter_map(|source| {
             if rsync_winfs::drive_kind_for_path(source) == Some(WindowsDriveKind::Remote) {
                 Some(format!(
-                    "source storage: {} is on a Windows network drive; rsync-win reads it while uploading",
+                    "source storage: {} is on a Windows network drive; upload must first read bytes from that mapped drive, so Windows may show inbound/download traffic while rsync-win sends them over SSH",
                     source.display()
                 ))
             } else {
@@ -1701,15 +1711,19 @@ fn serve_remote_receiver_requests<T: Read + Write>(
             entry.wire.path.display(),
             entry.wire.len
         ));
+        let started = Instant::now();
         let literal_bytes = write_file_tokens_from_path(
             transport,
             RemoteFileChecksum::SeededMd4(checksum_seed),
             &entry.local_path,
         )?;
+        let elapsed = started.elapsed();
         progress.info(format!(
-            "uploaded {} ({} bytes)",
+            "uploaded {} ({} bytes sent in {:.2}s, {})",
             entry.wire.path.display(),
-            literal_bytes
+            literal_bytes,
+            elapsed.as_secs_f64(),
+            transfer_rate_label(literal_bytes, elapsed)
         ));
         stats.files += 1;
         stats.bytes += literal_bytes;
@@ -1835,6 +1849,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                 entry.wire.len,
                 if append_verify { ", append-verify" } else { "" }
             ));
+            let started = Instant::now();
             let literal_bytes = if append_verify {
                 write_append_verify_file_tokens_from_path(
                     &mut writer,
@@ -1850,10 +1865,13 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                 )?
             };
             writer.flush()?;
+            let elapsed = started.elapsed();
             progress.info(format!(
-                "uploaded {} ({} bytes sent)",
+                "uploaded {} ({} bytes sent in {:.2}s, {})",
                 entry.wire.path.display(),
-                literal_bytes
+                literal_bytes,
+                elapsed.as_secs_f64(),
+                transfer_rate_label(literal_bytes, elapsed)
             ));
             stats.bytes += literal_bytes;
         }
@@ -2559,7 +2577,7 @@ fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
     checksum: RemoteFileChecksum,
 ) -> Result<u64> {
     let mut checksum = remote_file_checksum_builder(checksum);
-    let mut buf = [0_u8; 32 * 1024];
+    let mut buf = vec![0_u8; FILE_TOKEN_BUFFER_SIZE];
     let mut total = 0_u64;
     loop {
         let read = reader.read(&mut buf)?;
@@ -2583,7 +2601,7 @@ fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Rea
     prefix_len: usize,
 ) -> Result<u64> {
     let mut checksum = remote_file_checksum_builder(checksum);
-    let mut buf = [0_u8; 32 * 1024];
+    let mut buf = vec![0_u8; FILE_TOKEN_BUFFER_SIZE];
     let mut remaining_prefix = prefix_len;
     let mut total = 0_u64;
     loop {
@@ -2636,7 +2654,7 @@ fn read_file_tokens_to_path<T: Read>(
     let mut output = File::create(output_path)
         .with_context(|| format!("failed to create {}", output_path.display()))?;
     let mut total = 0_u64;
-    let mut buf = [0_u8; 32 * 1024];
+    let mut buf = vec![0_u8; FILE_TOKEN_BUFFER_SIZE];
 
     loop {
         let token = read_multiplexed_i32(transport, mux)?;

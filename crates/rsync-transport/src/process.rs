@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::{self, JoinHandle};
 
@@ -22,7 +22,7 @@ pub enum ProcessTransportError {
 #[derive(Debug)]
 pub struct ChildTransport {
     child: Child,
-    stdin: Option<ChildStdin>,
+    stdin: Option<BufWriter<ChildStdin>>,
     stdout: ChildStdout,
     stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
 }
@@ -60,14 +60,16 @@ impl ChildTransport {
 
         Ok(Self {
             child,
-            stdin: Some(stdin),
+            stdin: Some(BufWriter::with_capacity(1024 * 1024, stdin)),
             stdout,
             stderr: Some(drain_stderr(stderr)),
         })
     }
 
     pub fn finish_input(&mut self) {
-        self.stdin.take();
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = stdin.flush();
+        }
     }
 
     pub fn wait(mut self) -> io::Result<std::process::ExitStatus> {
