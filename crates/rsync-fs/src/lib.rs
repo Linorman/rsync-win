@@ -7,8 +7,8 @@ pub use metadata::{
     PortableMetadata,
 };
 pub use sync::{
-    source_relative_paths, sync_tree, DestinationPathPreflight, SymlinkMode, SyncAction,
-    SyncOptions, SyncReport, UpdateMode,
+    source_relative_paths, sync_sources, sync_tree, DestinationPathPreflight, SymlinkMode,
+    SyncAction, SyncOptions, SyncReport, UpdateMode,
 };
 pub use walk::{
     walk_tree, FileWriteMode, FileWriteOptions, FsError, LocalFileSystem, MemoryFileSystem,

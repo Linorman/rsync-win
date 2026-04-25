@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,7 +14,7 @@ use rsync_filter::{
     normalize_files_from_records, parse_files_from_bytes, EntryKind, Rule, RuleAction, RuleSet,
 };
 use rsync_fs::{
-    sync_tree, walk_tree, FileType, FileWriteMode, FileWriteOptions, FsError, LocalFileSystem,
+    sync_sources, walk_tree, FileType, FileWriteMode, FileWriteOptions, FsError, LocalFileSystem,
     PortableFileSystem, SymlinkMode, SyncAction, SyncOptions, UpdateMode,
 };
 use rsync_protocol::{
@@ -21,7 +22,7 @@ use rsync_protocol::{
     exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake, read_i32_le,
     read_multiplexed_i32, read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
-    read_vstring, rsync_plain_md4_checksum, rsync_whole_file_checksum, write_i32_le,
+    read_vstring, rsync_plain_md4_checksum_reader, rsync_whole_file_checksum_reader, write_i32_le,
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_options, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, MultiplexReadState,
     MultiplexedReader, MultiplexedWriter, RemoteSessionError, RemoteShellOperand,
@@ -30,7 +31,8 @@ use rsync_protocol::{
     REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE, RSYNC_REGULAR_FILE_MODE,
 };
 use rsync_transport::remote_shell::{
-    build_ssh_remote_command, default_ssh_program, spawn_ssh_remote_command, SshRemoteCommand,
+    build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
+    spawn_ssh_remote_command, SshRemoteCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -84,6 +86,9 @@ pub struct Cli {
 
     #[arg(long = "whole-file", action = ArgAction::SetTrue, help = "Use whole-file transfer planning")]
     whole_file: bool,
+
+    #[arg(short = 'z', long = "compress", action = ArgAction::SetTrue, help = "Accept rsync compression syntax; compression is not applied yet")]
+    compress: bool,
 
     #[arg(short = 'v', action = ArgAction::Count, help = "Increase verbosity")]
     verbosity: u8,
@@ -145,11 +150,25 @@ pub struct Cli {
     #[arg(long = "numeric-ids", action = ArgAction::SetTrue, help = "Use numeric owner/group ids when supported")]
     numeric_ids: bool,
 
+    #[arg(long = "no-o", alias = "no-owner", action = ArgAction::SetTrue, help = "Disable owner preservation requested by archive mode")]
+    no_owner: bool,
+
+    #[arg(long = "no-g", alias = "no-group", action = ArgAction::SetTrue, help = "Disable group preservation requested by archive mode")]
+    no_group: bool,
+
     #[arg(
         long = "chmod",
         help = "Requested chmod expression, reported until implemented"
     )]
     chmod: Option<String>,
+
+    #[arg(
+        short = 'e',
+        long = "rsh",
+        value_name = "COMMAND",
+        help = "Specify the remote shell command, e.g. \"ssh -p 10080\""
+    )]
+    remote_shell: Option<String>,
 
     #[arg(long = "copy-links", action = ArgAction::SetTrue, help = "Copy symlink referents")]
     copy_links: bool,
@@ -236,6 +255,7 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
     output.push_str(&format!("delete: {}\n", plan.delete));
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     output.push_str(&format!("whole file: {}\n", plan.whole_file));
+    output.push_str(&format!("compress: {}\n", cli.compress));
     output.push_str(&format!("verbosity: {}\n", plan.verbosity));
     output.push_str(&format!("itemize changes: {}\n", cli.itemize_changes));
     output.push_str(&format!("stats: {}\n", cli.stats));
@@ -278,7 +298,6 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
     }
     if let Some(argv) = &plan.remote_ssh_argv {
         output.push_str("remote ssh argv:");
-        output.push_str(" ssh");
         for arg in argv {
             output.push(' ');
             output.push_str(arg);
@@ -312,7 +331,7 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
 }
 
 fn execute_or_render(cli: &Cli) -> Result<String> {
-    if cli.version || cli.protocol_range || cli.plan || cli.paths.len() != 2 {
+    if cli.version || cli.protocol_range || cli.plan || cli.paths.len() < 2 {
         return Ok(render_output(cli));
     }
 
@@ -459,7 +478,7 @@ fn execute_remote_shell_protocol27_fallback(
     plan: &TransferPlan,
     direction: TransferDirection,
 ) -> Result<String> {
-    let command = build_protocol27_fallback_command(plan, direction)?;
+    let command = build_protocol27_fallback_command(cli, plan, direction)?;
     let mut transport = spawn_ssh_remote_command(&command)
         .with_context(|| format!("failed to spawn {}", command.display_command()))?;
 
@@ -503,6 +522,7 @@ fn execute_remote_shell_protocol27_fallback(
 }
 
 fn build_protocol27_fallback_command(
+    cli: &Cli,
     plan: &TransferPlan,
     direction: TransferDirection,
 ) -> Result<SshRemoteCommand> {
@@ -553,10 +573,26 @@ fn build_protocol27_fallback_command(
         },
         Path::new(&remote.path),
     )?;
+    build_remote_transport_command(cli, &remote.host, &argv)
+}
+
+fn build_remote_transport_command(
+    cli: &Cli,
+    host: &str,
+    remote_server_argv: &[String],
+) -> Result<SshRemoteCommand> {
+    if let Some(remote_shell) = &cli.remote_shell {
+        return Ok(build_custom_remote_shell_command(
+            remote_shell,
+            host,
+            remote_server_argv,
+        )?);
+    }
+
     Ok(build_ssh_remote_command(
         default_ssh_program().into_os_string(),
-        &remote.host,
-        &argv,
+        host,
+        remote_server_argv,
     ))
 }
 
@@ -589,10 +625,10 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
-    let source = Path::new(&cli.paths[0]);
+    let sources = local_source_paths(cli);
     let files_from = load_files_from(cli)?;
     let entries = collect_local_source_entries(
-        source,
+        &sources,
         plan.recursive,
         &plan.filter_rules,
         files_from.as_deref(),
@@ -628,7 +664,7 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         .context("remote operand was not planned")?;
     let mut output = String::new();
     output.push_str("rsync-win remote-shell push\n");
-    output.push_str(&format!("source: {}\n", source.display()));
+    append_sources_summary(&mut output, &sources);
     output.push_str(&format!("destination: {}:{}\n", remote.host, remote.path));
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
@@ -648,10 +684,10 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
-    let source = Path::new(&cli.paths[0]);
+    let sources = local_source_paths(cli);
     let files_from = load_files_from(cli)?;
     let entries = collect_local_source_entries(
-        source,
+        &sources,
         plan.recursive,
         &plan.filter_rules,
         files_from.as_deref(),
@@ -686,7 +722,7 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         .context("remote operand was not planned")?;
     let mut output = String::new();
     output.push_str("rsync-win remote-shell push\n");
-    output.push_str(&format!("source: {}\n", source.display()));
+    append_sources_summary(&mut output, &sources);
     output.push_str(&format!("destination: {}:{}\n", remote.host, remote.path));
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
@@ -1009,13 +1045,13 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
 }
 
 fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
-    let source = Path::new(&cli.paths[0]);
-    let dest = Path::new(&cli.paths[1]);
+    let sources = local_source_paths(cli);
+    let dest = Path::new(cli.paths.last().expect("checked operand count"));
     let files_from = load_files_from(cli)?;
     let mut fs = LocalFileSystem;
-    let sync_report = sync_tree(
+    let sync_report = sync_sources(
         &mut fs,
-        source,
+        &sources,
         dest,
         SyncOptions {
             recursive: plan.recursive,
@@ -1036,7 +1072,7 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
 
     let mut output = String::new();
     output.push_str("rsync-win local portable sync\n");
-    output.push_str(&format!("source: {}\n", source.display()));
+    append_sources_summary(&mut output, &sources);
     output.push_str(&format!("destination: {}\n", dest.display()));
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     output.push_str(&format!("metadata policy: {}\n", plan.metadata_policy));
@@ -1061,6 +1097,25 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     Ok(output)
 }
 
+fn local_source_paths(cli: &Cli) -> Vec<PathBuf> {
+    cli.paths[..cli.paths.len() - 1]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn append_sources_summary(output: &mut String, sources: &[PathBuf]) {
+    if sources.len() == 1 {
+        output.push_str(&format!("source: {}\n", sources[0].display()));
+        return;
+    }
+
+    output.push_str(&format!("sources: {}\n", sources.len()));
+    for source in sources {
+        output.push_str(&format!("- source {}\n", source.display()));
+    }
+}
+
 fn load_files_from(cli: &Cli) -> Result<Option<Vec<PathBuf>>> {
     let Some(path) = &cli.files_from else {
         return Ok(None);
@@ -1073,6 +1128,35 @@ fn load_files_from(cli: &Cli) -> Result<Option<Vec<PathBuf>>> {
 }
 
 fn collect_local_source_entries(
+    sources: &[PathBuf],
+    recursive: bool,
+    filter_rules: &RuleSet,
+    files_from: Option<&[PathBuf]>,
+    symlink_mode: SymlinkMode,
+    include_checksums: bool,
+) -> Result<Vec<RemoteSourceEntry>> {
+    if sources.len() == 1 {
+        return collect_single_local_source_entries(
+            &sources[0],
+            recursive,
+            filter_rules,
+            files_from,
+            symlink_mode,
+            include_checksums,
+        );
+    }
+
+    collect_batch_local_source_entries(
+        sources,
+        recursive,
+        filter_rules,
+        files_from,
+        symlink_mode,
+        include_checksums,
+    )
+}
+
+fn collect_single_local_source_entries(
     source: &Path,
     recursive: bool,
     filter_rules: &RuleSet,
@@ -1140,6 +1224,88 @@ fn collect_local_source_entries(
         Path::new(""),
         &mut entries,
     )?;
+
+    entries.sort_by(|left, right| left.wire.path.cmp(&right.wire.path));
+    Ok(entries)
+}
+
+fn collect_batch_local_source_entries(
+    sources: &[PathBuf],
+    recursive: bool,
+    filter_rules: &RuleSet,
+    files_from: Option<&[PathBuf]>,
+    symlink_mode: SymlinkMode,
+    include_checksums: bool,
+) -> Result<Vec<RemoteSourceEntry>> {
+    let fs = LocalFileSystem;
+    let mut entries = Vec::new();
+    for source in sources {
+        let file_name = source
+            .file_name()
+            .with_context(|| format!("source has no file name: {}", source.display()))?;
+        let relative = PathBuf::from(file_name);
+        let original_metadata = fs.metadata(source)?;
+        let Some(metadata) =
+            remote_sender_metadata(&fs, source, original_metadata.clone(), symlink_mode)?
+        else {
+            continue;
+        };
+
+        let (file_type, mode) = match metadata.file_type {
+            FileType::Directory => (WireFileType::Directory, RSYNC_DIRECTORY_MODE),
+            FileType::File => (WireFileType::File, RSYNC_REGULAR_FILE_MODE),
+            other => {
+                bail!(
+                    "remote-shell MVP does not transfer {:?}: {}",
+                    other,
+                    source.display()
+                )
+            }
+        };
+
+        if remote_source_path_is_filtered(filter_rules, &relative, file_type)
+            || files_from.is_some_and(|files_from| !files_from_matches(&relative, files_from))
+        {
+            continue;
+        }
+
+        entries.push(RemoteSourceEntry {
+            wire: RsyncFileListEntry {
+                path: relative.clone(),
+                file_type,
+                len: if file_type == WireFileType::File {
+                    metadata.len
+                } else {
+                    0
+                },
+                mtime_unix: system_time_to_unix(metadata.modified),
+                mode,
+                checksum: (include_checksums && file_type == WireFileType::File)
+                    .then(|| checksum_local_path(source))
+                    .transpose()?,
+            },
+            local_path: source.clone(),
+        });
+
+        if recursive && file_type == WireFileType::Directory {
+            let child_root =
+                remote_followed_directory_path(source, &original_metadata, &metadata, symlink_mode)
+                    .unwrap_or_else(|| source.clone());
+            collect_local_directory_source_entries(
+                &LocalSourceCollectContext {
+                    fs: &fs,
+                    recursive,
+                    filter_rules,
+                    files_from,
+                    symlink_mode,
+                    include_checksums,
+                },
+                &child_root,
+                &relative,
+                &mut entries,
+            )?;
+        }
+    }
 
     entries.sort_by(|left, right| left.wire.path.cmp(&right.wire.path));
     Ok(entries)
@@ -1318,9 +1484,10 @@ fn is_unsafe_symlink_target(target: &Path) -> bool {
 }
 
 fn checksum_local_path(path: &Path) -> Result<[u8; 16]> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(rsync_plain_md4_checksum(&bytes))
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    rsync_plain_md4_checksum_reader(&mut file)
+        .with_context(|| format!("failed to checksum {}", path.display()))
 }
 
 fn serve_remote_receiver_requests<T: Read + Write>(
@@ -1363,20 +1530,18 @@ fn serve_remote_receiver_requests<T: Read + Write>(
         let remainder = read_nonnegative_multiplexed_i32(transport, mux, "remainder length")?;
         skip_remote_block_signatures(transport, mux, block_count, checksum_len)?;
 
-        let bytes = std::fs::read(&entry.local_path)
-            .with_context(|| format!("failed to read {}", entry.local_path.display()))?;
         write_rsync_i32(transport, index)?;
         write_rsync_i32(transport, block_count as i32)?;
         write_rsync_i32(transport, block_len as i32)?;
         write_rsync_i32(transport, checksum_len as i32)?;
         write_rsync_i32(transport, remainder as i32)?;
-        write_file_tokens(
+        let literal_bytes = write_file_tokens_from_path(
             transport,
             RemoteFileChecksum::SeededMd4(checksum_seed),
-            &bytes,
+            &entry.local_path,
         )?;
         stats.files += 1;
-        stats.bytes += bytes.len() as u64;
+        stats.bytes += literal_bytes;
     }
 
     write_rsync_long_value(transport, 0)?;
@@ -1468,12 +1633,11 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             continue;
         }
 
-        let bytes = std::fs::read(&entry.local_path)
-            .with_context(|| format!("failed to read {}", entry.local_path.display()))?;
         let sum_head = sum_head.context("remote protocol 31 transfer request omitted sum head")?;
         let append_prefix_len = if append_verify {
             let prefix_len = remote_sum_head_file_len(sum_head)?;
-            if prefix_len > bytes.len() {
+            let file_len = entry.wire.len;
+            if prefix_len as u64 > file_len {
                 bail!(
                     "remote append basis is larger than sender file for {}",
                     entry.local_path.display()
@@ -1490,17 +1654,21 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             write_rsync31_optional_item_attrs(&mut writer, iflags, &attrs)?;
             write_sum_head(&mut writer, sum_head)?;
             let literal_bytes = if append_verify {
-                write_append_verify_file_tokens(
+                write_append_verify_file_tokens_from_path(
                     &mut writer,
                     RemoteFileChecksum::PlainMd4,
-                    &bytes,
+                    &entry.local_path,
                     append_prefix_len,
                 )?
             } else {
-                write_file_tokens(&mut writer, RemoteFileChecksum::PlainMd4, &bytes)?
+                write_file_tokens_from_path(
+                    &mut writer,
+                    RemoteFileChecksum::PlainMd4,
+                    &entry.local_path,
+                )?
             };
             writer.flush()?;
-            stats.bytes += literal_bytes as u64;
+            stats.bytes += literal_bytes;
         }
         stats.files += 1;
     }
@@ -1616,8 +1784,8 @@ fn receive_remote_sender_files<T: Read>(
         let target = ctx.dest.join(&entry.path);
 
         if ctx.dry_run {
-            ctx.actions
-                .push(remote_write_action(&target, entry.len as usize, &ctx));
+            let len = sync_action_len(entry.len)?;
+            ctx.actions.push(remote_write_action(&target, len, &ctx));
             stats.files += 1;
             stats.bytes += entry.len;
             continue;
@@ -1628,15 +1796,26 @@ fn receive_remote_sender_files<T: Read>(
         let _checksum_len = read_nonnegative_multiplexed_i32(transport, mux, "checksum length")?;
         let _remainder = read_nonnegative_multiplexed_i32(transport, mux, "remainder length")?;
 
-        let bytes = read_file_tokens(
+        let temp_path = receive_temp_path(&target);
+        let bytes = match read_file_tokens_to_path(
             transport,
             mux,
             RemoteFileChecksum::SeededMd4(ctx.checksum_seed),
             &entry.path,
-        )?;
-        write_received_file(&mut ctx, entry, &target, &bytes)?;
+            &temp_path,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(err);
+            }
+        };
+        let write_result =
+            write_received_file_from_path(&mut ctx, entry, &target, &temp_path, bytes);
+        let _ = std::fs::remove_file(&temp_path);
+        write_result?;
         stats.files += 1;
-        stats.bytes += bytes.len() as u64;
+        stats.bytes += bytes;
     }
 
     Ok(stats)
@@ -1682,17 +1861,33 @@ fn receive_remote_sender_files_protocol31<T: Read>(
         let target = ctx.dest.join(&entry.path);
 
         if iflags & RSYNC_ITEM_TRANSFER == 0 || ctx.dry_run {
-            ctx.actions
-                .push(remote_write_action(&target, entry.len as usize, &ctx));
+            let len = sync_action_len(entry.len)?;
+            ctx.actions.push(remote_write_action(&target, len, &ctx));
             stats.files += 1;
             stats.bytes += entry.len;
             continue;
         }
 
-        let bytes = read_file_tokens(transport, mux, RemoteFileChecksum::PlainMd4, &entry.path)?;
-        write_received_file(&mut ctx, entry, &target, &bytes)?;
+        let temp_path = receive_temp_path(&target);
+        let bytes = match read_file_tokens_to_path(
+            transport,
+            mux,
+            RemoteFileChecksum::PlainMd4,
+            &entry.path,
+            &temp_path,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(err);
+            }
+        };
+        let write_result =
+            write_received_file_from_path(&mut ctx, entry, &target, &temp_path, bytes);
+        let _ = std::fs::remove_file(&temp_path);
+        write_result?;
         stats.files += 1;
-        stats.bytes += bytes.len() as u64;
+        stats.bytes += bytes;
     }
 
     Ok(stats)
@@ -1711,49 +1906,52 @@ fn remote_write_action(target: &Path, len: usize, ctx: &RemoteReceiveContext<'_>
     }
 }
 
-fn write_received_file(
+fn write_received_file_from_path(
     ctx: &mut RemoteReceiveContext<'_>,
     entry: &RsyncFileListEntry,
     target: &Path,
-    bytes: &[u8],
+    source_path: &Path,
+    source_len: u64,
 ) -> Result<()> {
     if ctx.append_verify {
-        if let Some(suffix) = append_verify_suffix_local(ctx.fs, target, bytes)? {
-            if !suffix.is_empty() {
+        if let Some(offset) = append_verify_offset_local(ctx.fs, source_path, target, source_len)? {
+            let suffix_len = source_len - offset;
+            if suffix_len > 0 {
                 ctx.actions.push(SyncAction::AppendFile {
                     path: target.to_path_buf(),
-                    len: suffix.len(),
+                    len: sync_action_len(suffix_len)?,
                 });
-                ctx.fs.append_file(target, &suffix)?;
+                ctx.fs.append_file_from(target, source_path, offset)?;
             }
             preserve_remote_mtime(ctx, entry, target)?;
             return Ok(());
         }
     }
 
-    ctx.actions
-        .push(remote_write_action(target, bytes.len(), ctx));
+    ctx.actions.push(remote_write_action(
+        target,
+        sync_action_len(source_len)?,
+        ctx,
+    ));
     ctx.fs
-        .write_file_with_options(target, bytes, &ctx.file_write_options)?;
+        .copy_file_with_options(source_path, target, &ctx.file_write_options)?;
     preserve_remote_mtime(ctx, entry, target)
 }
 
-fn append_verify_suffix_local(
+fn append_verify_offset_local(
     fs: &LocalFileSystem,
+    source: &Path,
     target: &Path,
-    source_bytes: &[u8],
-) -> Result<Option<Vec<u8>>> {
+    source_len: u64,
+) -> Result<Option<u64>> {
     let Ok(target_metadata) = fs.metadata(target) else {
         return Ok(None);
     };
-    if target_metadata.file_type != FileType::File
-        || target_metadata.len > source_bytes.len() as u64
-    {
+    if target_metadata.file_type != FileType::File || target_metadata.len > source_len {
         return Ok(None);
     }
-    let target_bytes = fs.read_file(target)?;
-    if source_bytes.starts_with(&target_bytes) {
-        Ok(Some(source_bytes[target_bytes.len()..].to_vec()))
+    if fs.file_prefix_matches(source, target)? {
+        Ok(Some(target_metadata.len))
     } else {
         Ok(None)
     }
@@ -1927,8 +2125,7 @@ fn remote_file_needs_update(
             let Some(remote_checksum) = entry.checksum else {
                 return Ok(true);
             };
-            let target_bytes = fs.read_file(&target)?;
-            Ok(rsync_plain_md4_checksum(&target_bytes) != remote_checksum)
+            Ok(checksum_local_path(&target)? != remote_checksum)
         }
     }
 }
@@ -2146,66 +2343,92 @@ fn skip_remote_block_signatures_from_reader<R: Read>(
     Ok(())
 }
 
-fn write_file_tokens<T: Write>(
+fn write_file_tokens_from_path<T: Write>(
     transport: &mut T,
     checksum: RemoteFileChecksum,
-    bytes: &[u8],
-) -> Result<usize> {
-    write_literal_tokens_with_checksum(transport, bytes, remote_file_checksum(checksum, bytes))?;
-    Ok(bytes.len())
+    path: &Path,
+) -> Result<u64> {
+    let whole_file_checksum = remote_file_checksum_for_path(checksum, path)?;
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    write_literal_tokens_from_reader_with_checksum(transport, &mut file, whole_file_checksum)
 }
 
-fn write_append_verify_file_tokens<T: Write>(
+fn write_append_verify_file_tokens_from_path<T: Write>(
     transport: &mut T,
     checksum: RemoteFileChecksum,
-    bytes: &[u8],
+    path: &Path,
     prefix_len: usize,
-) -> Result<usize> {
-    let suffix = bytes
-        .get(prefix_len..)
-        .context("append basis length exceeds sender file length")?;
-    write_literal_tokens_with_checksum(transport, suffix, remote_file_checksum(checksum, bytes))?;
-    Ok(suffix.len())
+) -> Result<u64> {
+    let whole_file_checksum = remote_file_checksum_for_path(checksum, path)?;
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    file.seek(SeekFrom::Start(prefix_len as u64))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    write_literal_tokens_from_reader_with_checksum(transport, &mut file, whole_file_checksum)
 }
 
-fn write_literal_tokens_with_checksum<T: Write>(
+fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
     transport: &mut T,
-    literal_bytes: &[u8],
+    reader: &mut R,
     whole_file_checksum: [u8; 16],
-) -> Result<()> {
-    for chunk in literal_bytes.chunks(32 * 1024) {
-        write_rsync_i32(transport, chunk.len() as i32)?;
-        transport.write_all(chunk)?;
+) -> Result<u64> {
+    let mut buf = [0_u8; 32 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        write_rsync_i32(transport, read as i32)?;
+        transport.write_all(&buf[..read])?;
+        total += read as u64;
     }
     write_rsync_i32(transport, 0)?;
     transport.write_all(&whole_file_checksum)?;
-    Ok(())
+    Ok(total)
 }
 
-fn read_file_tokens<T: Read>(
+fn read_file_tokens_to_path<T: Read>(
     transport: &mut T,
     mux: &mut MultiplexReadState,
     checksum: RemoteFileChecksum,
     path: &Path,
-) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
+    output_path: &Path,
+) -> Result<u64> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut output = File::create(output_path)
+        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    let mut total = 0_u64;
+    let mut buf = [0_u8; 32 * 1024];
+
     loop {
         let token = read_multiplexed_i32(transport, mux)?;
         if token > 0 {
-            let start = bytes.len();
-            bytes.resize(start + token as usize, 0);
-            read_multiplexed_exact(transport, mux, &mut bytes[start..])?;
+            let mut remaining = token as usize;
+            while remaining > 0 {
+                let len = buf.len().min(remaining);
+                read_multiplexed_exact(transport, mux, &mut buf[..len])?;
+                output.write_all(&buf[..len])?;
+                remaining -= len;
+                total += len as u64;
+            }
         } else if token == 0 {
+            output.sync_all()?;
+            drop(output);
             let mut remote_checksum = [0_u8; 16];
             read_multiplexed_exact(transport, mux, &mut remote_checksum)?;
-            let local_checksum = remote_file_checksum(checksum, &bytes);
+            let local_checksum = remote_file_checksum_for_path(checksum, output_path)?;
             if remote_checksum != local_checksum {
                 return Err(RemoteSessionError::FileChecksumMismatch {
                     path: path.display().to_string(),
                 }
                 .into());
             }
-            return Ok(bytes);
+            return Ok(total);
         } else {
             return Err(RemoteSessionError::UnexpectedToken {
                 token,
@@ -2216,11 +2439,35 @@ fn read_file_tokens<T: Read>(
     }
 }
 
-fn remote_file_checksum(checksum: RemoteFileChecksum, bytes: &[u8]) -> [u8; 16] {
+fn remote_file_checksum_for_path(checksum: RemoteFileChecksum, path: &Path) -> Result<[u8; 16]> {
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     match checksum {
-        RemoteFileChecksum::SeededMd4(seed) => rsync_whole_file_checksum(seed, bytes),
-        RemoteFileChecksum::PlainMd4 => rsync_plain_md4_checksum(bytes),
+        RemoteFileChecksum::SeededMd4(seed) => rsync_whole_file_checksum_reader(seed, &mut file)
+            .with_context(|| format!("failed to checksum {}", path.display())),
+        RemoteFileChecksum::PlainMd4 => rsync_plain_md4_checksum_reader(&mut file)
+            .with_context(|| format!("failed to checksum {}", path.display())),
     }
+}
+
+fn receive_temp_path(target: &Path) -> PathBuf {
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "rsync-win".into());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp_name = format!(".{file_name}.{}.{}.recv", std::process::id(), nanos);
+    target
+        .parent()
+        .map(|parent| parent.join(&temp_name))
+        .unwrap_or_else(|| PathBuf::from(temp_name))
+}
+
+fn sync_action_len(len: u64) -> Result<usize> {
+    usize::try_from(len).context("file length exceeds this platform's address size")
 }
 
 fn read_multiplexed_exact<T: Read>(
@@ -2376,7 +2623,7 @@ impl TransferPlan {
             );
             add_metadata_degradations(
                 &mut report,
-                archive_mode_degradations(metadata_policy),
+                archive_mode_degradations_for_cli(cli, metadata_policy),
                 cli.fail_on_metadata_loss,
             );
         }
@@ -2458,27 +2705,31 @@ impl TransferPlan {
                     },
                     Path::new(&remote.path),
                 ) {
-                    Ok(argv) => {
-                        let ssh_command = build_ssh_remote_command(
-                            default_ssh_program().into_os_string(),
-                            &remote.host,
-                            &argv,
-                        );
-                        report.info(
-                            "I_REMOTE_PROTOCOL31_MVP",
-                            format!(
-                                "remote-shell execution tries protocol {REMOTE_SHELL_MODERN_PROTOCOL} first for the ordinary-file MVP"
-                            ),
-                        );
-                        (
-                            Some(argv),
-                            Some(render_ssh_command(&ssh_command)),
-                            Some(ssh_command),
-                            Some(remote.clone()),
-                            Some(direction),
-                            Some(RemoteWireProtocol::Modern31),
-                        )
-                    }
+                    Ok(argv) => match build_remote_transport_command(cli, &remote.host, &argv) {
+                        Ok(ssh_command) => {
+                            report.info(
+                                    "I_REMOTE_PROTOCOL31_MVP",
+                                    format!(
+                                        "remote-shell execution tries protocol {REMOTE_SHELL_MODERN_PROTOCOL} first for the ordinary-file MVP"
+                                    ),
+                                );
+                            (
+                                Some(argv),
+                                Some(render_ssh_command(&ssh_command)),
+                                Some(ssh_command),
+                                Some(remote.clone()),
+                                Some(direction),
+                                Some(RemoteWireProtocol::Modern31),
+                            )
+                        }
+                        Err(err) => {
+                            report.error(
+                                "E_REMOTE_SHELL",
+                                format!("could not parse remote shell command: {err}"),
+                            );
+                            (None, None, None, None, None, None)
+                        }
+                    },
                     Err(err) => {
                         report.error(
                             "E_REMOTE_ARGV",
@@ -2553,9 +2804,8 @@ fn file_write_options_from_plan(plan: &TransferPlan) -> FileWriteOptions {
 }
 
 fn render_ssh_command(command: &SshRemoteCommand) -> Vec<String> {
-    command
-        .args
-        .iter()
+    std::iter::once(&command.program)
+        .chain(command.args.iter())
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect()
 }
@@ -2617,6 +2867,19 @@ fn add_metadata_degradations(
     }
 }
 
+fn archive_mode_degradations_for_cli(
+    cli: &Cli,
+    metadata_policy: MetadataPolicy,
+) -> Vec<MetadataDegradation> {
+    archive_mode_degradations(metadata_policy)
+        .into_iter()
+        .filter(|degradation| {
+            !(cli.no_owner && degradation.feature == MetadataFeature::Owner
+                || cli.no_group && degradation.feature == MetadataFeature::Group)
+        })
+        .collect()
+}
+
 fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
     let unsupported = [
         (cli.numeric_ids, "--numeric-ids", MetadataFeature::Owner),
@@ -2636,12 +2899,15 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
     }
 
     for (enabled, flag) in [
+        (cli.compress, "-z/--compress"),
         (cli.partial, "--partial"),
         (cli.inplace, "--inplace"),
         (cli.append_verify, "--append-verify"),
         (cli.copy_links, "--copy-links"),
         (cli.safe_links, "--safe-links"),
         (cli.copy_unsafe_links, "--copy-unsafe-links"),
+        (cli.no_owner, "--no-o"),
+        (cli.no_group, "--no-g"),
     ] {
         if enabled {
             report.info(
@@ -2649,6 +2915,20 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
                 format!("{flag} is represented in the execution plan"),
             );
         }
+    }
+
+    if cli.compress {
+        report.warn(
+            "W_COMPRESS_UNSUPPORTED",
+            "-z/--compress is accepted for rsync CLI compatibility, but compression is not applied yet",
+        );
+    }
+
+    if let Some(remote_shell) = &cli.remote_shell {
+        report.info(
+            "I_REMOTE_SHELL",
+            format!("-e/--rsh remote shell command: {remote_shell}"),
+        );
     }
 
     if let Some(partial_dir) = &cli.partial_dir {
@@ -2670,6 +2950,16 @@ fn ensure_local_execution_options_supported(cli: &Cli) -> Result<()> {
 fn ensure_remote_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> Result<()> {
     if plan.remote_ssh_command.is_none() {
         bail!("remote-shell execution could not be planned; run with --plan for diagnostics");
+    }
+    if plan.remote_direction == Some(TransferDirection::Pull) && cli.paths.len() != 2 {
+        bail!("remote-shell pull currently supports one remote source and one local destination");
+    }
+    if plan.remote_direction == Some(TransferDirection::Push)
+        && cli.paths[..cli.paths.len() - 1]
+            .iter()
+            .any(|path| is_remote_operand(path))
+    {
+        bail!("remote-shell push sources must be local paths");
     }
 
     let has_remote_selection = !cli.includes.is_empty()
@@ -2932,7 +3222,7 @@ mod tests {
     fn renders_version_with_protocol_range() {
         let output = parse_and_render(["rsync-win", "--version"]);
 
-        assert!(output.contains("rsync-win 0.1.0"));
+        assert!(output.contains("rsync-win 0.1.1"));
         assert!(output.contains("protocol primitives range: 20-32"));
     }
 
@@ -2987,6 +3277,28 @@ mod tests {
         assert!(output.contains("wire protocol: experimental protocol 31"));
         assert!(output.contains("[info] I_REMOTE_PROTOCOL31_MVP"));
         assert!(!output.contains("local portable sync"));
+    }
+
+    #[test]
+    fn remote_shell_plan_accepts_rsync_e_compress_and_no_owner_group() {
+        let output = parse_and_render([
+            "rsync-win",
+            "-avz",
+            "--no-o",
+            "--no-g",
+            "./hunyuan_only_run/",
+            "-e",
+            "ssh -p 10080",
+            "root@118.145.32.132:/mnt/afs/250010150/huozhiyu/VBench-exp/hunyuan_only_run/",
+        ]);
+
+        assert!(output.contains("compress: true"));
+        assert!(output.contains("remote ssh argv: ssh -p 10080 root@118.145.32.132"));
+        assert!(output.contains("[info] I_REMOTE_SHELL"));
+        assert!(output.contains("[warning] W_COMPRESS_UNSUPPORTED"));
+        assert!(!output.contains("BatchMode=yes"));
+        assert!(!output.contains("W_METADATA_OWNER"));
+        assert!(!output.contains("W_METADATA_GROUP"));
     }
 
     #[test]
@@ -3414,6 +3726,33 @@ mod tests {
         assert!(output.contains("rsync-win local portable sync"));
         assert!(output.contains("write-file"));
         assert!(output.contains("delete-file"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_executor_batches_multiple_sources() {
+        let root = unique_temp_dir("rsync-cli-local-batch");
+        let file_source = root.join("one.txt");
+        let dir_source = root.join("dir");
+        let dest = root.join("dest");
+        fs::create_dir_all(dir_source.join("nested")).unwrap();
+        fs::write(&file_source, b"one").unwrap();
+        fs::write(dir_source.join("nested/two.txt"), b"two").unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            file_source.to_string_lossy().into_owned(),
+            dir_source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(dest.join("one.txt")).unwrap(), b"one");
+        assert_eq!(fs::read(dest.join("dir/nested/two.txt")).unwrap(), b"two");
+        assert!(output.contains("sources: 2"));
+        assert!(output.contains("write-file"));
 
         fs::remove_dir_all(root).unwrap();
     }

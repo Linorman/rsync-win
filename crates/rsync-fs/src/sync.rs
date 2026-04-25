@@ -247,6 +247,73 @@ pub fn sync_tree<F: PortableFileSystem>(
     Ok(report)
 }
 
+pub fn sync_sources<F: PortableFileSystem>(
+    fs: &mut F,
+    sources: &[PathBuf],
+    dest: &Path,
+    options: SyncOptions,
+) -> Result<SyncReport, FsError> {
+    match sources {
+        [] => Err(FsError::Unsupported("sync requires at least one source")),
+        [source] => sync_tree(fs, source, dest, options),
+        _ => sync_multiple_sources(fs, sources, dest, options),
+    }
+}
+
+fn sync_multiple_sources<F: PortableFileSystem>(
+    fs: &mut F,
+    sources: &[PathBuf],
+    dest: &Path,
+    options: SyncOptions,
+) -> Result<SyncReport, FsError> {
+    if let Ok(metadata) = fs.metadata(dest) {
+        if metadata.file_type != FileType::Directory {
+            return Err(FsError::NotDirectory(dest.to_path_buf()));
+        }
+    }
+
+    let mut targets = Vec::with_capacity(sources.len());
+    for source in sources {
+        let target = batch_target_path(source, dest)?;
+        let source_root = fs.resolve_path_for_prefix_check(source)?;
+        let target_root = fs.resolve_path_for_prefix_check(&target)?;
+        if source_root == target_root || target_root.starts_with(&source_root) {
+            return Err(FsError::DestinationInsideSource);
+        }
+        targets.push(target);
+    }
+
+    if let Some(preflight) = options.destination_path_preflight {
+        let destination_roots: Vec<_> = targets
+            .iter()
+            .map(|target| destination_preflight_path(target))
+            .collect();
+        preflight(&destination_roots)?;
+    }
+
+    let mut report = SyncReport::default();
+    if !fs.exists(dest) {
+        report.push(SyncAction::CreateDir(dest.to_path_buf()));
+        if !options.dry_run {
+            fs.create_dir_all(dest)?;
+        }
+    }
+
+    for (source, target) in sources.iter().zip(targets) {
+        let child = sync_tree(fs, source, &target, options.clone())?;
+        report.actions.extend(child.actions);
+    }
+
+    Ok(report)
+}
+
+fn batch_target_path(source: &Path, dest: &Path) -> Result<PathBuf, FsError> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| FsError::InvalidPortablePath(source.to_path_buf()))?;
+    Ok(dest.join(file_name))
+}
+
 fn sync_single_file<F: PortableFileSystem>(
     fs: &mut F,
     source: &Path,
@@ -290,16 +357,16 @@ fn transfer_file<F: PortableFileSystem>(
     options: &SyncOptions,
     report: &mut SyncReport,
 ) -> Result<(), FsError> {
-    let bytes = fs.read_file(&entry.path)?;
     if options.append_verify {
-        if let Some(suffix) = append_verify_suffix(fs, target, &bytes)? {
-            if !suffix.is_empty() {
+        if let Some(offset) = append_verify_offset(fs, &entry.path, target, entry.metadata.len)? {
+            let suffix_len = entry.metadata.len - offset;
+            if suffix_len > 0 {
                 report.push(SyncAction::AppendFile {
                     path: target.to_path_buf(),
-                    len: suffix.len(),
+                    len: action_len(suffix_len)?,
                 });
                 if !options.dry_run {
-                    fs.append_file(target, &suffix)?;
+                    fs.append_file_from(target, &entry.path, offset)?;
                 }
             }
             preserve_transferred_mtime(fs, target, entry, options, report)?;
@@ -310,40 +377,43 @@ fn transfer_file<F: PortableFileSystem>(
     let action = match options.file_write_mode {
         FileWriteMode::Atomic => SyncAction::WriteFile {
             path: target.to_path_buf(),
-            len: bytes.len(),
+            len: action_len(entry.metadata.len)?,
         },
         FileWriteMode::InPlace => SyncAction::WriteFileInPlace {
             path: target.to_path_buf(),
-            len: bytes.len(),
+            len: action_len(entry.metadata.len)?,
         },
     };
     report.push(action);
     if !options.dry_run {
-        fs.write_file_with_options(target, &bytes, &file_write_options(options))?;
+        fs.copy_file_with_options(&entry.path, target, &file_write_options(options))?;
     }
     preserve_transferred_mtime(fs, target, entry, options, report)
 }
 
-fn append_verify_suffix<F: PortableFileSystem>(
+fn append_verify_offset<F: PortableFileSystem>(
     fs: &F,
+    source: &Path,
     target: &Path,
-    source_bytes: &[u8],
-) -> Result<Option<Vec<u8>>, FsError> {
+    source_len: u64,
+) -> Result<Option<u64>, FsError> {
     let Ok(target_metadata) = fs.metadata(target) else {
         return Ok(None);
     };
-    if target_metadata.file_type != FileType::File
-        || target_metadata.len > source_bytes.len() as u64
-    {
+    if target_metadata.file_type != FileType::File || target_metadata.len > source_len {
         return Ok(None);
     }
 
-    let target_bytes = fs.read_file(target)?;
-    if source_bytes.starts_with(&target_bytes) {
-        Ok(Some(source_bytes[target_bytes.len()..].to_vec()))
+    if fs.file_prefix_matches(source, target)? {
+        Ok(Some(target_metadata.len))
     } else {
         Ok(None)
     }
+}
+
+fn action_len(len: u64) -> Result<usize, FsError> {
+    usize::try_from(len)
+        .map_err(|_| FsError::Unsupported("file length exceeds this platform's address size"))
 }
 
 fn file_write_options(options: &SyncOptions) -> FileWriteOptions {
@@ -395,11 +465,7 @@ fn file_needs_update<F: PortableFileSystem>(
                 Some((source_mtime, target_mtime)) => source_mtime != target_mtime,
                 None => true,
             }),
-        UpdateMode::Checksum => {
-            let source_bytes = fs.read_file(&source.path)?;
-            let target_bytes = fs.read_file(target)?;
-            Ok(source_bytes != target_bytes)
-        }
+        UpdateMode::Checksum => Ok(!fs.files_equal(&source.path, target)?),
     }
 }
 
@@ -1115,6 +1181,31 @@ mod tests {
         assert!(report
             .actions()
             .contains(&SyncAction::ProtectDelete(PathBuf::from("dst/old.txt"))));
+    }
+
+    #[test]
+    fn sync_sources_batches_multiple_sources_under_destination() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/one.txt", b"one").unwrap();
+        fs.add_file("src/dir/two.txt", b"two").unwrap();
+
+        let report = sync_sources(
+            &mut fs,
+            &[PathBuf::from("src/one.txt"), PathBuf::from("src/dir")],
+            Path::new("dst"),
+            SyncOptions {
+                dry_run: false,
+                preserve_mtime: false,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs.read_file(Path::new("dst/one.txt")).unwrap(), b"one");
+        assert_eq!(fs.read_file(Path::new("dst/dir/two.txt")).unwrap(), b"two");
+        assert!(report
+            .actions()
+            .contains(&SyncAction::CreateDir(PathBuf::from("dst"))));
     }
 
     #[test]

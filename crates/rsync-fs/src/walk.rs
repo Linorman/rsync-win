@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,6 +83,49 @@ pub trait PortableFileSystem {
         let mut existing = self.read_file(path)?;
         existing.extend_from_slice(bytes);
         self.write_file_atomic(path, &existing)
+    }
+    fn copy_file_with_options(
+        &mut self,
+        source: &Path,
+        dest: &Path,
+        options: &FileWriteOptions,
+    ) -> Result<u64, FsError> {
+        let bytes = self.read_file(source)?;
+        let len = bytes.len() as u64;
+        self.write_file_with_options(dest, &bytes, options)?;
+        Ok(len)
+    }
+    fn append_file_from(
+        &mut self,
+        path: &Path,
+        source: &Path,
+        offset: u64,
+    ) -> Result<u64, FsError> {
+        let bytes = self.read_file(source)?;
+        let offset = usize::try_from(offset)
+            .map_err(|_| FsError::Unsupported("file offset exceeds memory address size"))?;
+        if offset > bytes.len() {
+            return Err(FsError::Unsupported(
+                "append offset exceeds source file length",
+            ));
+        }
+        let suffix = &bytes[offset..];
+        let len = suffix.len() as u64;
+        self.append_file(path, suffix)?;
+        Ok(len)
+    }
+    fn files_equal(&self, left: &Path, right: &Path) -> Result<bool, FsError> {
+        let left_metadata = self.metadata(left)?;
+        let right_metadata = self.metadata(right)?;
+        if left_metadata.len != right_metadata.len {
+            return Ok(false);
+        }
+        Ok(self.read_file(left)? == self.read_file(right)?)
+    }
+    fn file_prefix_matches(&self, path: &Path, prefix: &Path) -> Result<bool, FsError> {
+        let path_bytes = self.read_file(path)?;
+        let prefix_bytes = self.read_file(prefix)?;
+        Ok(path_bytes.starts_with(&prefix_bytes))
     }
     fn create_dir_all(&mut self, path: &Path) -> Result<(), FsError>;
     fn remove_file(&mut self, path: &Path) -> Result<(), FsError>;
@@ -245,6 +288,18 @@ impl PortableFileSystem for MemoryFileSystem {
         node.bytes.extend_from_slice(bytes);
         node.metadata.len = node.bytes.len() as u64;
         Ok(())
+    }
+
+    fn copy_file_with_options(
+        &mut self,
+        source: &Path,
+        dest: &Path,
+        options: &FileWriteOptions,
+    ) -> Result<u64, FsError> {
+        let bytes = self.read_file(source)?;
+        let len = bytes.len() as u64;
+        self.write_file_with_options(dest, &bytes, options)?;
+        Ok(len)
     }
 
     fn create_dir_all(&mut self, path: &Path) -> Result<(), FsError> {
@@ -424,6 +479,56 @@ impl PortableFileSystem for LocalFileSystem {
         Ok(())
     }
 
+    fn copy_file_with_options(
+        &mut self,
+        source: &Path,
+        dest: &Path,
+        options: &FileWriteOptions,
+    ) -> Result<u64, FsError> {
+        match options.mode {
+            FileWriteMode::Atomic => self.copy_file_atomic_to_temp(
+                source,
+                dest,
+                options.partial_dir.as_deref(),
+                options.keep_partial || options.partial_dir.is_some(),
+            ),
+            FileWriteMode::InPlace => self.copy_file_direct(source, dest),
+        }
+    }
+
+    fn append_file_from(
+        &mut self,
+        path: &Path,
+        source: &Path,
+        offset: u64,
+    ) -> Result<u64, FsError> {
+        let source_len = fs::metadata(source)?.len();
+        if offset > source_len {
+            return Err(FsError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "append offset exceeds source file length",
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut input = File::open(source)?;
+        input.seek(SeekFrom::Start(offset))?;
+        let mut output = OpenOptions::new().create(true).append(true).open(path)?;
+        let copied = io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        Ok(copied)
+    }
+
+    fn files_equal(&self, left: &Path, right: &Path) -> Result<bool, FsError> {
+        Ok(files_equal_streaming(left, right)?)
+    }
+
+    fn file_prefix_matches(&self, path: &Path, prefix: &Path) -> Result<bool, FsError> {
+        Ok(file_prefix_matches_streaming(path, prefix)?)
+    }
+
     fn create_dir_all(&mut self, path: &Path) -> Result<(), FsError> {
         Ok(fs::create_dir_all(path)?)
     }
@@ -485,6 +590,95 @@ impl LocalFileSystem {
 
         write_result.map_err(FsError::Io)
     }
+
+    fn copy_file_direct(&mut self, source: &Path, dest: &Path) -> Result<u64, FsError> {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut input = File::open(source)?;
+        let mut output = File::create(dest)?;
+        let copied = io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        Ok(copied)
+    }
+
+    fn copy_file_atomic_to_temp(
+        &mut self,
+        source: &Path,
+        dest: &Path,
+        partial_dir: Option<&Path>,
+        keep_partial: bool,
+    ) -> Result<u64, FsError> {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = temp_path_for(dest, partial_dir);
+        if let Some(parent) = temp_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let write_result = (|| {
+            let copied = self.copy_file_direct(source, &temp_path)?;
+            replace_file(&temp_path, dest)?;
+            Ok(copied)
+        })();
+
+        if write_result.is_err() && !keep_partial {
+            let _ = fs::remove_file(&temp_path);
+        }
+
+        write_result
+    }
+}
+
+fn files_equal_streaming(left: &Path, right: &Path) -> io::Result<bool> {
+    let left_len = fs::metadata(left)?.len();
+    let right_len = fs::metadata(right)?.len();
+    if left_len != right_len {
+        return Ok(false);
+    }
+
+    let mut left_file = File::open(left)?;
+    let mut right_file = File::open(right)?;
+    streams_equal_for_len(&mut left_file, &mut right_file, left_len)
+}
+
+fn file_prefix_matches_streaming(path: &Path, prefix: &Path) -> io::Result<bool> {
+    let path_len = fs::metadata(path)?.len();
+    let prefix_len = fs::metadata(prefix)?.len();
+    if prefix_len > path_len {
+        return Ok(false);
+    }
+
+    let mut path_file = File::open(path)?;
+    let mut prefix_file = File::open(prefix)?;
+    streams_equal_for_len(&mut path_file, &mut prefix_file, prefix_len)
+}
+
+fn streams_equal_for_len<L: Read, R: Read>(
+    left: &mut L,
+    right: &mut R,
+    mut remaining: u64,
+) -> io::Result<bool> {
+    let mut left_buf = [0_u8; 64 * 1024];
+    let mut right_buf = [0_u8; 64 * 1024];
+
+    while remaining > 0 {
+        let len = if remaining > left_buf.len() as u64 {
+            left_buf.len()
+        } else {
+            remaining as usize
+        };
+        left.read_exact(&mut left_buf[..len])?;
+        right.read_exact(&mut right_buf[..len])?;
+        if left_buf[..len] != right_buf[..len] {
+            return Ok(false);
+        }
+        remaining -= len as u64;
+    }
+
+    Ok(true)
 }
 
 fn portable_metadata_from_std(

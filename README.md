@@ -5,24 +5,25 @@
 
 `rsync-win` is a native Windows rsync-compatible command line application written in Rust. It aims to provide useful rsync-style local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
 
-This is an early development release. Version `v0.1` maps to Cargo package version `0.1.0` and focuses on ordinary files, directories, explicit metadata degradation, and a clean-room protocol implementation.
+This is an early development release. Version `v0.1.1` maps to Cargo package version `0.1.1` and focuses on ordinary files, directories, explicit metadata degradation, and a clean-room protocol implementation.
 
 ## Status
 
-| Area | v0.1 status |
+| Area | v0.1.1 status |
 | --- | --- |
-| Local Windows sync | Supported for ordinary files and directories. |
+| Local Windows sync | Supported for ordinary files and directories, including multiple source operands. |
 | Recursion and mtimes | `-r`, `-t`, and `-a` planning are supported, with unsupported archive metadata reported. |
 | Deletion and dry-run | `--delete`, `--dry-run`, `--plan`, itemized changes, and structured stats are available. |
 | Filters | `--include`, `--exclude`, `--filter`, `--files-from`, and `--from0` are available. |
 | Update modes | Quick-check, `--checksum`, `--size-only`, `--ignore-times`, `--partial`, `--partial-dir`, `--inplace`, and `--append-verify` are represented. |
-| Remote shell | Experimental ordinary-file push/pull path over SSH with protocol 31 work and protocol 27 compatibility fallback. |
+| Large files | Local copies and remote whole-file token IO stream through bounded buffers instead of staging whole files in memory. |
+| Remote shell | Experimental ordinary-file push/pull path over SSH with protocol 31 work, protocol 27 compatibility fallback, and multiple local-source push support. |
 | Windows-native metadata | Long path, collision, link, and metadata policy work is in progress. |
-| Daemon mode | Planned, not implemented in v0.1. |
+| Daemon mode | Planned, not implemented in v0.1.1. |
 
 ## Install
 
-Download the Windows x64 zip from the `v0.1` GitHub Release, extract it, and run:
+Download the Windows x64 zip from the `v0.1.1` GitHub Release, extract it, and run:
 
 ```powershell
 .\rsync-win.exe --version
@@ -69,6 +70,12 @@ Run a local portable sync, preserving mtimes and deleting receiver-only files:
 rsync-win -rt --delete .\source .\dest
 ```
 
+Transfer multiple sources into one destination directory:
+
+```powershell
+rsync-win -r .\file.txt .\folder .\dest
+```
+
 Preview archive mode metadata handling:
 
 ```powershell
@@ -82,6 +89,12 @@ rsync-win -r --include "*.rs" --exclude "target/" .\source .\dest
 ```
 
 Remote-shell support is still experimental. Use `--plan` first when testing against a real remote peer.
+
+Use a custom SSH command, matching rsync's `-e` style:
+
+```powershell
+rsync-win -avz --no-o --no-g .\source\ -e "ssh -p 10080" root@example:/tmp/source/
+```
 
 ## Project Layout
 

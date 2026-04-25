@@ -519,11 +519,53 @@ pub fn rsync_whole_file_checksum(seed: i32, bytes: &[u8]) -> [u8; 16] {
     out
 }
 
+pub fn rsync_whole_file_checksum_reader<R: Read>(
+    seed: i32,
+    reader: &mut R,
+) -> io::Result<[u8; 16]> {
+    use digest::Digest;
+
+    let mut hasher = md4::Md4::new();
+    hasher.update(seed.to_le_bytes());
+    update_md4_from_reader(&mut hasher, reader)?;
+    Ok(finalize_md4(hasher))
+}
+
 pub fn rsync_plain_md4_checksum(bytes: &[u8]) -> [u8; 16] {
     use digest::Digest;
 
     let mut hasher = md4::Md4::new();
     hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = [0_u8; 16];
+    out.copy_from_slice(&digest);
+    out
+}
+
+pub fn rsync_plain_md4_checksum_reader<R: Read>(reader: &mut R) -> io::Result<[u8; 16]> {
+    use digest::Digest;
+
+    let mut hasher = md4::Md4::new();
+    update_md4_from_reader(&mut hasher, reader)?;
+    Ok(finalize_md4(hasher))
+}
+
+fn update_md4_from_reader<R: Read>(hasher: &mut md4::Md4, reader: &mut R) -> io::Result<()> {
+    use digest::Digest;
+
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            return Ok(());
+        }
+        hasher.update(&buf[..read]);
+    }
+}
+
+fn finalize_md4(hasher: md4::Md4) -> [u8; 16] {
+    use digest::Digest;
+
     let digest = hasher.finalize();
     let mut out = [0_u8; 16];
     out.copy_from_slice(&digest);
