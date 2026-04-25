@@ -17,17 +17,12 @@ pub enum RsyncCoreError {
     InvalidPath(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MetadataPolicy {
+    #[default]
     Portable,
     Posix,
     NtfsNative,
-}
-
-impl Default for MetadataPolicy {
-    fn default() -> Self {
-        Self::Portable
-    }
 }
 
 impl MetadataPolicy {
