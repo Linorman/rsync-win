@@ -3667,7 +3667,7 @@ mod tests {
     fn renders_version_with_protocol_range() {
         let output = parse_and_render(["rsync-win", "--version"]);
 
-        assert!(output.contains("rsync-win 0.1.3"));
+        assert!(output.contains("rsync-win 0.1.4"));
         assert!(output.contains("protocol primitives range: 20-32"));
     }
 
