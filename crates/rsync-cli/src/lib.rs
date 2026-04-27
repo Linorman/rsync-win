@@ -403,6 +403,104 @@ impl ProgressLog {
             eprintln!("rsync-win: {}", message.as_ref());
         }
     }
+
+    fn enabled(self) -> bool {
+        self.verbosity > 0
+    }
+}
+
+#[derive(Debug)]
+struct FileProgress {
+    progress: ProgressLog,
+    operation: &'static str,
+    path: String,
+    total: Option<u64>,
+    started: Instant,
+    last_report: Instant,
+    transferred: u64,
+}
+
+impl FileProgress {
+    fn start(
+        progress: ProgressLog,
+        operation: &'static str,
+        path: &Path,
+        total: Option<u64>,
+    ) -> Self {
+        let now = Instant::now();
+        let meter = Self {
+            progress,
+            operation,
+            path: path.display().to_string(),
+            total,
+            started: now,
+            last_report: now,
+            transferred: 0,
+        };
+        if progress.enabled() {
+            match total {
+                Some(total) => progress.info(format!(
+                    "{} started: {} ({})",
+                    operation,
+                    meter.path,
+                    format_bytes(total)
+                )),
+                None => progress.info(format!("{} started: {}", operation, meter.path)),
+            }
+        }
+        meter
+    }
+
+    fn advance(&mut self, bytes: u64) {
+        self.transferred += bytes;
+        if !self.progress.enabled() || self.last_report.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+
+        self.report("progress");
+        self.last_report = Instant::now();
+    }
+
+    fn finish(&mut self) {
+        if self.progress.enabled() {
+            self.report("finished");
+        }
+    }
+
+    fn report(&self, state: &'static str) {
+        let elapsed = self.started.elapsed();
+        let rate = transfer_rate_label(self.transferred, elapsed);
+        let elapsed_suffix = if state == "finished" {
+            format!(", {:.2}s", elapsed.as_secs_f64())
+        } else {
+            String::new()
+        };
+        match self.total {
+            Some(total) if total > 0 => {
+                let percent = (self.transferred as f64 / total as f64 * 100.0).min(100.0);
+                self.progress.info(format!(
+                    "{} {}: {} - {} / {} ({:.1}%, {}{})",
+                    self.operation,
+                    state,
+                    self.path,
+                    format_bytes(self.transferred),
+                    format_bytes(total),
+                    percent,
+                    rate,
+                    elapsed_suffix
+                ));
+            }
+            Some(_) | None => self.progress.info(format!(
+                "{} {}: {} - {} ({}{})",
+                self.operation,
+                state,
+                self.path,
+                format_bytes(self.transferred),
+                rate,
+                elapsed_suffix
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,8 +532,7 @@ fn transfer_direction_label(direction: TransferDirection) -> &'static str {
     }
 }
 
-const RSYNC31_MUX_FRAME_SIZE: usize = 256 * 1024;
-const FILE_TOKEN_BUFFER_SIZE: usize = 256 * 1024;
+const RSYNC31_MUX_FRAME_SIZE: usize = 32 * 1024;
 const RSYNC_ITEM_BASIS_TYPE_FOLLOWS: u16 = 1 << 11;
 const RSYNC_ITEM_XNAME_FOLLOWS: u16 = 1 << 12;
 const RSYNC_ITEM_IS_NEW: u16 = 1 << 13;
@@ -937,6 +1034,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
             index_offset,
             checksum_seed: handshake.checksum_seed,
             dry_run: plan.dry_run,
+            progress: ProgressLog::from_cli(cli),
             preserve_times: plan.preserve_times,
             file_write_options: file_write_options_from_plan(plan),
             append_verify: plan.append_verify,
@@ -1077,6 +1175,7 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
             index_offset,
             checksum_seed: handshake.checksum_seed,
             dry_run: plan.dry_run,
+            progress: ProgressLog::from_cli(cli),
             preserve_times: plan.preserve_times,
             file_write_options: file_write_options_from_plan(plan),
             append_verify: plan.append_verify,
@@ -1144,6 +1243,12 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     let dest = Path::new(cli.paths.last().expect("checked operand count"));
     let files_from = load_files_from(cli)?;
     let mut fs = LocalFileSystem;
+    let progress = ProgressLog::from_cli(cli);
+    progress.info(format!(
+        "local sync starting: {} source(s) -> {}",
+        sources.len(),
+        dest.display()
+    ));
     let sync_report = sync_sources(
         &mut fs,
         &sources,
@@ -1164,6 +1269,11 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
             symlink_mode: plan.symlink_mode,
         },
     )?;
+    log_sync_actions(progress, sync_report.actions());
+    progress.info(format!(
+        "local sync finished: {} action(s)",
+        sync_report.actions().len()
+    ));
 
     let mut output = String::new();
     output.push_str("rsync-win local portable sync\n");
@@ -1220,13 +1330,30 @@ fn remote_entries_file_summary(entries: &[RemoteSourceEntry]) -> (usize, u64) {
         })
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let value = bytes as f64;
+    if value >= GIB {
+        format!("{:.2} GiB", value / GIB)
+    } else if value >= MIB {
+        format!("{:.2} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.2} KiB", value / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn transfer_rate_label(bytes: u64, elapsed: Duration) -> String {
     let seconds = elapsed.as_secs_f64();
     if seconds <= f64::EPSILON {
         return "instant".to_string();
     }
 
-    format!("{:.2} MiB/s", bytes as f64 / seconds / 1024.0 / 1024.0)
+    format!("{}/s", format_bytes((bytes as f64 / seconds) as u64))
 }
 
 fn append_remote_push_quick_check_note(
@@ -1272,7 +1399,7 @@ fn source_storage_notes(sources: &[PathBuf]) -> Vec<String> {
         .filter_map(|source| {
             if rsync_winfs::drive_kind_for_path(source) == Some(WindowsDriveKind::Remote) {
                 Some(format!(
-                    "source storage: {} is on a Windows network drive; upload must first read bytes from that mapped drive, so Windows may show inbound/download traffic while rsync-win sends them over SSH",
+                    "source storage: {} is on a Windows network drive; rsync-win reads it while uploading",
                     source.display()
                 ))
             } else {
@@ -1706,24 +1833,19 @@ fn serve_remote_receiver_requests<T: Read + Write>(
         write_rsync_i32(transport, block_len as i32)?;
         write_rsync_i32(transport, checksum_len as i32)?;
         write_rsync_i32(transport, remainder as i32)?;
-        progress.info(format!(
-            "uploading {} ({} bytes)",
-            entry.wire.path.display(),
-            entry.wire.len
-        ));
-        let started = Instant::now();
+        let mut file_progress =
+            FileProgress::start(progress, "upload", &entry.wire.path, Some(entry.wire.len));
         let literal_bytes = write_file_tokens_from_path(
             transport,
             RemoteFileChecksum::SeededMd4(checksum_seed),
             &entry.local_path,
+            Some(&mut file_progress),
         )?;
-        let elapsed = started.elapsed();
+        file_progress.finish();
         progress.info(format!(
-            "uploaded {} ({} bytes sent in {:.2}s, {})",
+            "upload complete: {} ({} sent)",
             entry.wire.path.display(),
-            literal_bytes,
-            elapsed.as_secs_f64(),
-            transfer_rate_label(literal_bytes, elapsed)
+            format_bytes(literal_bytes)
         ));
         stats.files += 1;
         stats.bytes += literal_bytes;
@@ -1843,35 +1965,40 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             write_u16_le(&mut writer, iflags)?;
             write_rsync31_optional_item_attrs(&mut writer, iflags, &attrs)?;
             write_sum_head(&mut writer, sum_head)?;
-            progress.info(format!(
-                "uploading {} ({} bytes{})",
-                entry.wire.path.display(),
-                entry.wire.len,
-                if append_verify { ", append-verify" } else { "" }
-            ));
-            let started = Instant::now();
+            let total = if append_verify {
+                entry.wire.len.saturating_sub(append_prefix_len as u64)
+            } else {
+                entry.wire.len
+            };
+            let operation = if append_verify {
+                "upload append"
+            } else {
+                "upload"
+            };
+            let mut file_progress =
+                FileProgress::start(progress, operation, &entry.wire.path, Some(total));
             let literal_bytes = if append_verify {
                 write_append_verify_file_tokens_from_path(
                     &mut writer,
                     RemoteFileChecksum::PlainMd4,
                     &entry.local_path,
                     append_prefix_len,
+                    Some(&mut file_progress),
                 )?
             } else {
                 write_file_tokens_from_path(
                     &mut writer,
                     RemoteFileChecksum::PlainMd4,
                     &entry.local_path,
+                    Some(&mut file_progress),
                 )?
             };
             writer.flush()?;
-            let elapsed = started.elapsed();
+            file_progress.finish();
             progress.info(format!(
-                "uploaded {} ({} bytes sent in {:.2}s, {})",
+                "upload complete: {} ({} sent)",
                 entry.wire.path.display(),
-                literal_bytes,
-                elapsed.as_secs_f64(),
-                transfer_rate_label(literal_bytes, elapsed)
+                format_bytes(literal_bytes)
             ));
             stats.bytes += literal_bytes;
         }
@@ -1963,6 +2090,7 @@ struct RemoteReceiveContext<'a> {
     index_offset: i32,
     checksum_seed: i32,
     dry_run: bool,
+    progress: ProgressLog,
     preserve_times: bool,
     file_write_options: FileWriteOptions,
     append_verify: bool,
@@ -2002,14 +2130,20 @@ fn receive_remote_sender_files<T: Read>(
         let _remainder = read_nonnegative_multiplexed_i32(transport, mux, "remainder length")?;
 
         let temp_path = receive_temp_path(&target);
+        let mut file_progress =
+            FileProgress::start(ctx.progress, "download", &entry.path, Some(entry.len));
         let bytes = match read_file_tokens_to_path(
             transport,
             mux,
             RemoteFileChecksum::SeededMd4(ctx.checksum_seed),
             &entry.path,
             &temp_path,
+            Some(&mut file_progress),
         ) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => {
+                file_progress.finish();
+                bytes
+            }
             Err(err) => {
                 let _ = std::fs::remove_file(&temp_path);
                 return Err(err);
@@ -2074,14 +2208,20 @@ fn receive_remote_sender_files_protocol31<T: Read>(
         }
 
         let temp_path = receive_temp_path(&target);
+        let mut file_progress =
+            FileProgress::start(ctx.progress, "download", &entry.path, Some(entry.len));
         let bytes = match read_file_tokens_to_path(
             transport,
             mux,
             RemoteFileChecksum::PlainMd4,
             &entry.path,
             &temp_path,
+            Some(&mut file_progress),
         ) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => {
+                file_progress.finish();
+                bytes
+            }
             Err(err) => {
                 let _ = std::fs::remove_file(&temp_path);
                 return Err(err);
@@ -2552,10 +2692,11 @@ fn write_file_tokens_from_path<T: Write>(
     transport: &mut T,
     checksum: RemoteFileChecksum,
     path: &Path,
+    progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    write_literal_tokens_from_reader_with_checksum(transport, &mut file, checksum)
+    write_literal_tokens_from_reader_with_checksum(transport, &mut file, checksum, progress)
 }
 
 fn write_append_verify_file_tokens_from_path<T: Write>(
@@ -2563,11 +2704,12 @@ fn write_append_verify_file_tokens_from_path<T: Write>(
     checksum: RemoteFileChecksum,
     path: &Path,
     prefix_len: usize,
+    progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     write_append_verify_literal_tokens_from_reader_with_checksum(
-        transport, &mut file, checksum, prefix_len,
+        transport, &mut file, checksum, prefix_len, progress,
     )
 }
 
@@ -2575,9 +2717,10 @@ fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
     transport: &mut T,
     reader: &mut R,
     checksum: RemoteFileChecksum,
+    mut progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     let mut checksum = remote_file_checksum_builder(checksum);
-    let mut buf = vec![0_u8; FILE_TOKEN_BUFFER_SIZE];
+    let mut buf = [0_u8; 32 * 1024];
     let mut total = 0_u64;
     loop {
         let read = reader.read(&mut buf)?;
@@ -2588,6 +2731,9 @@ fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
         write_rsync_i32(transport, read as i32)?;
         transport.write_all(&buf[..read])?;
         total += read as u64;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.advance(read as u64);
+        }
     }
     write_rsync_i32(transport, 0)?;
     transport.write_all(&checksum.finalize())?;
@@ -2599,9 +2745,10 @@ fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Rea
     reader: &mut R,
     checksum: RemoteFileChecksum,
     prefix_len: usize,
+    mut progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     let mut checksum = remote_file_checksum_builder(checksum);
-    let mut buf = vec![0_u8; FILE_TOKEN_BUFFER_SIZE];
+    let mut buf = [0_u8; 32 * 1024];
     let mut remaining_prefix = prefix_len;
     let mut total = 0_u64;
     loop {
@@ -2624,6 +2771,9 @@ fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Rea
         write_rsync_i32(transport, literal.len() as i32)?;
         transport.write_all(literal)?;
         total += literal.len() as u64;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.advance(literal.len() as u64);
+        }
     }
     if remaining_prefix > 0 {
         bail!("append-verify prefix length exceeds source file length");
@@ -2646,6 +2796,7 @@ fn read_file_tokens_to_path<T: Read>(
     checksum: RemoteFileChecksum,
     path: &Path,
     output_path: &Path,
+    mut progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)
@@ -2654,7 +2805,7 @@ fn read_file_tokens_to_path<T: Read>(
     let mut output = File::create(output_path)
         .with_context(|| format!("failed to create {}", output_path.display()))?;
     let mut total = 0_u64;
-    let mut buf = vec![0_u8; FILE_TOKEN_BUFFER_SIZE];
+    let mut buf = [0_u8; 32 * 1024];
 
     loop {
         let token = read_multiplexed_i32(transport, mux)?;
@@ -2666,6 +2817,9 @@ fn read_file_tokens_to_path<T: Read>(
                 output.write_all(&buf[..len])?;
                 remaining -= len;
                 total += len as u64;
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.advance(len as u64);
+                }
             }
         } else if token == 0 {
             output.sync_all()?;
@@ -3291,6 +3445,46 @@ fn append_sync_action(output: &mut String, action: &SyncAction) {
     }
 }
 
+fn log_sync_actions(progress: ProgressLog, actions: &[SyncAction]) {
+    if !progress.enabled() {
+        return;
+    }
+
+    for action in actions {
+        match action {
+            SyncAction::CreateDir(path) => progress.info(format!("create dir: {}", path.display())),
+            SyncAction::WriteFile { path, len } => progress.info(format!(
+                "write file: {} ({})",
+                path.display(),
+                format_bytes(*len as u64)
+            )),
+            SyncAction::WriteFileInPlace { path, len } => progress.info(format!(
+                "write file inplace: {} ({})",
+                path.display(),
+                format_bytes(*len as u64)
+            )),
+            SyncAction::AppendFile { path, len } => progress.info(format!(
+                "append file: {} ({})",
+                path.display(),
+                format_bytes(*len as u64)
+            )),
+            SyncAction::PreserveMtime(path) => {
+                progress.detail(format!("preserve mtime: {}", path.display()));
+            }
+            SyncAction::DeleteFile(path) => {
+                progress.info(format!("delete file: {}", path.display()))
+            }
+            SyncAction::DeleteDir(path) => progress.info(format!("delete dir: {}", path.display())),
+            SyncAction::ProtectDelete(path) => {
+                progress.detail(format!("protect delete: {}", path.display()));
+            }
+            SyncAction::Warn { path, message } => {
+                progress.info(format!("warning: {}: {message}", path.display()));
+            }
+        }
+    }
+}
+
 fn append_optional_itemized_changes(output: &mut String, enabled: bool, actions: &[SyncAction]) {
     if !enabled {
         return;
@@ -3562,6 +3756,7 @@ mod tests {
             &mut output,
             &mut input,
             RemoteFileChecksum::PlainMd4,
+            None,
         )
         .unwrap();
 
@@ -3585,6 +3780,7 @@ mod tests {
             &mut input,
             RemoteFileChecksum::PlainMd4,
             3,
+            None,
         )
         .unwrap();
 
