@@ -202,11 +202,13 @@ pub fn build_remote_shell_argv(
     options: &RemoteShellOptions,
     path: &Path,
 ) -> Result<Vec<String>, SessionError> {
-    let path = path.to_string_lossy();
-    if path.as_bytes().contains(&0) {
-        return Err(SessionError::NulByteInPath);
-    }
+    build_remote_shell_argv_for_paths(options, &[path])
+}
 
+pub fn build_remote_shell_argv_for_paths(
+    options: &RemoteShellOptions,
+    paths: &[&Path],
+) -> Result<Vec<String>, SessionError> {
     let mut argv = vec!["rsync".to_string(), "--server".to_string()];
     if matches!(options.direction, TransferDirection::Pull) {
         argv.push("--sender".to_string());
@@ -220,6 +222,9 @@ pub fn build_remote_shell_argv(
     if options.delete {
         argv.push("--delete".to_string());
     }
+    if matches!(options.direction, TransferDirection::Pull) && options.recursive {
+        argv.push("--no-inc-recursive".to_string());
+    }
     if options.dry_run {
         argv.push("--dry-run".to_string());
     }
@@ -231,7 +236,7 @@ pub fn build_remote_shell_argv(
         argv.push("-v".to_string());
     }
     argv.push(".".to_string());
-    argv.push(path.into_owned());
+    append_remote_paths(&mut argv, paths)?;
 
     Ok(argv)
 }
@@ -240,17 +245,22 @@ pub fn build_remote_shell_protocol31_argv(
     options: &RemoteShellOptions,
     path: &Path,
 ) -> Result<Vec<String>, SessionError> {
-    let path = path.to_string_lossy();
-    if path.as_bytes().contains(&0) {
-        return Err(SessionError::NulByteInPath);
-    }
+    build_remote_shell_protocol31_argv_for_paths(options, &[path])
+}
 
+pub fn build_remote_shell_protocol31_argv_for_paths(
+    options: &RemoteShellOptions,
+    paths: &[&Path],
+) -> Result<Vec<String>, SessionError> {
     let mut argv = vec!["rsync".to_string(), "--server".to_string()];
     if matches!(options.direction, TransferDirection::Pull) {
         argv.push("--sender".to_string());
     }
     if options.delete {
         argv.push("--delete".to_string());
+    }
+    if matches!(options.direction, TransferDirection::Pull) && options.recursive {
+        argv.push("--no-inc-recursive".to_string());
     }
     append_remote_shell_long_options(&mut argv, options);
 
@@ -274,9 +284,24 @@ pub fn build_remote_shell_protocol31_argv(
 
     argv.push(short_args);
     argv.push(".".to_string());
-    argv.push(path.into_owned());
+    append_remote_paths(&mut argv, paths)?;
 
     Ok(argv)
+}
+
+fn append_remote_paths(argv: &mut Vec<String>, paths: &[&Path]) -> Result<(), SessionError> {
+    if paths.is_empty() {
+        return Err(SessionError::MissingRemotePath(String::new()));
+    }
+
+    for path in paths {
+        let path = path.to_string_lossy();
+        if path.as_bytes().contains(&0) {
+            return Err(SessionError::NulByteInPath);
+        }
+        argv.push(path.into_owned());
+    }
+    Ok(())
 }
 
 fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShellOptions) {
@@ -796,7 +821,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(argv[2], "--sender");
-        assert_eq!(argv[3], "-Wre.LsfxCIvu");
+        assert_eq!(argv[3], "--no-inc-recursive");
+        assert_eq!(argv[4], "-Wre.LsfxCIvu");
+    }
+
+    #[test]
+    fn builds_protocol31_pull_server_argv_with_multiple_remote_paths() {
+        let argv = build_remote_shell_protocol31_argv_for_paths(
+            &RemoteShellOptions {
+                direction: TransferDirection::Pull,
+                recursive: true,
+                ..RemoteShellOptions::default()
+            },
+            &[Path::new("/tmp/one"), Path::new("/tmp/two")],
+        )
+        .unwrap();
+
+        assert_eq!(argv[2], "--sender");
+        assert_eq!(
+            &argv[argv.len() - 3..],
+            &[
+                ".".to_string(),
+                "/tmp/one".to_string(),
+                "/tmp/two".to_string()
+            ]
+        );
+        assert!(argv.contains(&"--no-inc-recursive".to_string()));
     }
 
     #[test]

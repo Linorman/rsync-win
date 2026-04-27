@@ -355,7 +355,6 @@ pub fn read_rsync27_file_list_with_options<R: Read>(
         last_mode = Some(mode);
     }
 
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
 }
 
@@ -582,7 +581,6 @@ pub fn read_rsync31_file_list_with_options<R: Read>(
         last_mode = Some(mode);
     }
 
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
 }
 

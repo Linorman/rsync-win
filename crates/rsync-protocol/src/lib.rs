@@ -18,7 +18,8 @@ pub use io::{
     RSYNC_INDEX_DONE, RSYNC_INDEX_FLIST_EOF, RSYNC_INDEX_FLIST_OFFSET,
 };
 pub use session::{
-    build_remote_shell_argv, build_remote_shell_protocol31_argv, build_ssh_remote_command,
+    build_remote_shell_argv, build_remote_shell_argv_for_paths, build_remote_shell_protocol31_argv,
+    build_remote_shell_protocol31_argv_for_paths, build_ssh_remote_command,
     exchange_remote_shell_handshake, exchange_remote_shell_mvp_handshake,
     exchange_remote_shell_protocol31_handshake, read_multiplexed_i32, read_multiplexed_long,
     rsync_plain_md4_checksum, rsync_plain_md4_checksum_reader, rsync_whole_file_checksum,

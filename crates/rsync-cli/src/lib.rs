@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -18,9 +19,10 @@ use rsync_fs::{
     PortableFileSystem, SymlinkMode, SyncAction, SyncOptions, UpdateMode,
 };
 use rsync_protocol::{
-    build_remote_shell_argv, build_remote_shell_protocol31_argv,
-    exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake, read_i32_le,
-    read_multiplexed_i32, read_multiplexed_long, read_rsync27_file_list_with_options,
+    build_remote_shell_argv_for_paths, build_remote_shell_protocol31_argv,
+    build_remote_shell_protocol31_argv_for_paths, exchange_remote_shell_mvp_handshake,
+    exchange_remote_shell_protocol31_handshake, read_i32_le, read_multiplexed_i32,
+    read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
     read_vstring, rsync_plain_md4_checksum_reader, rsync_whole_file_checksum_reader, write_i32_le,
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_options, write_rsync_i32,
@@ -440,12 +442,12 @@ impl FileProgress {
         if progress.enabled() {
             match total {
                 Some(total) => progress.info(format!(
-                    "{} started: {} ({})",
+                    "{}: {} ({})",
                     operation,
                     meter.path,
                     format_bytes(total)
                 )),
-                None => progress.info(format!("{} started: {}", operation, meter.path)),
+                None => progress.info(format!("{}: {}", operation, meter.path)),
             }
         }
         meter
@@ -453,51 +455,70 @@ impl FileProgress {
 
     fn advance(&mut self, bytes: u64) {
         self.transferred += bytes;
-        if !self.progress.enabled() || self.last_report.elapsed() < Duration::from_secs(1) {
+        if !self.progress.enabled() || self.last_report.elapsed() < Duration::from_secs(2) {
             return;
         }
 
-        self.report("progress");
+        self.report_progress();
         self.last_report = Instant::now();
     }
 
     fn finish(&mut self) {
         if self.progress.enabled() {
-            self.report("finished");
+            self.report_finished();
         }
     }
 
-    fn report(&self, state: &'static str) {
+    fn report_progress(&self) {
         let elapsed = self.started.elapsed();
         let rate = transfer_rate_label(self.transferred, elapsed);
-        let elapsed_suffix = if state == "finished" {
-            format!(", {:.2}s", elapsed.as_secs_f64())
-        } else {
-            String::new()
-        };
         match self.total {
             Some(total) if total > 0 => {
                 let percent = (self.transferred as f64 / total as f64 * 100.0).min(100.0);
                 self.progress.info(format!(
-                    "{} {}: {} - {} / {} ({:.1}%, {}{})",
+                    "{}: {} {} / {} ({:.1}%, {})",
                     self.operation,
-                    state,
+                    self.path,
+                    format_bytes(self.transferred),
+                    format_bytes(total),
+                    percent,
+                    rate
+                ));
+            }
+            Some(_) | None => self.progress.info(format!(
+                "{}: {} {} ({})",
+                self.operation,
+                self.path,
+                format_bytes(self.transferred),
+                rate
+            )),
+        }
+    }
+
+    fn report_finished(&self) {
+        let elapsed = self.started.elapsed();
+        let rate = transfer_rate_label(self.transferred, elapsed);
+        match self.total {
+            Some(total) if total > 0 => {
+                let percent = (self.transferred as f64 / total as f64 * 100.0).min(100.0);
+                self.progress.info(format!(
+                    "{} done: {} {} / {} ({:.1}%, {}, {:.2}s)",
+                    self.operation,
                     self.path,
                     format_bytes(self.transferred),
                     format_bytes(total),
                     percent,
                     rate,
-                    elapsed_suffix
+                    elapsed.as_secs_f64()
                 ));
             }
             Some(_) | None => self.progress.info(format!(
-                "{} {}: {} - {} ({}{})",
+                "{} done: {} {} ({}, {:.2}s)",
                 self.operation,
-                state,
                 self.path,
                 format_bytes(self.transferred),
                 rate,
-                elapsed_suffix
+                elapsed.as_secs_f64()
             )),
         }
     }
@@ -571,10 +592,11 @@ fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         .as_ref()
         .context("remote-shell command was not planned")?;
     progress.info(format!(
-        "remote-shell {} starting via {}",
+        "remote-shell {} started: {}",
         transfer_direction_label(direction),
-        command.display_command()
+        remote_session_label(&plan, direction)
     ));
+    progress.detail(format!("remote command: {}", command.display_command()));
 
     let mut transport = spawn_ssh_remote_command(command)
         .with_context(|| format!("failed to spawn {}", command.display_command()))?;
@@ -684,7 +706,17 @@ fn build_protocol27_fallback_command(
         .context("remote operand was not planned")?;
     let protocol = RemoteWireProtocol::Compat27;
     debug_assert_eq!(protocol.protocol_number(), REMOTE_SHELL_MVP_PROTOCOL);
-    let argv = build_remote_shell_argv(
+    let remote_paths: Vec<PathBuf> =
+        if direction == TransferDirection::Pull && !plan.remote_operands.is_empty() {
+            plan.remote_operands
+                .iter()
+                .map(|operand| PathBuf::from(&operand.path))
+                .collect()
+        } else {
+            vec![PathBuf::from(&remote.path)]
+        };
+    let remote_path_refs: Vec<&Path> = remote_paths.iter().map(PathBuf::as_path).collect();
+    let argv = build_remote_shell_argv_for_paths(
         &RemoteShellOptions {
             direction,
             recursive: plan.recursive,
@@ -723,7 +755,7 @@ fn build_protocol27_fallback_command(
             copy_unsafe_links: direction == TransferDirection::Pull
                 && plan.symlink_mode == SymlinkMode::CopyUnsafe,
         },
-        Path::new(&remote.path),
+        &remote_path_refs,
     )?;
     build_remote_transport_command(cli, &remote.host, &argv)
 }
@@ -781,7 +813,7 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     let sources = local_source_paths(cli);
     log_source_storage_notes(progress, &sources);
     let files_from = load_files_from(cli)?;
-    progress.info("building local file list for upload");
+    progress.info("building upload file list");
     let entries = collect_local_source_entries(
         &sources,
         plan.recursive,
@@ -793,15 +825,15 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
     progress.info(format!(
-        "upload file list ready: {} entries, {} files, {} bytes",
-        entries.len(),
+        "upload list: {} files, {}",
         file_count,
-        total_file_bytes
+        format_bytes(total_file_bytes)
     ));
+    progress.detail(format!("upload list entries: {}", entries.len(),));
 
     let handshake = exchange_remote_shell_mvp_handshake(transport)?;
-    progress.info(format!(
-        "remote rsync protocol {} negotiated",
+    progress.detail(format!(
+        "protocol: rsync {}",
         handshake.selected_protocol.value()
     ));
     if plan.delete {
@@ -841,8 +873,8 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         handshake.peer_protocol
     ));
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
-    output.push_str(&format!("files offered: {}\n", entries.len()));
-    output.push_str(&format!("file bytes offered: {}\n", total_file_bytes));
+    output.push_str(&format!("files offered: {}\n", file_count));
+    output.push_str(&format!("bytes offered: {}\n", total_file_bytes));
     output.push_str(&format!("files sent: {}\n", stats.files));
     output.push_str(&format!("bytes sent: {}\n", stats.bytes));
     append_remote_push_quick_check_note(&mut output, plan, file_count, total_file_bytes, stats);
@@ -859,7 +891,7 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     let sources = local_source_paths(cli);
     log_source_storage_notes(progress, &sources);
     let files_from = load_files_from(cli)?;
-    progress.info("building local file list for upload");
+    progress.info("building upload file list");
     let entries = collect_local_source_entries(
         &sources,
         plan.recursive,
@@ -871,15 +903,15 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
     progress.info(format!(
-        "upload file list ready: {} entries, {} files, {} bytes",
-        entries.len(),
+        "upload list: {} files, {}",
         file_count,
-        total_file_bytes
+        format_bytes(total_file_bytes)
     ));
+    progress.detail(format!("upload list entries: {}", entries.len(),));
 
     let handshake = exchange_remote_shell_protocol31_handshake(transport)?;
-    progress.info(format!(
-        "remote rsync protocol {} negotiated",
+    progress.detail(format!(
+        "protocol: rsync {}",
         handshake.selected_protocol.value()
     ));
     {
@@ -921,8 +953,8 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         output.push_str(&format!("checksum negotiation: {checksum_name}\n"));
     }
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
-    output.push_str(&format!("files offered: {}\n", entries.len()));
-    output.push_str(&format!("file bytes offered: {}\n", total_file_bytes));
+    output.push_str(&format!("files offered: {}\n", file_count));
+    output.push_str(&format!("bytes offered: {}\n", total_file_bytes));
     output.push_str(&format!("files sent: {}\n", stats.files));
     output.push_str(&format!("bytes sent: {}\n", stats.bytes));
     append_remote_push_quick_check_note(&mut output, plan, file_count, total_file_bytes, stats);
@@ -949,14 +981,14 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
-    let dest = Path::new(&cli.paths[1]);
+    let dest = Path::new(cli.paths.last().expect("checked operand count"));
     let handshake = exchange_remote_shell_mvp_handshake(transport)?;
     let mut mux = MultiplexReadState::default();
 
     write_rsync_i32(transport, 0)?;
     transport.flush()?;
 
-    let entries = {
+    let mut entries = {
         let mut reader = MultiplexedReader::new(transport, &mut mux);
         read_rsync27_file_list_with_options(
             &mut reader,
@@ -965,6 +997,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
             plan.update_mode == UpdateMode::Checksum,
         )?
     };
+    sort_remote_entries_for_sender_indexes(&mut entries);
     let files_from = load_files_from(cli)?;
     let selected_indexes =
         selected_remote_entry_indexes(&entries, &plan.filter_rules, files_from.as_deref());
@@ -1062,7 +1095,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
     let mut output = String::new();
     output.push_str("rsync-win remote-shell pull\n");
     output.push_str("direction: download (remote -> local)\n");
-    output.push_str(&format!("source: {}:{}\n", remote.host, remote.path));
+    append_remote_pull_sources_summary(&mut output, plan, remote);
     output.push_str(&format!("destination: {}\n", dest.display()));
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
@@ -1070,18 +1103,9 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
         handshake.peer_protocol
     ));
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
-    output.push_str("actions:\n");
-    if actions.is_empty() {
-        output.push_str("- no changes\n");
-    } else {
-        for action in &actions {
-            append_sync_action(&mut output, action);
-        }
-    }
-    append_optional_itemized_changes(&mut output, cli.itemize_changes, &actions);
+    append_action_report(&mut output, cli, &actions);
     output.push_str(&format!("files received: {}\n", stats.files));
     output.push_str(&format!("bytes received: {}\n", stats.bytes));
-    append_structured_stats(&mut output, cli.stats, &actions);
     append_remote_messages(&mut output, &mux);
     Ok(output)
 }
@@ -1091,7 +1115,7 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
-    let dest = Path::new(&cli.paths[1]);
+    let dest = Path::new(cli.paths.last().expect("checked operand count"));
     let handshake = exchange_remote_shell_protocol31_handshake(transport)?;
     let mut mux = MultiplexReadState::default();
 
@@ -1101,7 +1125,7 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
         writer.flush()?;
     }
 
-    let entries = {
+    let mut entries = {
         let mut reader = MultiplexedReader::new(transport, &mut mux);
         read_rsync31_file_list_with_options(
             &mut reader,
@@ -1110,6 +1134,7 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
             plan.update_mode == UpdateMode::Checksum,
         )?
     };
+    sort_remote_entries_for_sender_indexes(&mut entries);
     let files_from = load_files_from(cli)?;
     let selected_indexes =
         selected_remote_entry_indexes(&entries, &plan.filter_rules, files_from.as_deref());
@@ -1211,7 +1236,7 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
     let mut output = String::new();
     output.push_str("rsync-win remote-shell pull\n");
     output.push_str("direction: download (remote -> local)\n");
-    output.push_str(&format!("source: {}:{}\n", remote.host, remote.path));
+    append_remote_pull_sources_summary(&mut output, plan, remote);
     output.push_str(&format!("destination: {}\n", dest.display()));
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
@@ -1222,18 +1247,9 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
         output.push_str(&format!("checksum negotiation: {checksum_name}\n"));
     }
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
-    output.push_str("actions:\n");
-    if actions.is_empty() {
-        output.push_str("- no changes\n");
-    } else {
-        for action in &actions {
-            append_sync_action(&mut output, action);
-        }
-    }
-    append_optional_itemized_changes(&mut output, cli.itemize_changes, &actions);
+    append_action_report(&mut output, cli, &actions);
     output.push_str(&format!("files received: {}\n", stats.files));
     output.push_str(&format!("bytes received: {}\n", stats.bytes));
-    append_structured_stats(&mut output, cli.stats, &actions);
     append_remote_messages(&mut output, &mux);
     Ok(output)
 }
@@ -1287,17 +1303,7 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         append_diagnostics(&mut output, &plan.report);
     }
 
-    output.push_str("actions:\n");
-    if sync_report.actions().is_empty() {
-        output.push_str("- no changes\n");
-    } else {
-        for action in sync_report.actions() {
-            append_sync_action(&mut output, action);
-        }
-    }
-    append_optional_itemized_changes(&mut output, cli.itemize_changes, sync_report.actions());
-    output.push_str(&format!("stats: {} actions\n", sync_report.actions().len()));
-    append_structured_stats(&mut output, cli.stats, sync_report.actions());
+    append_action_report(&mut output, cli, sync_report.actions());
 
     Ok(output)
 }
@@ -1318,6 +1324,50 @@ fn append_sources_summary(output: &mut String, sources: &[PathBuf]) {
     output.push_str(&format!("sources: {}\n", sources.len()));
     for source in sources {
         output.push_str(&format!("- source {}\n", source.display()));
+    }
+}
+
+fn append_remote_pull_sources_summary(
+    output: &mut String,
+    plan: &TransferPlan,
+    fallback_remote: &RemoteShellOperand,
+) {
+    let sources = if plan.remote_operands.is_empty() {
+        std::slice::from_ref(fallback_remote)
+    } else {
+        plan.remote_operands.as_slice()
+    };
+
+    if sources.len() == 1 {
+        output.push_str(&format!(
+            "source: {}:{}\n",
+            sources[0].host, sources[0].path
+        ));
+        return;
+    }
+
+    output.push_str(&format!("sources: {}\n", sources.len()));
+    for source in sources {
+        output.push_str(&format!("- source {}:{}\n", source.host, source.path));
+    }
+}
+
+fn remote_session_label(plan: &TransferPlan, direction: TransferDirection) -> String {
+    let Some(remote) = plan.remote_operand.as_ref() else {
+        return "remote".to_string();
+    };
+
+    if direction == TransferDirection::Pull && plan.remote_operands.len() > 1 {
+        return format!(
+            "{} sources from {}",
+            plan.remote_operands.len(),
+            remote.host
+        );
+    }
+
+    match direction {
+        TransferDirection::Push => format!("to {}:{}", remote.host, remote.path),
+        TransferDirection::Pull => format!("from {}:{}", remote.host, remote.path),
     }
 }
 
@@ -1842,11 +1892,6 @@ fn serve_remote_receiver_requests<T: Read + Write>(
             Some(&mut file_progress),
         )?;
         file_progress.finish();
-        progress.info(format!(
-            "upload complete: {} ({} sent)",
-            entry.wire.path.display(),
-            format_bytes(literal_bytes)
-        ));
         stats.files += 1;
         stats.bytes += literal_bytes;
     }
@@ -1995,11 +2040,6 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             };
             writer.flush()?;
             file_progress.finish();
-            progress.info(format!(
-                "upload complete: {} ({} sent)",
-                entry.wire.path.display(),
-                format_bytes(literal_bytes)
-            ));
             stats.bytes += literal_bytes;
         }
         stats.files += 1;
@@ -2383,6 +2423,73 @@ fn remote_entry_is_top_dir(entry: &RsyncFileListEntry) -> bool {
     entry.file_type == WireFileType::Directory && entry.path == Path::new(".")
 }
 
+fn sort_remote_entries_for_sender_indexes(entries: &mut [RsyncFileListEntry]) {
+    let directories: BTreeSet<PathBuf> = entries
+        .iter()
+        .filter(|entry| entry.file_type == WireFileType::Directory)
+        .map(|entry| entry.path.clone())
+        .collect();
+
+    entries.sort_by(|left, right| remote_sender_entry_cmp(left, right, &directories));
+}
+
+fn remote_sender_entry_cmp(
+    left: &RsyncFileListEntry,
+    right: &RsyncFileListEntry,
+    directories: &BTreeSet<PathBuf>,
+) -> Ordering {
+    if left.path == right.path {
+        return Ordering::Equal;
+    }
+    if remote_entry_is_top_dir(left) {
+        return Ordering::Less;
+    }
+    if remote_entry_is_top_dir(right) {
+        return Ordering::Greater;
+    }
+
+    let left_components = normal_path_components(&left.path);
+    let right_components = normal_path_components(&right.path);
+    let shared = left_components.len().min(right_components.len());
+
+    for index in 0..shared {
+        let left_component = &left_components[index];
+        let right_component = &right_components[index];
+        if left_component == right_component {
+            continue;
+        }
+
+        let left_prefix = path_from_components(&left_components[..=index]);
+        let right_prefix = path_from_components(&right_components[..=index]);
+        let left_is_directory = directories.contains(&left_prefix);
+        let right_is_directory = directories.contains(&right_prefix);
+        match (left_is_directory, right_is_directory) {
+            (false, true) => return Ordering::Less,
+            (true, false) => return Ordering::Greater,
+            _ => return left_component.cmp(right_component),
+        }
+    }
+
+    left_components.len().cmp(&right_components.len())
+}
+
+fn normal_path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn path_from_components(components: &[String]) -> PathBuf {
+    let mut path = PathBuf::new();
+    for component in components {
+        path.push(component);
+    }
+    path
+}
+
 fn selected_remote_entry_indexes(
     entries: &[RsyncFileListEntry],
     filter_rules: &RuleSet,
@@ -2481,11 +2588,8 @@ fn remote_entry_mtime(entry: &RsyncFileListEntry) -> Option<SystemTime> {
 }
 
 fn remote_file_index_offset(entries: &[RsyncFileListEntry]) -> i32 {
-    if entries.first().is_some_and(remote_entry_is_top_dir) {
-        0
-    } else {
-        1
-    }
+    let _ = entries;
+    0
 }
 
 fn remote_wire_index(index: usize, offset: i32) -> Result<i32> {
@@ -3001,6 +3105,7 @@ struct TransferPlan {
     remote_ssh_argv: Option<Vec<String>>,
     remote_ssh_command: Option<SshRemoteCommand>,
     remote_operand: Option<RemoteShellOperand>,
+    remote_operands: Vec<RemoteShellOperand>,
     remote_direction: Option<TransferDirection>,
     remote_wire_protocol: Option<RemoteWireProtocol>,
     report: Report,
@@ -3053,61 +3158,111 @@ impl TransferPlan {
             remote_ssh_argv,
             remote_ssh_command,
             remote_operand,
+            remote_operands,
             remote_direction,
             remote_wire_protocol,
         ) = if cli.paths.len() >= 2 {
-            let source = cli.paths.first().expect("checked len");
+            let sources = &cli.paths[..cli.paths.len() - 1];
             let destination = cli.paths.last().expect("checked len");
-            let source_remote = parse_remote_shell_operand(source, &mut report);
+            let source_remotes: Vec<_> = sources
+                .iter()
+                .map(|source| parse_remote_shell_operand(source, &mut report))
+                .collect();
             let destination_remote = parse_remote_shell_operand(destination, &mut report);
-            if source_remote.is_none() && destination_remote.is_none() {
-                (None, None, None, None, None, None)
-            } else if source_remote.is_some() && destination_remote.is_some() {
+            let any_source_remote = source_remotes.iter().any(Option::is_some);
+            if !any_source_remote && destination_remote.is_none() {
+                (None, None, None, None, Vec::new(), None, None)
+            } else if any_source_remote && destination_remote.is_some() {
                 report.error(
                     "E_REMOTE_BOTH",
                     "remote-to-remote transfers are not supported by this development build",
                 );
-                (None, None, None, None, None, None)
-            } else {
-                let remote = source_remote
-                    .as_ref()
-                    .or(destination_remote.as_ref())
-                    .expect("checked one remote operand");
-                let direction = if source_remote.is_some() {
-                    TransferDirection::Pull
+                (None, None, None, None, Vec::new(), None, None)
+            } else if any_source_remote {
+                if !source_remotes.iter().all(Option::is_some) {
+                    report.error(
+                        "E_REMOTE_MIXED_SOURCES",
+                        "remote-shell pull sources must all be remote operands from the same host",
+                    );
+                    (None, None, None, None, Vec::new(), None, None)
                 } else {
-                    TransferDirection::Push
-                };
+                    let remotes: Vec<_> = source_remotes.into_iter().flatten().collect();
+                    let remote = remotes.first().expect("checked remote source");
+                    if remotes.iter().any(|operand| operand.host != remote.host) {
+                        report.error(
+                            "E_REMOTE_HOST_MISMATCH",
+                            "remote-shell pull sources must use the same remote host",
+                        );
+                        (None, None, None, None, Vec::new(), None, None)
+                    } else {
+                        let direction = TransferDirection::Pull;
+                        let remote_paths: Vec<PathBuf> = remotes
+                            .iter()
+                            .map(|operand| PathBuf::from(&operand.path))
+                            .collect();
+                        let remote_path_refs: Vec<&Path> =
+                            remote_paths.iter().map(PathBuf::as_path).collect();
+                        match build_remote_shell_protocol31_argv_for_paths(
+                            &remote_shell_options_from_cli(
+                                cli,
+                                direction,
+                                recursive,
+                                preserve_times,
+                                symlink_mode,
+                            ),
+                            &remote_path_refs,
+                        ) {
+                            Ok(argv) => {
+                                match build_remote_transport_command(cli, &remote.host, &argv) {
+                                    Ok(ssh_command) => {
+                                        report.info(
+                                        "I_REMOTE_PROTOCOL31_MVP",
+                                        format!(
+                                            "remote-shell execution tries protocol {REMOTE_SHELL_MODERN_PROTOCOL} first for the ordinary-file MVP"
+                                        ),
+                                    );
+                                        (
+                                            Some(argv),
+                                            Some(render_ssh_command(&ssh_command)),
+                                            Some(ssh_command),
+                                            Some(remote.clone()),
+                                            remotes,
+                                            Some(direction),
+                                            Some(RemoteWireProtocol::Modern31),
+                                        )
+                                    }
+                                    Err(err) => {
+                                        report.error(
+                                            "E_REMOTE_SHELL",
+                                            format!("could not parse remote shell command: {err}"),
+                                        );
+                                        (None, None, None, None, Vec::new(), None, None)
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                report.error(
+                                    "E_REMOTE_ARGV",
+                                    format!("could not build remote --server argv: {err}"),
+                                );
+                                (None, None, None, None, Vec::new(), None, None)
+                            }
+                        }
+                    }
+                }
+            } else {
+                let remote = destination_remote
+                    .as_ref()
+                    .expect("checked remote destination");
+                let direction = TransferDirection::Push;
                 match build_remote_shell_protocol31_argv(
-                    &RemoteShellOptions {
+                    &remote_shell_options_from_cli(
+                        cli,
                         direction,
                         recursive,
                         preserve_times,
-                        delete: cli.delete,
-                        dry_run: cli.dry_run,
-                        whole_file: cli.whole_file
-                            && !(direction == TransferDirection::Push && cli.append_verify),
-                        verbosity: cli.verbosity,
-                        checksum: cli.checksum,
-                        size_only: direction == TransferDirection::Push && cli.size_only,
-                        ignore_times: direction == TransferDirection::Push && cli.ignore_times,
-                        partial: direction == TransferDirection::Push && cli.partial,
-                        partial_dir: (direction == TransferDirection::Push)
-                            .then(|| cli.partial_dir.clone())
-                            .flatten(),
-                        inplace: direction == TransferDirection::Push && cli.inplace,
-                        append_verify: direction == TransferDirection::Push && cli.append_verify,
-                        numeric_ids: direction == TransferDirection::Push && cli.numeric_ids,
-                        chmod: (direction == TransferDirection::Push)
-                            .then(|| cli.chmod.clone())
-                            .flatten(),
-                        copy_links: direction == TransferDirection::Pull
-                            && symlink_mode == SymlinkMode::CopyAll,
-                        safe_links: direction == TransferDirection::Push
-                            && symlink_mode == SymlinkMode::SafeOnly,
-                        copy_unsafe_links: direction == TransferDirection::Pull
-                            && symlink_mode == SymlinkMode::CopyUnsafe,
-                    },
+                        symlink_mode,
+                    ),
                     Path::new(&remote.path),
                 ) {
                     Ok(argv) => match build_remote_transport_command(cli, &remote.host, &argv) {
@@ -3123,6 +3278,7 @@ impl TransferPlan {
                                 Some(render_ssh_command(&ssh_command)),
                                 Some(ssh_command),
                                 Some(remote.clone()),
+                                vec![remote.clone()],
                                 Some(direction),
                                 Some(RemoteWireProtocol::Modern31),
                             )
@@ -3132,7 +3288,7 @@ impl TransferPlan {
                                 "E_REMOTE_SHELL",
                                 format!("could not parse remote shell command: {err}"),
                             );
-                            (None, None, None, None, None, None)
+                            (None, None, None, None, Vec::new(), None, None)
                         }
                     },
                     Err(err) => {
@@ -3140,12 +3296,12 @@ impl TransferPlan {
                             "E_REMOTE_ARGV",
                             format!("could not build remote --server argv: {err}"),
                         );
-                        (None, None, None, None, None, None)
+                        (None, None, None, None, Vec::new(), None, None)
                     }
                 }
             }
         } else {
-            (None, None, None, None, None, None)
+            (None, None, None, None, Vec::new(), None, None)
         };
 
         Self {
@@ -3169,10 +3325,46 @@ impl TransferPlan {
             remote_ssh_argv,
             remote_ssh_command,
             remote_operand,
+            remote_operands,
             remote_direction,
             remote_wire_protocol,
             report,
         }
+    }
+}
+
+fn remote_shell_options_from_cli(
+    cli: &Cli,
+    direction: TransferDirection,
+    recursive: bool,
+    preserve_times: bool,
+    symlink_mode: SymlinkMode,
+) -> RemoteShellOptions {
+    RemoteShellOptions {
+        direction,
+        recursive,
+        preserve_times,
+        delete: cli.delete,
+        dry_run: cli.dry_run,
+        whole_file: cli.whole_file && !(direction == TransferDirection::Push && cli.append_verify),
+        verbosity: cli.verbosity,
+        checksum: cli.checksum,
+        size_only: direction == TransferDirection::Push && cli.size_only,
+        ignore_times: direction == TransferDirection::Push && cli.ignore_times,
+        partial: direction == TransferDirection::Push && cli.partial,
+        partial_dir: (direction == TransferDirection::Push)
+            .then(|| cli.partial_dir.clone())
+            .flatten(),
+        inplace: direction == TransferDirection::Push && cli.inplace,
+        append_verify: direction == TransferDirection::Push && cli.append_verify,
+        numeric_ids: direction == TransferDirection::Push && cli.numeric_ids,
+        chmod: (direction == TransferDirection::Push)
+            .then(|| cli.chmod.clone())
+            .flatten(),
+        copy_links: direction == TransferDirection::Pull && symlink_mode == SymlinkMode::CopyAll,
+        safe_links: direction == TransferDirection::Push && symlink_mode == SymlinkMode::SafeOnly,
+        copy_unsafe_links: direction == TransferDirection::Pull
+            && symlink_mode == SymlinkMode::CopyUnsafe,
     }
 }
 
@@ -3356,9 +3548,6 @@ fn ensure_remote_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
     if plan.remote_ssh_command.is_none() {
         bail!("remote-shell execution could not be planned; run with --plan for diagnostics");
     }
-    if plan.remote_direction == Some(TransferDirection::Pull) && cli.paths.len() != 2 {
-        bail!("remote-shell pull currently supports one remote source and one local destination");
-    }
     if plan.remote_direction == Some(TransferDirection::Push)
         && cli.paths[..cli.paths.len() - 1]
             .iter()
@@ -3410,6 +3599,74 @@ fn append_diagnostics(output: &mut String, report: &Report) {
     }
 }
 
+fn append_action_report(output: &mut String, cli: &Cli, actions: &[SyncAction]) {
+    append_compact_action_summary(output, actions);
+
+    let expand_actions = cli.dry_run || cli.verbosity > 1;
+    if expand_actions {
+        output.push_str("actions:\n");
+        if actions.is_empty() {
+            output.push_str("- no changes\n");
+        } else {
+            for action in actions {
+                append_sync_action(output, action);
+            }
+        }
+    } else {
+        append_action_warnings(output, actions);
+    }
+
+    append_optional_itemized_changes(output, cli.itemize_changes, actions);
+    append_structured_stats(output, cli.stats, actions);
+}
+
+fn append_compact_action_summary(output: &mut String, actions: &[SyncAction]) {
+    if actions.is_empty() {
+        output.push_str("changes: none\n");
+        return;
+    }
+
+    let stats = ActionStats::from_actions(actions);
+    let mut parts = vec![format!("{} actions", actions.len())];
+    if stats.file_writes > 0 {
+        parts.push(format!("{} file writes", stats.file_writes));
+    }
+    if stats.appended_files > 0 {
+        parts.push(format!("{} appends", stats.appended_files));
+    }
+    if stats.file_write_bytes > 0 {
+        parts.push(format!(
+            "{} data",
+            format_bytes(stats.file_write_bytes as u64)
+        ));
+    }
+    if stats.created_dirs > 0 {
+        parts.push(format!("{} dirs", stats.created_dirs));
+    }
+    let deletes = stats.deleted_files + stats.deleted_dirs;
+    if deletes > 0 {
+        parts.push(format!("{} deletes", deletes));
+    }
+    if stats.protected_deletes > 0 {
+        parts.push(format!("{} protected", stats.protected_deletes));
+    }
+    if stats.preserved_mtimes > 0 {
+        parts.push(format!("{} mtimes", stats.preserved_mtimes));
+    }
+    if stats.warnings > 0 {
+        parts.push(format!("{} warnings", stats.warnings));
+    }
+    output.push_str(&format!("changes: {}\n", parts.join(", ")));
+}
+
+fn append_action_warnings(output: &mut String, actions: &[SyncAction]) {
+    for action in actions {
+        if let SyncAction::Warn { path, message } = action {
+            output.push_str(&format!("- warning {}: {message}\n", path.display()));
+        }
+    }
+}
+
 fn append_sync_action(output: &mut String, action: &SyncAction) {
     match action {
         SyncAction::CreateDir(path) => {
@@ -3452,19 +3709,21 @@ fn log_sync_actions(progress: ProgressLog, actions: &[SyncAction]) {
 
     for action in actions {
         match action {
-            SyncAction::CreateDir(path) => progress.info(format!("create dir: {}", path.display())),
+            SyncAction::CreateDir(path) => {
+                progress.detail(format!("create dir: {}", path.display()))
+            }
             SyncAction::WriteFile { path, len } => progress.info(format!(
-                "write file: {} ({})",
+                "write: {} ({})",
                 path.display(),
                 format_bytes(*len as u64)
             )),
             SyncAction::WriteFileInPlace { path, len } => progress.info(format!(
-                "write file inplace: {} ({})",
+                "write inplace: {} ({})",
                 path.display(),
                 format_bytes(*len as u64)
             )),
             SyncAction::AppendFile { path, len } => progress.info(format!(
-                "append file: {} ({})",
+                "append: {} ({})",
                 path.display(),
                 format_bytes(*len as u64)
             )),
@@ -3534,10 +3793,7 @@ fn append_structured_stats(output: &mut String, enabled: bool, actions: &[SyncAc
         return;
     }
 
-    let mut stats = ActionStats::default();
-    for action in actions {
-        stats.record(action);
-    }
+    let stats = ActionStats::from_actions(actions);
     output.push_str("structured stats:\n");
     output.push_str(&format!("- actions: {}\n", actions.len()));
     output.push_str(&format!(
@@ -3546,6 +3802,7 @@ fn append_structured_stats(output: &mut String, enabled: bool, actions: &[SyncAc
     ));
     output.push_str(&format!("- appended files: {}\n", stats.appended_files));
     output.push_str(&format!("- directories created: {}\n", stats.created_dirs));
+    output.push_str(&format!("- mtimes preserved: {}\n", stats.preserved_mtimes));
     output.push_str(&format!("- deleted files: {}\n", stats.deleted_files));
     output.push_str(&format!("- deleted directories: {}\n", stats.deleted_dirs));
     output.push_str(&format!(
@@ -3561,6 +3818,7 @@ struct ActionStats {
     file_write_bytes: usize,
     appended_files: usize,
     created_dirs: usize,
+    preserved_mtimes: usize,
     deleted_files: usize,
     deleted_dirs: usize,
     protected_deletes: usize,
@@ -3568,6 +3826,14 @@ struct ActionStats {
 }
 
 impl ActionStats {
+    fn from_actions(actions: &[SyncAction]) -> Self {
+        let mut stats = Self::default();
+        for action in actions {
+            stats.record(action);
+        }
+        stats
+    }
+
     fn record(&mut self, action: &SyncAction) {
         match action {
             SyncAction::CreateDir(_) => self.created_dirs += 1,
@@ -3579,7 +3845,7 @@ impl ActionStats {
                 self.appended_files += 1;
                 self.file_write_bytes += *len;
             }
-            SyncAction::PreserveMtime(_) => {}
+            SyncAction::PreserveMtime(_) => self.preserved_mtimes += 1,
             SyncAction::DeleteFile(_) => self.deleted_files += 1,
             SyncAction::DeleteDir(_) => self.deleted_dirs += 1,
             SyncAction::ProtectDelete(_) => self.protected_deletes += 1,
@@ -3667,7 +3933,7 @@ mod tests {
     fn renders_version_with_protocol_range() {
         let output = parse_and_render(["rsync-win", "--version"]);
 
-        assert!(output.contains("rsync-win 0.1.4"));
+        assert!(output.contains(&format!("rsync-win {}", env!("CARGO_PKG_VERSION"))));
         assert!(output.contains("protocol primitives range: 20-32"));
     }
 
@@ -3908,6 +4174,70 @@ mod tests {
     }
 
     #[test]
+    fn remote_pull_plan_accepts_multiple_sources_from_same_host() {
+        let output = parse_and_render([
+            "rsync-win",
+            "-r",
+            "--plan",
+            "user@example.test:/tmp/one",
+            "user@example.test:/tmp/two",
+            "dest",
+        ]);
+        let server_line = output
+            .lines()
+            .find(|line| line.starts_with("remote --server argv:"))
+            .unwrap();
+
+        assert!(output.contains("remote direction: download (remote -> local)"));
+        assert!(server_line.contains("--sender"));
+        assert!(server_line.contains("--no-inc-recursive"));
+        assert!(server_line.ends_with(" . /tmp/one /tmp/two"));
+        assert!(!output.contains("[error] E_REMOTE"));
+    }
+
+    #[test]
+    fn remote_pull_plan_rejects_multiple_hosts() {
+        let output = parse_and_render([
+            "rsync-win",
+            "-r",
+            "--plan",
+            "one@example.test:/tmp/one",
+            "two@example.test:/tmp/two",
+            "dest",
+        ]);
+
+        assert!(output.contains("[error] E_REMOTE_HOST_MISMATCH"));
+        assert!(!output.contains("remote --server argv:"));
+    }
+
+    #[test]
+    fn remote_pull_sender_index_sort_places_files_before_directory_walks() {
+        let mut entries = vec![
+            test_remote_entry(".", WireFileType::Directory),
+            test_remote_entry("analysis", WireFileType::Directory),
+            test_remote_entry("subdir", WireFileType::Directory),
+            test_remote_entry("root.txt", WireFileType::File),
+            test_remote_entry("analysis/config_overview.json", WireFileType::File),
+            test_remote_entry("subdir/a.txt", WireFileType::File),
+        ];
+
+        sort_remote_entries_for_sender_indexes(&mut entries);
+
+        let paths: Vec<_> = entries.iter().map(|entry| entry.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                Path::new("."),
+                Path::new("root.txt"),
+                Path::new("analysis"),
+                Path::new("analysis/config_overview.json"),
+                Path::new("subdir"),
+                Path::new("subdir/a.txt"),
+            ]
+        );
+    }
+
+    #[test]
     fn remote_push_routes_append_verify_without_whole_file() {
         let output = parse_and_render([
             "rsync-win",
@@ -3969,7 +4299,7 @@ mod tests {
         assert!(output.contains("rsync-win remote-shell push"));
         assert!(output.contains("protocol: 31 (peer advertised 31)"));
         assert!(output.contains("checksum negotiation: md4"));
-        assert!(output.contains("files offered: 2"));
+        assert!(output.contains("files offered: 1"));
         assert!(output.contains("files sent: 0"));
         assert!(transport.written.starts_with(&31_u32.to_le_bytes()));
         assert!(transport
@@ -4066,7 +4396,7 @@ mod tests {
 
         let output = execute_remote_push(&cli, &plan, &mut transport).unwrap();
 
-        assert!(output.contains("files offered: 2"));
+        assert!(output.contains("files offered: 1"));
         assert!(transport
             .written
             .windows("file.txt".len())
@@ -4132,8 +4462,8 @@ mod tests {
         assert!(output.contains("files received: 1"));
         assert!(dest.join("skip.tmp").exists());
         let payloads = written_protocol31_mux_payloads(&transport.written);
-        assert!(payloads.iter().any(|payload| payload == &[2]));
-        assert!(!payloads.iter().any(|payload| payload == &[3]));
+        assert!(payloads.iter().any(|payload| payload == &[1]));
+        assert!(!payloads.iter().any(|payload| payload == &[2]));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -4248,8 +4578,10 @@ mod tests {
         assert_eq!(fs::read(dest.join("nested/file.txt")).unwrap(), b"new");
         assert!(!dest.join("old.txt").exists());
         assert!(output.contains("rsync-win local portable sync"));
-        assert!(output.contains("write-file"));
-        assert!(output.contains("delete-file"));
+        assert!(output.contains("changes:"));
+        assert!(output.contains("file writes"));
+        assert!(output.contains("deletes"));
+        assert!(!output.contains("actions:\n"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -4276,7 +4608,8 @@ mod tests {
         assert_eq!(fs::read(dest.join("one.txt")).unwrap(), b"one");
         assert_eq!(fs::read(dest.join("dir/nested/two.txt")).unwrap(), b"two");
         assert!(output.contains("sources: 2"));
-        assert!(output.contains("write-file"));
+        assert!(output.contains("changes:"));
+        assert!(output.contains("file writes"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -4331,10 +4664,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(dest.join("file.txt")).unwrap(), b"abcdef");
-        assert!(output.contains("append-file"));
         assert!(output.contains("itemized changes:"));
         assert!(output.contains(">f+++++a+++"));
         assert!(output.contains("structured stats:"));
+        assert!(output.contains("- appended files: 1"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -4352,6 +4685,7 @@ mod tests {
         let output = parse_and_execute(vec![
             "rsync-win".to_string(),
             "-r".to_string(),
+            "-vv".to_string(),
             "--ignore-times".to_string(),
             "--inplace".to_string(),
             source.to_string_lossy().into_owned(),
@@ -4422,6 +4756,20 @@ mod tests {
             .unwrap_or_default();
         path.push(format!("{prefix}-{}-{nanos}", std::process::id()));
         path
+    }
+
+    fn test_remote_entry(path: &str, file_type: WireFileType) -> RsyncFileListEntry {
+        RsyncFileListEntry {
+            path: PathBuf::from(path),
+            file_type,
+            len: 0,
+            mtime_unix: 0,
+            mode: match file_type {
+                WireFileType::Directory => RSYNC_DIRECTORY_MODE,
+                _ => RSYNC_REGULAR_FILE_MODE,
+            },
+            checksum: None,
+        }
     }
 
     fn remote_push_dry_run_input() -> Vec<u8> {
