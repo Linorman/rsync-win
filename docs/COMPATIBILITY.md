@@ -45,5 +45,9 @@ cargo test --workspace --all-features
 cargo clippy --workspace --all-features -- -D warnings
 cargo bench -p rsync-fs --bench local_sync
 rsync-win -rt --delete .\source .\dest
-rsync-win --plan -avz --no-o --no-g -e "ssh -p 22" .\source\ user@host:/tmp/rsync-win-smoke/
+$env:RSYNC_WIN_SSH_TARGET = "user@host"
+$env:RSYNC_WIN_SSH_TMP_ROOT = "/tmp"
+cargo test -p rsync-cli --test interop_discovery --all-features -- --nocapture
 ```
+
+`RSYNC_WIN_SSH_TARGET` enables disposable remote-shell smoke tests against the configured SSH host. The tests create and remove `rsync-win-*` directories under `RSYNC_WIN_SSH_TMP_ROOT`, which defaults to `/tmp`; use a path reserved for test data. `RSYNC_WIN_SSH_PROTOCOL27_TARGET` is optional and should only be set to a peer that explicitly exercises protocol 27 fallback behavior.

@@ -137,6 +137,16 @@ Download multiple remote directories from the same host into one destination, pr
 rsync-win -av --no-o --no-g -e "ssh -p 22" root@example:/srv/one root@example:/srv/two .\backup\
 ```
 
+Remote-shell interop tests are gated by environment variables so normal test runs do not require external hosts:
+
+```powershell
+$env:RSYNC_WIN_SSH_TARGET = "user@host"
+$env:RSYNC_WIN_SSH_TMP_ROOT = "/tmp" # optional; defaults to /tmp
+cargo test -p rsync-cli --test interop_discovery --all-features -- --nocapture
+```
+
+The tests create disposable directories named `rsync-win-*` below `RSYNC_WIN_SSH_TMP_ROOT` and remove them at the end of each smoke case. Set `RSYNC_WIN_SSH_PROTOCOL27_TARGET=user@old-host` only when a fixture that requires protocol 27 fallback is available.
+
 Use `-v` for concise live progress. The command prints a compact final summary by default, for example file counts, byte counts, and a `changes:` line. Use `--dry-run` or `-vv` when you need the full action list, and `--stats` for structured counters.
 
 ## Project Layout

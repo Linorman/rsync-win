@@ -12,6 +12,10 @@ use common::{
     FixtureTempDir,
 };
 
+const SSH_TARGET_ENV: &str = "RSYNC_WIN_SSH_TARGET";
+const SSH_PROTOCOL27_TARGET_ENV: &str = "RSYNC_WIN_SSH_PROTOCOL27_TARGET";
+const SSH_TMP_ROOT_ENV: &str = "RSYNC_WIN_SSH_TMP_ROOT";
+
 #[test]
 fn fixture_temp_directory_is_created_and_removed() {
     let path = {
@@ -164,6 +168,68 @@ fn remote_shell_push_small_tree_skips_without_ssh_target() {
 }
 
 #[test]
+fn remote_shell_push_delete_tree_skips_without_ssh_target() {
+    let Some((target, ssh)) = remote_shell_fixture("remote-shell push -rt --delete") else {
+        return;
+    };
+    let rsync_win = rsync_win_binary();
+    let temp = FixtureTempDir::new("rsync-win-remote-push-delete").unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"fresh").unwrap();
+
+    let remote_root = remote_temp_root("push-delete");
+    let remote_dest = format!("{remote_root}/dest");
+    run_remote_command(
+        &ssh,
+        &target,
+        &format!(
+            "rm -rf {}; mkdir -p {}; printf %s stale > {}",
+            shell_quote(&remote_root),
+            shell_quote(&remote_dest),
+            shell_quote(&format!("{remote_dest}/stale.txt"))
+        ),
+    );
+
+    let source_arg = format!("{}/", source.to_string_lossy());
+    let dest_arg = format!("{target}:{remote_dest}/");
+    let output = Command::new(&rsync_win)
+        .args(["-r", "-t", "--delete", "--whole-file", &source_arg, &dest_arg])
+        .output()
+        .unwrap();
+
+    let verify = remote_command_output(
+        &ssh,
+        &target,
+        &format!(
+            "test -f {} && test ! -e {} && cat {}",
+            shell_quote(&format!("{remote_dest}/keep.txt")),
+            shell_quote(&format!("{remote_dest}/stale.txt")),
+            shell_quote(&format!("{remote_dest}/keep.txt"))
+        ),
+    );
+    run_remote_command(
+        &ssh,
+        &target,
+        &format!("rm -rf {}", shell_quote(&remote_root)),
+    );
+
+    assert!(
+        output.status.success(),
+        "remote push --delete failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        verify.status.success(),
+        "remote delete verification failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&verify.stdout), "fresh");
+}
+
+#[test]
 fn remote_shell_pull_small_tree_skips_without_ssh_target() {
     let Some((target, ssh)) = remote_shell_fixture("remote-shell pull small tree") else {
         return;
@@ -214,6 +280,62 @@ fn remote_shell_pull_small_tree_skips_without_ssh_target() {
 }
 
 #[test]
+fn remote_shell_protocol27_fallback_skips_without_old_peer_fixture() {
+    let Some((target, ssh)) = remote_shell_fixture_from_env(
+        "remote-shell protocol 27 fallback",
+        SSH_PROTOCOL27_TARGET_ENV,
+        "set RSYNC_WIN_SSH_PROTOCOL27_TARGET=user@old-host to enable protocol 27 fallback smoke",
+    ) else {
+        return;
+    };
+    let rsync_win = rsync_win_binary();
+    let temp = FixtureTempDir::new("rsync-win-remote-protocol27").unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("file.txt"), b"compat").unwrap();
+
+    let remote_root = remote_temp_root("protocol27");
+    let remote_dest = format!("{remote_root}/dest");
+    run_remote_command(
+        &ssh,
+        &target,
+        &format!(
+            "rm -rf {}; mkdir -p {}",
+            shell_quote(&remote_root),
+            shell_quote(&remote_dest)
+        ),
+    );
+
+    let output = Command::new(&rsync_win)
+        .args([
+            "-r",
+            "--whole-file",
+            source.to_string_lossy().as_ref(),
+            &format!("{target}:{remote_dest}"),
+        ])
+        .output()
+        .unwrap();
+    run_remote_command(
+        &ssh,
+        &target,
+        &format!("rm -rf {}", shell_quote(&remote_root)),
+    );
+
+    assert!(
+        output.status.success(),
+        "protocol 27 fallback smoke failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("protocol: 27"),
+        "fallback fixture did not exercise protocol 27; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn discovers_platform_capabilities() {
     let capabilities = discover_platform_capabilities();
 
@@ -239,13 +361,22 @@ fn discovers_platform_capabilities() {
 }
 
 fn remote_shell_fixture(name: &str) -> Option<(String, PathBuf)> {
-    let target = match env::var("RSYNC_WIN_SSH_TARGET") {
+    remote_shell_fixture_from_env(
+        name,
+        SSH_TARGET_ENV,
+        "set RSYNC_WIN_SSH_TARGET=user@host to enable remote-shell interop",
+    )
+}
+
+fn remote_shell_fixture_from_env(
+    name: &str,
+    env_var: &str,
+    missing_message: &'static str,
+) -> Option<(String, PathBuf)> {
+    let target = match env::var(env_var) {
         Ok(target) if !target.trim().is_empty() => target,
         _ => {
-            skip_external_test(
-                name,
-                Some("set RSYNC_WIN_SSH_TARGET=user@host to enable remote-shell interop"),
-            );
+            skip_external_test(name, Some(missing_message));
             return None;
         }
     };
@@ -280,7 +411,16 @@ fn remote_temp_root(label: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    format!("/tmp/rsync-win-{label}-{}-{nanos}", std::process::id())
+    let parent = env::var(SSH_TMP_ROOT_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/tmp".to_string());
+    let parent = parent.trim_end_matches('/');
+    if parent.is_empty() {
+        format!("/rsync-win-{label}-{}-{nanos}", std::process::id())
+    } else {
+        format!("{parent}/rsync-win-{label}-{}-{nanos}", std::process::id())
+    }
 }
 
 fn run_remote_command(ssh: &std::path::Path, target: &str, command: &str) {
