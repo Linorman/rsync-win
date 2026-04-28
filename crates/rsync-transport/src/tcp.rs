@@ -14,6 +14,8 @@ impl TcpTransport {
             match TcpStream::connect_timeout(&addr, timeout) {
                 Ok(stream) => {
                     stream.set_nodelay(true)?;
+                    stream.set_read_timeout(Some(timeout))?;
+                    stream.set_write_timeout(Some(timeout))?;
                     return Ok(Self { stream });
                 }
                 Err(err) => last_error = Some(err),
