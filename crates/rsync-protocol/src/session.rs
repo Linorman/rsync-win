@@ -49,6 +49,9 @@ pub struct RemoteShellOptions {
     pub copy_links: bool,
     pub safe_links: bool,
     pub copy_unsafe_links: bool,
+    pub includes: Vec<String>,
+    pub excludes: Vec<String>,
+    pub filters: Vec<String>,
 }
 
 impl Default for RemoteShellOptions {
@@ -76,6 +79,9 @@ impl Default for RemoteShellOptions {
             copy_links: false,
             safe_links: false,
             copy_unsafe_links: false,
+            includes: Vec::new(),
+            excludes: Vec::new(),
+            filters: Vec::new(),
         }
     }
 }
@@ -367,6 +373,15 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     }
     if options.copy_unsafe_links {
         argv.push("--copy-unsafe-links".to_string());
+    }
+    for pattern in &options.includes {
+        argv.push(format!("--include={pattern}"));
+    }
+    for pattern in &options.excludes {
+        argv.push(format!("--exclude={pattern}"));
+    }
+    for filter in &options.filters {
+        argv.push(format!("--filter={filter}"));
     }
 }
 
@@ -831,6 +846,28 @@ mod tests {
                 "dest",
             ]
         );
+    }
+
+    #[test]
+    fn builds_push_server_argv_with_receiver_filter_args() {
+        let options = RemoteShellOptions {
+            recursive: true,
+            delete: true,
+            includes: vec!["src/**".to_string()],
+            excludes: vec!["*.tmp".to_string()],
+            filters: vec!["protect *.bak".to_string()],
+            ..RemoteShellOptions::default()
+        };
+
+        let protocol27 = build_remote_shell_argv(&options, Path::new("dest")).unwrap();
+        let protocol31 = build_remote_shell_protocol31_argv(&options, Path::new("dest")).unwrap();
+
+        for argv in [protocol27, protocol31] {
+            assert!(argv.contains(&"--delete".to_string()));
+            assert!(argv.contains(&"--include=src/**".to_string()));
+            assert!(argv.contains(&"--exclude=*.tmp".to_string()));
+            assert!(argv.contains(&"--filter=protect *.bak".to_string()));
+        }
     }
 
     #[test]

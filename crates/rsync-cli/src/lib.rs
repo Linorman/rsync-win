@@ -758,6 +758,7 @@ fn build_protocol27_fallback_command(
             vec![PathBuf::from(&remote.path)]
         };
     let remote_path_refs: Vec<&Path> = remote_paths.iter().map(PathBuf::as_path).collect();
+    let (includes, excludes, filters) = remote_receiver_filter_args_from_cli(cli, direction);
     let argv = build_remote_shell_argv_for_paths(
         &RemoteShellOptions {
             direction,
@@ -799,6 +800,9 @@ fn build_protocol27_fallback_command(
                 && plan.symlink_mode == SymlinkMode::SafeOnly,
             copy_unsafe_links: direction == TransferDirection::Pull
                 && plan.symlink_mode == SymlinkMode::CopyUnsafe,
+            includes,
+            excludes,
+            filters,
         },
         &remote_path_refs,
     )?;
@@ -3749,6 +3753,7 @@ fn remote_shell_options_from_cli(
     preserve_times: bool,
     symlink_mode: SymlinkMode,
 ) -> RemoteShellOptions {
+    let (includes, excludes, filters) = remote_receiver_filter_args_from_cli(cli, direction);
     RemoteShellOptions {
         direction,
         recursive,
@@ -3777,6 +3782,24 @@ fn remote_shell_options_from_cli(
         safe_links: direction == TransferDirection::Push && symlink_mode == SymlinkMode::SafeOnly,
         copy_unsafe_links: direction == TransferDirection::Pull
             && symlink_mode == SymlinkMode::CopyUnsafe,
+        includes,
+        excludes,
+        filters,
+    }
+}
+
+fn remote_receiver_filter_args_from_cli(
+    cli: &Cli,
+    direction: TransferDirection,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    if direction == TransferDirection::Push {
+        (
+            cli.includes.clone(),
+            cli.excludes.clone(),
+            cli.filters.clone(),
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
     }
 }
 
@@ -4032,15 +4055,12 @@ fn ensure_remote_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
         bail!("remote-shell push sources must be local paths");
     }
 
-    let has_remote_selection = !cli.includes.is_empty()
-        || !cli.excludes.is_empty()
-        || !cli.filters.is_empty()
-        || cli.files_from.is_some()
-        || cli.from0;
-    if plan.remote_direction == Some(TransferDirection::Push) && cli.delete && has_remote_selection
+    if plan.remote_direction == Some(TransferDirection::Push)
+        && cli.delete
+        && cli.files_from.is_some()
     {
         bail!(
-            "remote-shell push does not yet support --delete together with filters or --files-from because receiver-side delete protection is not implemented"
+            "remote-shell push does not yet support --delete together with --files-from because receiver-side files-from semantics are not implemented"
         );
     }
     if cli.inplace && cli.partial_dir.is_some() {
@@ -4694,8 +4714,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_push_rejects_delete_with_filters_until_receiver_protection_exists() {
-        let err = parse_and_execute([
+    fn remote_push_delete_with_filters_routes_receiver_protection() {
+        let cli = Cli::parse_from([
             "rsync-win",
             "-rt",
             "--delete",
@@ -4703,12 +4723,33 @@ mod tests {
             "*.tmp",
             "src",
             "user@example.test:/tmp/dest",
-        ])
-        .unwrap_err();
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
 
-        assert!(err.to_string().contains(
-            "remote-shell push does not yet support --delete together with filters or --files-from"
-        ));
+        ensure_remote_execution_options_supported(&cli, &plan).unwrap();
+        let argv = plan.remote_server_argv.as_ref().unwrap();
+        assert!(argv.contains(&"--delete".to_string()));
+        assert!(argv.contains(&"--exclude=*.tmp".to_string()));
+    }
+
+    #[test]
+    fn remote_push_still_rejects_delete_with_files_from() {
+        let cli = Cli::parse_from([
+            "rsync-win",
+            "-rt",
+            "--delete",
+            "--files-from",
+            "list.txt",
+            "src",
+            "user@example.test:/tmp/dest",
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+
+        let err = ensure_remote_execution_options_supported(&cli, &plan).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("remote-shell push does not yet support --delete together with --files-from"));
     }
 
     #[test]

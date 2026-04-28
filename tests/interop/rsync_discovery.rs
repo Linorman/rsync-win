@@ -230,6 +230,80 @@ fn remote_shell_push_delete_tree_skips_without_ssh_target() {
 }
 
 #[test]
+fn remote_shell_push_delete_with_exclude_protects_receiver_files() {
+    let Some((target, ssh)) =
+        remote_shell_fixture("remote-shell push --delete --exclude receiver protection")
+    else {
+        return;
+    };
+    let rsync_win = rsync_win_binary();
+    let temp = FixtureTempDir::new("rsync-win-remote-push-filter-delete").unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"fresh").unwrap();
+    fs::write(source.join("skip.tmp"), b"local-skip").unwrap();
+
+    let remote_root = remote_temp_root("push-filter-delete");
+    let remote_dest = format!("{remote_root}/dest");
+    run_remote_command(
+        &ssh,
+        &target,
+        &format!(
+            "rm -rf {}; mkdir -p {}; printf %s protected > {}",
+            shell_quote(&remote_root),
+            shell_quote(&remote_dest),
+            shell_quote(&format!("{remote_dest}/skip.tmp"))
+        ),
+    );
+
+    let source_arg = format!("{}/", source.to_string_lossy());
+    let dest_arg = format!("{target}:{remote_dest}/");
+    let output = Command::new(&rsync_win)
+        .args([
+            "-r",
+            "--delete",
+            "--whole-file",
+            "--exclude",
+            "*.tmp",
+            &source_arg,
+            &dest_arg,
+        ])
+        .output()
+        .unwrap();
+
+    let verify = remote_command_output(
+        &ssh,
+        &target,
+        &format!(
+            "test -f {} && test -f {} && cat {} && printf : && cat {}",
+            shell_quote(&format!("{remote_dest}/keep.txt")),
+            shell_quote(&format!("{remote_dest}/skip.tmp")),
+            shell_quote(&format!("{remote_dest}/keep.txt")),
+            shell_quote(&format!("{remote_dest}/skip.tmp"))
+        ),
+    );
+    run_remote_command(
+        &ssh,
+        &target,
+        &format!("rm -rf {}", shell_quote(&remote_root)),
+    );
+
+    assert!(
+        output.status.success(),
+        "remote push --delete --exclude failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        verify.status.success(),
+        "remote exclude delete protection verification failed; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&verify.stdout), "fresh:protected");
+}
+
+#[test]
 fn remote_shell_pull_small_tree_skips_without_ssh_target() {
     let Some((target, ssh)) = remote_shell_fixture("remote-shell pull small tree") else {
         return;
