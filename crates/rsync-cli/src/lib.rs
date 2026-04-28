@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -28,15 +29,16 @@ use rsync_protocol::{
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_options, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, MultiplexReadState,
     MultiplexedReader, MultiplexedWriter, RemoteSessionError, RemoteShellOperand,
-    RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, RsyncMd4Checksum, TransferDirection,
-    WireFileType, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
-    REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE, RSYNC_REGULAR_FILE_MODE,
+    RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, RsyncMd4Checksum, SessionError,
+    TransferDirection, WireFileType, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+    REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
+    RSYNC_INDEX_DONE, RSYNC_REGULAR_FILE_MODE,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
     spawn_ssh_remote_command, SshRemoteCommand,
 };
-use rsync_winfs::WindowsDriveKind;
+use rsync_winfs::{to_long_path_safe, WindowsDriveKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliMetadataPolicy {
@@ -781,13 +783,62 @@ fn build_remote_transport_command(
 }
 
 fn should_fallback_to_protocol27(err: &anyhow::Error) -> bool {
+    if let Some(setup_err) = err.downcast_ref::<Protocol31SetupError>() {
+        return should_fallback_to_protocol27_from_setup(&setup_err.source);
+    }
+
+    should_fallback_to_protocol27_from_negotiation(err)
+}
+
+fn should_fallback_to_protocol27_from_setup(err: &anyhow::Error) -> bool {
+    should_fallback_to_protocol27_from_negotiation(err) || is_unexpected_eof(err)
+}
+
+fn should_fallback_to_protocol27_from_negotiation(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<RemoteSessionError>(),
         Some(
             RemoteSessionError::UnsupportedProtocol { .. }
                 | RemoteSessionError::UnsupportedChecksumNegotiation
+                | RemoteSessionError::InvalidChecksumList
+                | RemoteSessionError::Session(
+                    SessionError::NonProtocolOutput(_)
+                        | SessionError::IncompleteProtocolPrefix
+                        | SessionError::InvalidProtocolPrefix(_)
+                )
         )
     )
+}
+
+fn is_unexpected_eof(err: &anyhow::Error) -> bool {
+    if let Some(io_error) = err.downcast_ref::<std::io::Error>() {
+        return io_error.kind() == std::io::ErrorKind::UnexpectedEof;
+    }
+    matches!(
+        err.downcast_ref::<RemoteSessionError>(),
+        Some(RemoteSessionError::Io(io_error))
+            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+#[derive(Debug)]
+struct Protocol31SetupError {
+    source: anyhow::Error,
+}
+
+impl fmt::Display for Protocol31SetupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "protocol 31 setup failed: {}", self.source)
+    }
+}
+
+impl std::error::Error for Protocol31SetupError {}
+
+fn protocol31_setup_error<E>(err: E) -> anyhow::Error
+where
+    E: Into<anyhow::Error>,
+{
+    anyhow::Error::new(Protocol31SetupError { source: err.into() })
 }
 
 fn execute_remote_push<T: Read + Write>(
@@ -909,7 +960,8 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     ));
     progress.detail(format!("upload list entries: {}", entries.len(),));
 
-    let handshake = exchange_remote_shell_protocol31_handshake(transport)?;
+    let handshake =
+        exchange_remote_shell_protocol31_handshake(transport).map_err(protocol31_setup_error)?;
     progress.detail(format!(
         "protocol: rsync {}",
         handshake.selected_protocol.value()
@@ -920,8 +972,9 @@ fn execute_remote_push_protocol31<T: Read + Write>(
             &mut writer,
             &wire_entries,
             plan.update_mode == UpdateMode::Checksum,
-        )?;
-        writer.flush()?;
+        )
+        .map_err(protocol31_setup_error)?;
+        writer.flush().map_err(protocol31_setup_error)?;
     }
 
     let mut mux = MultiplexReadState::default();
@@ -1116,13 +1169,14 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
     transport: &mut T,
 ) -> Result<String> {
     let dest = Path::new(cli.paths.last().expect("checked operand count"));
-    let handshake = exchange_remote_shell_protocol31_handshake(transport)?;
+    let handshake =
+        exchange_remote_shell_protocol31_handshake(transport).map_err(protocol31_setup_error)?;
     let mut mux = MultiplexReadState::default();
 
     {
         let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
-        write_i32_le(&mut writer, 0)?;
-        writer.flush()?;
+        write_i32_le(&mut writer, 0).map_err(protocol31_setup_error)?;
+        writer.flush().map_err(protocol31_setup_error)?;
     }
 
     let mut entries = {
@@ -1132,7 +1186,8 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
             100_000,
             32 * 1024,
             plan.update_mode == UpdateMode::Checksum,
-        )?
+        )
+        .map_err(protocol31_setup_error)?
     };
     sort_remote_entries_for_sender_indexes(&mut entries);
     let files_from = load_files_from(cli)?;
@@ -1464,7 +1519,7 @@ fn load_files_from(cli: &Cli) -> Result<Option<Vec<PathBuf>>> {
         return Ok(None);
     };
 
-    let bytes = std::fs::read(path)?;
+    let bytes = read_local_file(path)?;
     let records = parse_files_from_bytes(&bytes, cli.from0)?;
     let normalized = normalize_files_from_records(records)?;
     Ok(Some(normalized.into_iter().map(PathBuf::from).collect()))
@@ -1827,8 +1882,7 @@ fn is_unsafe_symlink_target(target: &Path) -> bool {
 }
 
 fn checksum_local_path(path: &Path) -> Result<[u8; 16]> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut file = open_local_file(path)?;
     rsync_plain_md4_checksum_reader(&mut file)
         .with_context(|| format!("failed to checksum {}", path.display()))
 }
@@ -1940,6 +1994,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                 let attrs = read_rsync31_optional_item_attrs(&mut reader, iflags)?;
                 if iflags & RSYNC_ITEM_TRANSFER != 0 {
                     let sum_head = read_sum_head(&mut reader)?;
+                    // Upstream append mode sends the append basis as a sum head only.
                     if !append_verify {
                         skip_remote_block_signatures_from_reader(
                             &mut reader,
@@ -2185,13 +2240,13 @@ fn receive_remote_sender_files<T: Read>(
                 bytes
             }
             Err(err) => {
-                let _ = std::fs::remove_file(&temp_path);
+                remove_local_file_best_effort(&temp_path);
                 return Err(err);
             }
         };
         let write_result =
             write_received_file_from_path(&mut ctx, entry, &target, &temp_path, bytes);
-        let _ = std::fs::remove_file(&temp_path);
+        remove_local_file_best_effort(&temp_path);
         write_result?;
         stats.files += 1;
         stats.bytes += bytes;
@@ -2263,13 +2318,13 @@ fn receive_remote_sender_files_protocol31<T: Read>(
                 bytes
             }
             Err(err) => {
-                let _ = std::fs::remove_file(&temp_path);
+                remove_local_file_best_effort(&temp_path);
                 return Err(err);
             }
         };
         let write_result =
             write_received_file_from_path(&mut ctx, entry, &target, &temp_path, bytes);
-        let _ = std::fs::remove_file(&temp_path);
+        remove_local_file_best_effort(&temp_path);
         write_result?;
         stats.files += 1;
         stats.bytes += bytes;
@@ -2798,8 +2853,7 @@ fn write_file_tokens_from_path<T: Write>(
     path: &Path,
     progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut file = open_local_file(path)?;
     write_literal_tokens_from_reader_with_checksum(transport, &mut file, checksum, progress)
 }
 
@@ -2810,8 +2864,7 @@ fn write_append_verify_file_tokens_from_path<T: Write>(
     prefix_len: usize,
     progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut file = open_local_file(path)?;
     write_append_verify_literal_tokens_from_reader_with_checksum(
         transport, &mut file, checksum, prefix_len, progress,
     )
@@ -2903,11 +2956,9 @@ fn read_file_tokens_to_path<T: Read>(
     mut progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        create_local_dir_all(parent)?;
     }
-    let mut output = File::create(output_path)
-        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    let mut output = create_local_file(output_path)?;
     let mut total = 0_u64;
     let mut buf = [0_u8; 32 * 1024];
 
@@ -2949,14 +3000,37 @@ fn read_file_tokens_to_path<T: Read>(
 }
 
 fn remote_file_checksum_for_path(checksum: RemoteFileChecksum, path: &Path) -> Result<[u8; 16]> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut file = open_local_file(path)?;
     match checksum {
         RemoteFileChecksum::SeededMd4(seed) => rsync_whole_file_checksum_reader(seed, &mut file)
             .with_context(|| format!("failed to checksum {}", path.display())),
         RemoteFileChecksum::PlainMd4 => rsync_plain_md4_checksum_reader(&mut file)
             .with_context(|| format!("failed to checksum {}", path.display())),
     }
+}
+
+fn read_local_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(to_long_path_safe(path))
+        .with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn open_local_file(path: &Path) -> Result<File> {
+    File::open(to_long_path_safe(path))
+        .with_context(|| format!("failed to open {}", path.display()))
+}
+
+fn create_local_file(path: &Path) -> Result<File> {
+    File::create(to_long_path_safe(path))
+        .with_context(|| format!("failed to create {}", path.display()))
+}
+
+fn create_local_dir_all(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(to_long_path_safe(path))
+        .with_context(|| format!("failed to create {}", path.display()))
+}
+
+fn remove_local_file_best_effort(path: &Path) {
+    let _ = std::fs::remove_file(to_long_path_safe(path));
 }
 
 fn receive_temp_path(target: &Path) -> PathBuf {
@@ -4058,6 +4132,128 @@ mod tests {
             &output[11..27],
             &rsync_protocol::rsync_plain_md4_checksum(b"abcdef")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_token_file_io_handles_windows_long_paths() {
+        let root = unique_temp_dir("rsync-cli-long-path");
+        let mut long_dir = root.clone();
+        while long_dir.as_os_str().to_string_lossy().len() < 280 {
+            long_dir.push("segment0123456789");
+        }
+        let source = long_dir.join("source.txt");
+        let dest = long_dir.join("dest.txt");
+        assert!(source.as_os_str().to_string_lossy().len() > 260);
+
+        std::fs::create_dir_all(to_long_path_safe(&long_dir)).unwrap();
+        std::fs::write(to_long_path_safe(&source), b"abc").unwrap();
+
+        let mut upload_tokens = Vec::new();
+        assert_eq!(
+            write_file_tokens_from_path(
+                &mut upload_tokens,
+                RemoteFileChecksum::PlainMd4,
+                &source,
+                None
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            checksum_local_path(&source).unwrap(),
+            rsync_protocol::rsync_plain_md4_checksum(b"abc")
+        );
+
+        let mut payload = Vec::new();
+        write_i32_le(&mut payload, 3).unwrap();
+        payload.extend_from_slice(b"abc");
+        write_i32_le(&mut payload, 0).unwrap();
+        payload.extend_from_slice(&rsync_protocol::rsync_plain_md4_checksum(b"abc"));
+        let mut input = Vec::new();
+        append_mux_payload(&mut input, &payload);
+        let mut input = &input[..];
+        let mut mux = MultiplexReadState::default();
+
+        assert_eq!(
+            read_file_tokens_to_path(
+                &mut input,
+                &mut mux,
+                RemoteFileChecksum::PlainMd4,
+                Path::new("dest.txt"),
+                &dest,
+                None
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(std::fs::read(to_long_path_safe(&dest)).unwrap(), b"abc");
+
+        std::fs::remove_dir_all(to_long_path_safe(&root)).unwrap();
+    }
+
+    #[test]
+    fn should_fallback_to_protocol27_accepts_protocol31_setup_errors() {
+        let fallback_errors = vec![
+            anyhow::Error::new(RemoteSessionError::UnsupportedProtocol {
+                negotiated: 30,
+                supported: REMOTE_SHELL_MODERN_PROTOCOL,
+            }),
+            anyhow::Error::new(RemoteSessionError::UnsupportedChecksumNegotiation),
+            anyhow::Error::new(RemoteSessionError::InvalidChecksumList),
+            anyhow::Error::new(RemoteSessionError::Session(
+                SessionError::NonProtocolOutput("banner".to_string()),
+            )),
+            anyhow::Error::new(RemoteSessionError::Session(
+                SessionError::IncompleteProtocolPrefix,
+            )),
+            anyhow::Error::new(RemoteSessionError::Session(
+                SessionError::InvalidProtocolPrefix(0x7273_796e),
+            )),
+            protocol31_setup_error(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated setup frame",
+            )),
+            protocol31_setup_error(RemoteSessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated handshake",
+            ))),
+        ];
+
+        for err in fallback_errors {
+            assert!(should_fallback_to_protocol27(&err), "{err}");
+        }
+    }
+
+    #[test]
+    fn should_fallback_to_protocol27_rejects_transfer_errors() {
+        let non_fallback_errors = vec![
+            anyhow::Error::new(RemoteSessionError::InvalidFileIndex {
+                index: 99,
+                file_count: 1,
+            }),
+            anyhow::Error::new(RemoteSessionError::NonFileBlockRequest { index: 0 }),
+            anyhow::Error::new(RemoteSessionError::FileChecksumMismatch {
+                path: "file.txt".to_string(),
+            }),
+            anyhow::Error::new(RemoteSessionError::InvalidPhaseAck(0)),
+            anyhow::Error::new(RemoteSessionError::InvalidFinalAck(0)),
+            anyhow::Error::new(RemoteSessionError::UnexpectedToken {
+                token: -1,
+                path: "file.txt".to_string(),
+            }),
+            anyhow::Error::new(RemoteSessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated transfer",
+            ))),
+            anyhow::Error::new(RemoteSessionError::Session(
+                SessionError::RemoteErrorMessage("remote refused transfer".to_string()),
+            )),
+        ];
+
+        for err in non_fallback_errors {
+            assert!(!should_fallback_to_protocol27(&err), "{err}");
+        }
     }
 
     #[test]
