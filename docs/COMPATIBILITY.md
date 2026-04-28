@@ -18,7 +18,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Mode | Current status | Notes |
 | --- | --- | --- |
 | `portable` | Default | Copies ordinary files/directories, compares size, applies mtime where requested, and applies explicit delete/filter behavior in tested paths. |
-| `posix` | Reporting prototype | POSIX permissions/executability requests are represented; owner, group, ACL, xattr, fake-super, and symlink mtime limitations are reported. POSIX ACL/xattr/fake-super storage is not implemented unless a future sidecar says so explicitly. |
+| `posix` | Reporting prototype with narrow remote mode mapping | POSIX permissions/executability requests are represented. `--chmod` accepts numeric `600`/`0644` and scoped `F600`/`D755` forms for remote upload mode bits only. `--executability` infers peer execute bits from Windows script/executable extensions; it does not enforce NTFS execute permissions. Owner, group, ACL, xattr, fake-super, and symlink mtime limitations are reported. POSIX ACL/xattr/fake-super storage is not implemented unless a future sidecar says so explicitly. |
 | `ntfs-native` | Capture-only sidecar prototype | Captures security descriptor summary, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Restore and stream payload copying are not implemented. |
 | VSS snapshot mode | Rejected with diagnostics | `--vss` is parsed and reported, but snapshot reads are not implemented. |
 

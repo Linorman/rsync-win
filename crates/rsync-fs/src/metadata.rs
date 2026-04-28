@@ -211,13 +211,16 @@ mod tests {
     }
 
     #[test]
-    fn infers_executable_mode_from_windows_filename_conventions() {
+    fn executability_infers_mode_from_windows_filename_conventions() {
         let metadata = PortableMetadata::file(12);
 
-        assert_eq!(
-            metadata.posix_mode_for_path(Some(Path::new("tool.exe")), true),
-            POSIX_TYPE_REGULAR | POSIX_FILE_EXECUTABLE_PERMS
-        );
+        for path in ["tool.exe", "run.bat", "run.cmd", "script.ps1"] {
+            assert_eq!(
+                metadata.posix_mode_for_path(Some(Path::new(path)), true),
+                POSIX_TYPE_REGULAR | POSIX_FILE_EXECUTABLE_PERMS,
+                "{path}"
+            );
+        }
         assert_eq!(
             metadata.posix_mode_for_path(Some(Path::new("notes.txt")), true),
             POSIX_TYPE_REGULAR | POSIX_FILE_DEFAULT_PERMS

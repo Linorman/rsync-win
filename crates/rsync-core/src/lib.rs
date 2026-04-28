@@ -1,7 +1,11 @@
+pub mod chmod;
+
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use thiserror::Error;
+
+pub use chmod::{ChmodFileKind, ChmodRules};
 
 pub type Result<T> = std::result::Result<T, RsyncCoreError>;
 
@@ -279,36 +283,26 @@ impl PosixMetadataRequest {
             ));
         }
         if self.acls {
-            let action = if self.fake_super {
-                MetadataAction::Stored
-            } else {
-                MetadataAction::Ignored
-            };
             let message = if self.fake_super {
-                "--acls metadata is selected for fake-super sidecar storage; POSIX ACLs are not applied as NTFS ACL fidelity"
+                "--acls metadata requested with fake-super, but POSIX ACL sidecar storage is not implemented yet"
             } else {
                 "--acls requests POSIX ACL preservation; Windows local transfers do not apply POSIX ACLs"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Acl,
-                action,
+                MetadataAction::Ignored,
                 message,
             ));
         }
         if self.xattrs {
-            let action = if self.fake_super {
-                MetadataAction::Stored
-            } else {
-                MetadataAction::Ignored
-            };
             let message = if self.fake_super {
-                "--xattrs metadata is selected for fake-super sidecar storage; xattrs are not applied to NTFS streams automatically"
+                "--xattrs metadata requested with fake-super, but POSIX xattr sidecar storage is not implemented yet"
             } else {
                 "--xattrs requests extended attribute preservation; Windows local transfers do not apply POSIX xattrs"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Xattr,
-                action,
+                MetadataAction::Ignored,
                 message,
             ));
         }
@@ -730,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn posix_request_reports_fake_super_storage_and_losses() {
+    fn posix_request_reports_fake_super_as_unimplemented_storage_loss() {
         let request = PosixMetadataRequest {
             permissions: true,
             owner: true,
@@ -745,8 +739,13 @@ mod tests {
         assert!(request.any());
         assert!(degradations.iter().any(|degradation| {
             degradation.feature == MetadataFeature::Acl
-                && degradation.action == MetadataAction::Stored
-                && !degradation.is_loss()
+                && degradation.action == MetadataAction::Ignored
+                && degradation.is_loss()
+        }));
+        assert!(degradations.iter().any(|degradation| {
+            degradation.feature == MetadataFeature::Xattr
+                && degradation.action == MetadataAction::Ignored
+                && degradation.is_loss()
         }));
         assert!(degradations.iter().any(|degradation| {
             degradation.feature == MetadataFeature::Permissions && degradation.is_loss()

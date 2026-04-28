@@ -9,9 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use rsync_core::{
-    archive_mode_components, archive_mode_degradations, metadata_policy_degradations, Diagnostic,
-    MetadataDegradation, MetadataFeature, MetadataPolicy, NtfsNativeMetadataRequest,
-    PosixMetadataRequest, Report, Severity,
+    archive_mode_components, archive_mode_degradations, metadata_policy_degradations,
+    ChmodFileKind, ChmodRules, Diagnostic, MetadataDegradation, MetadataFeature, MetadataPolicy,
+    NtfsNativeMetadataRequest, PosixMetadataRequest, Report, Severity,
 };
 use rsync_filter::{
     normalize_files_from_records, parse_files_from_bytes, EntryKind, Rule, RuleAction, RuleSet,
@@ -458,12 +458,17 @@ struct RemoteSourceEntry {
 
 struct LocalSourceCollectContext<'a> {
     fs: &'a LocalFileSystem,
+    options: &'a LocalSourceCollectOptions<'a>,
+}
+
+struct LocalSourceCollectOptions<'a> {
     recursive: bool,
     filter_rules: &'a RuleSet,
     files_from: Option<&'a [PathBuf]>,
     symlink_mode: SymlinkMode,
     include_checksums: bool,
     preserve_executability: bool,
+    chmod_rules: Option<&'a ChmodRules>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1099,15 +1104,8 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     log_source_storage_notes(progress, &sources);
     let files_from = load_files_from(cli)?;
     progress.info("building upload file list");
-    let entries = collect_local_source_entries(
-        &sources,
-        plan.recursive,
-        &plan.filter_rules,
-        files_from.as_deref(),
-        plan.symlink_mode,
-        plan.update_mode == UpdateMode::Checksum,
-        plan.preserve_executability,
-    )?;
+    let collect_options = local_source_collect_options(plan, files_from.as_deref());
+    let entries = collect_local_source_entries(&sources, &collect_options)?;
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
     progress.info(format!(
@@ -1178,15 +1176,8 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     log_source_storage_notes(progress, &sources);
     let files_from = load_files_from(cli)?;
     progress.info("building upload file list");
-    let entries = collect_local_source_entries(
-        &sources,
-        plan.recursive,
-        &plan.filter_rules,
-        files_from.as_deref(),
-        plan.symlink_mode,
-        plan.update_mode == UpdateMode::Checksum,
-        plan.preserve_executability,
-    )?;
+    let collect_options = local_source_collect_options(plan, files_from.as_deref());
+    let entries = collect_local_source_entries(&sources, &collect_options)?;
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
     progress.info(format!(
@@ -1936,50 +1927,40 @@ fn load_files_from(cli: &Cli) -> Result<Option<Vec<PathBuf>>> {
     Ok(Some(normalized.into_iter().map(PathBuf::from).collect()))
 }
 
+fn local_source_collect_options<'a>(
+    plan: &'a TransferPlan,
+    files_from: Option<&'a [PathBuf]>,
+) -> LocalSourceCollectOptions<'a> {
+    LocalSourceCollectOptions {
+        recursive: plan.recursive,
+        filter_rules: &plan.filter_rules,
+        files_from,
+        symlink_mode: plan.symlink_mode,
+        include_checksums: plan.update_mode == UpdateMode::Checksum,
+        preserve_executability: plan.preserve_executability,
+        chmod_rules: plan.chmod_rules.as_ref(),
+    }
+}
+
 fn collect_local_source_entries(
     sources: &[PathBuf],
-    recursive: bool,
-    filter_rules: &RuleSet,
-    files_from: Option<&[PathBuf]>,
-    symlink_mode: SymlinkMode,
-    include_checksums: bool,
-    preserve_executability: bool,
+    options: &LocalSourceCollectOptions<'_>,
 ) -> Result<Vec<RemoteSourceEntry>> {
     if sources.len() == 1 {
-        return collect_single_local_source_entries(
-            &sources[0],
-            recursive,
-            filter_rules,
-            files_from,
-            symlink_mode,
-            include_checksums,
-            preserve_executability,
-        );
+        return collect_single_local_source_entries(&sources[0], options);
     }
 
-    collect_batch_local_source_entries(
-        sources,
-        recursive,
-        filter_rules,
-        files_from,
-        symlink_mode,
-        include_checksums,
-        preserve_executability,
-    )
+    collect_batch_local_source_entries(sources, options)
 }
 
 fn collect_single_local_source_entries(
     source: &Path,
-    recursive: bool,
-    filter_rules: &RuleSet,
-    files_from: Option<&[PathBuf]>,
-    symlink_mode: SymlinkMode,
-    include_checksums: bool,
-    preserve_executability: bool,
+    options: &LocalSourceCollectOptions<'_>,
 ) -> Result<Vec<RemoteSourceEntry>> {
     let fs = LocalFileSystem;
-    let source_metadata = remote_sender_metadata(&fs, source, fs.metadata(source)?, symlink_mode)?
-        .context("source is skipped by link handling")?;
+    let source_metadata =
+        remote_sender_metadata(&fs, source, fs.metadata(source)?, options.symlink_mode)?
+            .context("source is skipped by link handling")?;
     let mut entries = Vec::new();
 
     if source_metadata.file_type == FileType::File {
@@ -1987,8 +1968,10 @@ fn collect_single_local_source_entries(
             .file_name()
             .context("source file is missing a file name")?;
         let relative = PathBuf::from(file_name);
-        if remote_source_path_is_filtered(filter_rules, &relative, WireFileType::File)
-            || files_from.is_some_and(|files_from| !files_from_matches(&relative, files_from))
+        if remote_source_path_is_filtered(options.filter_rules, &relative, WireFileType::File)
+            || options
+                .files_from
+                .is_some_and(|files_from| !files_from_matches(&relative, files_from))
         {
             return Ok(entries);
         }
@@ -2002,9 +1985,11 @@ fn collect_single_local_source_entries(
                     &source_metadata,
                     WireFileType::File,
                     &relative,
-                    preserve_executability,
+                    options.preserve_executability,
+                    options.chmod_rules,
                 ),
-                checksum: include_checksums
+                checksum: options
+                    .include_checksums
                     .then(|| checksum_local_path(source))
                     .transpose()?,
             },
@@ -2030,15 +2015,7 @@ fn collect_single_local_source_entries(
     });
 
     collect_local_directory_source_entries(
-        &LocalSourceCollectContext {
-            fs: &fs,
-            recursive,
-            filter_rules,
-            files_from,
-            symlink_mode,
-            include_checksums,
-            preserve_executability,
-        },
+        &LocalSourceCollectContext { fs: &fs, options },
         source,
         Path::new(""),
         &mut entries,
@@ -2050,12 +2027,7 @@ fn collect_single_local_source_entries(
 
 fn collect_batch_local_source_entries(
     sources: &[PathBuf],
-    recursive: bool,
-    filter_rules: &RuleSet,
-    files_from: Option<&[PathBuf]>,
-    symlink_mode: SymlinkMode,
-    include_checksums: bool,
-    preserve_executability: bool,
+    options: &LocalSourceCollectOptions<'_>,
 ) -> Result<Vec<RemoteSourceEntry>> {
     let fs = LocalFileSystem;
     let mut entries = Vec::new();
@@ -2066,7 +2038,7 @@ fn collect_batch_local_source_entries(
         let relative = PathBuf::from(file_name);
         let original_metadata = fs.metadata(source)?;
         let Some(metadata) =
-            remote_sender_metadata(&fs, source, original_metadata.clone(), symlink_mode)?
+            remote_sender_metadata(&fs, source, original_metadata.clone(), options.symlink_mode)?
         else {
             continue;
         };
@@ -2078,7 +2050,8 @@ fn collect_batch_local_source_entries(
                     &metadata,
                     WireFileType::Directory,
                     &relative,
-                    preserve_executability,
+                    options.preserve_executability,
+                    options.chmod_rules,
                 ),
             ),
             FileType::File => (
@@ -2087,7 +2060,8 @@ fn collect_batch_local_source_entries(
                     &metadata,
                     WireFileType::File,
                     &relative,
-                    preserve_executability,
+                    options.preserve_executability,
+                    options.chmod_rules,
                 ),
             ),
             other => {
@@ -2099,8 +2073,10 @@ fn collect_batch_local_source_entries(
             }
         };
 
-        if remote_source_path_is_filtered(filter_rules, &relative, file_type)
-            || files_from.is_some_and(|files_from| !files_from_matches(&relative, files_from))
+        if remote_source_path_is_filtered(options.filter_rules, &relative, file_type)
+            || options
+                .files_from
+                .is_some_and(|files_from| !files_from_matches(&relative, files_from))
         {
             continue;
         }
@@ -2116,27 +2092,23 @@ fn collect_batch_local_source_entries(
                 },
                 mtime_unix: system_time_to_unix(metadata.modified),
                 mode,
-                checksum: (include_checksums && file_type == WireFileType::File)
+                checksum: (options.include_checksums && file_type == WireFileType::File)
                     .then(|| checksum_local_path(source))
                     .transpose()?,
             },
             local_path: source.clone(),
         });
 
-        if recursive && file_type == WireFileType::Directory {
-            let child_root =
-                remote_followed_directory_path(source, &original_metadata, &metadata, symlink_mode)
-                    .unwrap_or_else(|| source.clone());
+        if options.recursive && file_type == WireFileType::Directory {
+            let child_root = remote_followed_directory_path(
+                source,
+                &original_metadata,
+                &metadata,
+                options.symlink_mode,
+            )
+            .unwrap_or_else(|| source.clone());
             collect_local_directory_source_entries(
-                &LocalSourceCollectContext {
-                    fs: &fs,
-                    recursive,
-                    filter_rules,
-                    files_from,
-                    symlink_mode,
-                    include_checksums,
-                    preserve_executability,
-                },
+                &LocalSourceCollectContext { fs: &fs, options },
                 &child_root,
                 &relative,
                 &mut entries,
@@ -2163,8 +2135,12 @@ fn collect_local_directory_source_entries(
 
         let original_path = entry.path.clone();
         let original_metadata = entry.metadata.clone();
-        let Some(metadata) =
-            remote_sender_metadata(ctx.fs, &entry.path, entry.metadata, ctx.symlink_mode)?
+        let Some(metadata) = remote_sender_metadata(
+            ctx.fs,
+            &entry.path,
+            entry.metadata,
+            ctx.options.symlink_mode,
+        )?
         else {
             continue;
         };
@@ -2176,7 +2152,8 @@ fn collect_local_directory_source_entries(
                     &metadata,
                     WireFileType::Directory,
                     &relative,
-                    ctx.preserve_executability,
+                    ctx.options.preserve_executability,
+                    ctx.options.chmod_rules,
                 ),
             ),
             FileType::File => (
@@ -2185,7 +2162,8 @@ fn collect_local_directory_source_entries(
                     &metadata,
                     WireFileType::File,
                     &relative,
-                    ctx.preserve_executability,
+                    ctx.options.preserve_executability,
+                    ctx.options.chmod_rules,
                 ),
             ),
             other => {
@@ -2197,8 +2175,9 @@ fn collect_local_directory_source_entries(
             }
         };
 
-        if remote_source_path_is_filtered(ctx.filter_rules, &relative, file_type)
+        if remote_source_path_is_filtered(ctx.options.filter_rules, &relative, file_type)
             || ctx
+                .options
                 .files_from
                 .is_some_and(|files_from| !files_from_matches(&relative, files_from))
         {
@@ -2216,18 +2195,18 @@ fn collect_local_directory_source_entries(
                 },
                 mtime_unix: system_time_to_unix(metadata.modified),
                 mode,
-                checksum: (ctx.include_checksums && file_type == WireFileType::File)
+                checksum: (ctx.options.include_checksums && file_type == WireFileType::File)
                     .then(|| checksum_local_path(&original_path))
                     .transpose()?,
             },
             local_path: original_path.clone(),
         });
-        if ctx.recursive && file_type == WireFileType::Directory {
+        if ctx.options.recursive && file_type == WireFileType::Directory {
             let child_root = remote_followed_directory_path(
                 &original_path,
                 &original_metadata,
                 &metadata,
-                ctx.symlink_mode,
+                ctx.options.symlink_mode,
             )
             .unwrap_or(original_path);
             collect_local_directory_source_entries(ctx, &child_root, &relative, entries)?;
@@ -2242,11 +2221,17 @@ fn remote_wire_mode(
     file_type: WireFileType,
     path: &Path,
     preserve_executability: bool,
+    chmod_rules: Option<&ChmodRules>,
 ) -> u32 {
-    match file_type {
+    let mode = match file_type {
         WireFileType::File | WireFileType::Directory | WireFileType::Symlink => {
             metadata.posix_mode_for_path(Some(path), preserve_executability)
         }
+    };
+    match (chmod_rules, file_type) {
+        (Some(rules), WireFileType::File) => rules.apply(mode, ChmodFileKind::File),
+        (Some(rules), WireFileType::Directory) => rules.apply(mode, ChmodFileKind::Directory),
+        _ => mode,
     }
 }
 
@@ -3689,6 +3674,7 @@ struct TransferPlan {
     vss: bool,
     numeric_ids: bool,
     chmod: Option<String>,
+    chmod_rules: Option<ChmodRules>,
     metadata_policy: MetadataPolicy,
     filter_rules: RuleSet,
     remote_server_argv: Option<Vec<String>>,
@@ -3754,6 +3740,7 @@ impl TransferPlan {
         add_explicit_option_diagnostics(cli, &mut report);
 
         let filter_rules = build_filter_rules(cli, &mut report);
+        let chmod_rules = parse_chmod_rules(cli, &mut report);
         let update_mode = update_mode_from_cli(cli);
         let file_write_mode = if cli.inplace {
             FileWriteMode::InPlace
@@ -3940,6 +3927,7 @@ impl TransferPlan {
             vss: cli.vss,
             numeric_ids: cli.numeric_ids,
             chmod: cli.chmod.clone(),
+            chmod_rules,
             metadata_policy,
             filter_rules,
             remote_server_argv,
@@ -4156,6 +4144,19 @@ fn build_filter_rules(cli: &Cli, report: &mut Report) -> RuleSet {
     rules
 }
 
+fn parse_chmod_rules(cli: &Cli, report: &mut Report) -> Option<ChmodRules> {
+    let Some(chmod) = &cli.chmod else {
+        return None;
+    };
+    match chmod.parse::<ChmodRules>() {
+        Ok(rules) => Some(rules),
+        Err(err) => {
+            report.error("E_CHMOD", err.to_string());
+            None
+        }
+    }
+}
+
 fn add_metadata_degradations(
     report: &mut Report,
     degradations: Vec<MetadataDegradation>,
@@ -4253,11 +4254,13 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
             "--numeric-ids is parsed as an owner/group id mapping modifier; it has no local effect unless owner/group preservation is requested",
         );
     }
-    if cli.chmod.is_some() {
-        report.warn(
-            "W_UNSUPPORTED_OPTION",
-            "--chmod is parsed and reported but not applied by the portable executor",
-        );
+    if let Some(chmod) = &cli.chmod {
+        if chmod.parse::<ChmodRules>().is_ok() {
+            report.info(
+                "I_OPTION_PARSED",
+                "--chmod is applied to POSIX mode bits for remote uploads; local Windows destinations do not chmod files",
+            );
+        }
         report.warn(
             metadata_code(MetadataFeature::Permissions, Severity::Warning),
             "permissions metadata would be degraded",
@@ -5944,7 +5947,27 @@ mod tests {
         assert!(output.contains("[error] E_METADATA_GROUP"));
         assert!(output.contains("[error] E_METADATA_PERMISSIONS"));
         assert!(output.contains("fake-super metadata degraded"));
-        assert!(output.contains("acl metadata stored"));
+        assert!(output.contains("[error] E_METADATA_LOSS"));
+        assert!(output.contains("ACL sidecar storage is not implemented yet"));
+    }
+
+    #[test]
+    fn fake_super_fail_on_metadata_loss_errors_without_storage() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--fake-super",
+            "--acls",
+            "--xattrs",
+            "--fail-on-metadata-loss",
+            "src",
+            "dest",
+        ]);
+
+        assert!(output.contains("[error] E_METADATA_LOSS"));
+        assert!(output.contains("fake-super metadata degraded"));
+        assert!(output.contains("acl metadata ignored"));
+        assert!(output.contains("xattr metadata ignored"));
+        assert!(!output.contains("metadata stored"));
     }
 
     #[test]
@@ -6277,33 +6300,89 @@ mod tests {
         let root = unique_temp_dir("rsync-cli-executability-mode");
         let source = root.join("source");
         fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("app.exe"), b"exe").unwrap();
+        fs::write(source.join("run.bat"), b"echo hi").unwrap();
         fs::write(source.join("run.cmd"), b"echo hi").unwrap();
+        fs::write(source.join("script.ps1"), b"Write-Host hi").unwrap();
         fs::write(source.join("notes.txt"), b"notes").unwrap();
+        let filter_rules = RuleSet::empty();
+        let options = LocalSourceCollectOptions {
+            recursive: true,
+            filter_rules: &filter_rules,
+            files_from: None,
+            symlink_mode: SymlinkMode::Preserve,
+            include_checksums: false,
+            preserve_executability: true,
+            chmod_rules: None,
+        };
 
-        let entries = collect_local_source_entries(
-            &[source.clone()],
-            true,
-            &RuleSet::empty(),
-            None,
-            SymlinkMode::Preserve,
-            false,
-            true,
-        )
-        .unwrap();
+        let entries = collect_local_source_entries(&[source.clone()], &options).unwrap();
 
-        let script = entries
-            .iter()
-            .find(|entry| entry.wire.path == PathBuf::from("run.cmd"))
-            .unwrap();
+        for path in ["app.exe", "run.bat", "run.cmd", "script.ps1"] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.wire.path == PathBuf::from(path))
+                .unwrap();
+            assert_eq!(entry.wire.mode & 0o111, 0o111, "{path}");
+        }
         let notes = entries
             .iter()
             .find(|entry| entry.wire.path == PathBuf::from("notes.txt"))
             .unwrap();
 
-        assert_eq!(script.wire.mode & 0o111, 0o111);
         assert_eq!(notes.wire.mode & 0o111, 0);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_sender_chmod_applies_numeric_modes_to_remote_file_list() {
+        let root = unique_temp_dir("rsync-cli-chmod-mode");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("dir")).unwrap();
+        fs::write(source.join("dir/file.txt"), b"data").unwrap();
+        let chmod_rules = "F600,D700".parse::<ChmodRules>().unwrap();
+        let filter_rules = RuleSet::empty();
+        let options = LocalSourceCollectOptions {
+            recursive: true,
+            filter_rules: &filter_rules,
+            files_from: None,
+            symlink_mode: SymlinkMode::Preserve,
+            include_checksums: false,
+            preserve_executability: false,
+            chmod_rules: Some(&chmod_rules),
+        };
+
+        let entries = collect_local_source_entries(&[source.clone()], &options).unwrap();
+
+        let dir = entries
+            .iter()
+            .find(|entry| entry.wire.path == PathBuf::from("dir"))
+            .unwrap();
+        let file = entries
+            .iter()
+            .find(|entry| entry.wire.path == PathBuf::from("dir/file.txt"))
+            .unwrap();
+
+        assert_eq!(dir.wire.mode & 0o7777, 0o700);
+        assert_eq!(file.wire.mode & 0o7777, 0o600);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chmod_rejects_complex_symbolic_forms_in_cli_plan() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--plan",
+            "--chmod",
+            "u+rw",
+            "src",
+            "host:/dest",
+        ]);
+
+        assert!(output.contains("[error] E_CHMOD"));
+        assert!(output.contains("supported subset accepts only numeric modes"));
     }
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
