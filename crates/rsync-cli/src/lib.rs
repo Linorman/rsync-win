@@ -17,8 +17,9 @@ use rsync_filter::{
     normalize_files_from_records, parse_files_from_bytes, EntryKind, Rule, RuleAction, RuleSet,
 };
 use rsync_fs::{
-    sync_sources, walk_tree, FileType, FileWriteMode, FileWriteOptions, FsError, LocalFileSystem,
-    PortableFileSystem, SymlinkMode, SyncAction, SyncOptions, UpdateMode,
+    selected_source_paths, sync_sources, walk_tree, FileType, FileWriteMode, FileWriteOptions,
+    FsError, LocalFileSystem, PortableFileSystem, SourceSelectionOptions, SymlinkMode, SyncAction,
+    SyncOptions, UpdateMode,
 };
 use rsync_protocol::{
     authenticate_daemon_module, build_remote_shell_argv_for_paths,
@@ -1546,6 +1547,7 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     let sources = local_source_paths(cli);
     let dest = Path::new(cli.paths.last().expect("checked operand count"));
     let files_from = load_files_from(cli)?;
+    let ntfs_files_from = files_from.clone();
     let mut fs = LocalFileSystem;
     let progress = ProgressLog::from_cli(cli);
     progress.info(format!(
@@ -1578,7 +1580,8 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         "local sync finished: {} action(s)",
         sync_report.actions().len()
     ));
-    let ntfs_sidecars = handle_ntfs_native_sidecars(&sources, dest, &plan)?;
+    let ntfs_sidecars =
+        handle_ntfs_native_sidecars(&sources, dest, &plan, ntfs_files_from.as_deref())?;
 
     let mut output = String::new();
     output.push_str("rsync-win local portable sync\n");
@@ -1637,6 +1640,7 @@ fn handle_ntfs_native_sidecars(
     sources: &[PathBuf],
     dest: &Path,
     plan: &TransferPlan,
+    files_from: Option<&[PathBuf]>,
 ) -> Result<Option<NtfsSidecarExecution>> {
     if plan.metadata_policy != MetadataPolicy::NtfsNative {
         return Ok(None);
@@ -1644,7 +1648,7 @@ fn handle_ntfs_native_sidecars(
 
     let fs = LocalFileSystem;
     let sidecar_root = ntfs_sidecar_root(dest);
-    let capture_paths = collect_ntfs_sidecar_paths(&fs, sources, plan.recursive)?;
+    let capture_paths = collect_ntfs_sidecar_paths(&fs, sources, plan, files_from)?;
     if plan.dry_run {
         return Ok(Some(NtfsSidecarExecution {
             root: sidecar_root,
@@ -1753,19 +1757,19 @@ fn ntfs_destination_for_source(
 fn collect_ntfs_sidecar_paths(
     fs: &LocalFileSystem,
     sources: &[PathBuf],
-    recursive: bool,
+    plan: &TransferPlan,
+    files_from: Option<&[PathBuf]>,
 ) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for source in sources {
-        let metadata = fs.metadata(source)?;
-        paths.push(source.clone());
-        if recursive && metadata.file_type == FileType::Directory {
-            paths.extend(walk_tree(fs, source)?.into_iter().map(|entry| entry.path));
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    Ok(selected_source_paths(
+        fs,
+        sources,
+        SourceSelectionOptions {
+            recursive: plan.recursive,
+            filter_rules: &plan.filter_rules,
+            files_from,
+            symlink_mode: plan.symlink_mode,
+        },
+    )?)
 }
 
 fn ntfs_sidecar_root(dest: &Path) -> PathBuf {
@@ -6327,6 +6331,72 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn local_ntfs_native_sidecars_respect_filters() {
+        let root = unique_temp_dir("rsync-cli-ntfs-filter");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("keep.txt"), b"keep").unwrap();
+        fs::write(source.join("secret.txt"), b"secret").unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--metadata-policy".to_string(),
+            "ntfs-native".to_string(),
+            "--exclude".to_string(),
+            "secret.txt".to_string(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let sidecar_paths = ntfs_sidecar_source_paths(&dest);
+        assert!(output.contains("ntfs sidecars: planned 2, written 2"));
+        assert!(sidecar_paths.contains(&source));
+        assert!(sidecar_paths.contains(&source.join("keep.txt")));
+        assert!(!sidecar_paths.contains(&source.join("secret.txt")));
+        assert_eq!(fs::read(dest.join("keep.txt")).unwrap(), b"keep");
+        assert!(!dest.join("secret.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_ntfs_native_sidecars_respect_files_from() {
+        let root = unique_temp_dir("rsync-cli-ntfs-files-from");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        let list = root.join("files.txt");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("keep.txt"), b"keep").unwrap();
+        fs::write(source.join("drop.txt"), b"drop").unwrap();
+        fs::write(&list, b"keep.txt\n").unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--metadata-policy".to_string(),
+            "ntfs-native".to_string(),
+            "--files-from".to_string(),
+            list.to_string_lossy().into_owned(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let sidecar_paths = ntfs_sidecar_source_paths(&dest);
+        assert!(output.contains("ntfs sidecars: planned 2, written 2"));
+        assert!(sidecar_paths.contains(&source));
+        assert!(sidecar_paths.contains(&source.join("keep.txt")));
+        assert!(!sidecar_paths.contains(&source.join("drop.txt")));
+        assert_eq!(fs::read(dest.join("keep.txt")).unwrap(), b"keep");
+        assert!(!dest.join("drop.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn local_ntfs_native_sync_restores_safe_windows_attributes() {
@@ -6661,6 +6731,19 @@ mod tests {
         let mut stream_path = to_long_path_safe(path).into_os_string();
         stream_path.push(format!(":{stream_name}"));
         PathBuf::from(stream_path)
+    }
+
+    fn ntfs_sidecar_source_paths(dest: &Path) -> BTreeSet<PathBuf> {
+        fs::read_dir(ntfs_sidecar_root(dest))
+            .unwrap()
+            .map(|entry| {
+                let manifest = fs::read_to_string(entry.unwrap().path()).unwrap();
+                rsync_winfs::parse_ntfs_native_sidecar_manifest(&manifest)
+                    .unwrap()
+                    .sidecar
+                    .path
+            })
+            .collect()
     }
 
     fn remote_push_dry_run_input() -> Vec<u8> {

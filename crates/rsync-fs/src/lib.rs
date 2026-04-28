@@ -9,8 +9,9 @@ pub use metadata::{
     POSIX_SYMLINK_DEFAULT_PERMS, POSIX_TYPE_DIRECTORY, POSIX_TYPE_REGULAR, POSIX_TYPE_SYMLINK,
 };
 pub use sync::{
-    source_relative_paths, sync_sources, sync_tree, DestinationPathPreflight, SymlinkMode,
-    SyncAction, SyncOptions, SyncReport, UpdateMode,
+    selected_source_paths, source_relative_paths, sync_sources, sync_tree,
+    DestinationPathPreflight, SourceSelectionOptions, SymlinkMode, SyncAction, SyncOptions,
+    SyncReport, UpdateMode,
 };
 pub use walk::{
     walk_tree, FileWriteMode, FileWriteOptions, FsError, LocalFileSystem, MemoryFileSystem,

@@ -24,6 +24,14 @@ pub struct SyncOptions {
     pub symlink_mode: SymlinkMode,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SourceSelectionOptions<'a> {
+    pub recursive: bool,
+    pub filter_rules: &'a RuleSet,
+    pub files_from: Option<&'a [PathBuf]>,
+    pub symlink_mode: SymlinkMode,
+}
+
 impl Default for SyncOptions {
     fn default() -> Self {
         Self {
@@ -516,6 +524,60 @@ pub fn source_relative_paths<F: PortableFileSystem>(
             .into_keys()
             .collect(),
     )
+}
+
+pub fn selected_source_paths<F: PortableFileSystem>(
+    fs: &F,
+    sources: &[PathBuf],
+    options: SourceSelectionOptions<'_>,
+) -> Result<Vec<PathBuf>, FsError> {
+    if sources.is_empty() {
+        return Err(FsError::Unsupported("sync requires at least one source"));
+    }
+
+    let mut paths = Vec::new();
+    for source in sources {
+        paths.extend(selected_single_source_paths(fs, source, options)?);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn selected_single_source_paths<F: PortableFileSystem>(
+    fs: &F,
+    source: &Path,
+    options: SourceSelectionOptions<'_>,
+) -> Result<Vec<PathBuf>, FsError> {
+    let metadata = fs.metadata(source)?;
+    let mut paths = Vec::new();
+    if matches!(metadata.file_type, FileType::File | FileType::Directory) {
+        paths.push(source.to_path_buf());
+    }
+    if metadata.file_type != FileType::Directory {
+        return Ok(paths);
+    }
+
+    let mut entries = relative_entries(
+        fs,
+        source,
+        Some(options.filter_rules),
+        options.recursive,
+        options.symlink_mode,
+    )?;
+    if let Some(files_from) = options.files_from {
+        retain_files_from_entries(&mut entries, files_from);
+    }
+
+    paths.extend(entries.into_values().filter_map(|entry| {
+        let selected = match entry.metadata.file_type {
+            FileType::File => true,
+            FileType::Directory => options.recursive,
+            FileType::Symlink | FileType::Hardlink | FileType::Other => false,
+        };
+        selected.then_some(entry.path)
+    }));
+    Ok(paths)
 }
 
 fn remove_conflicting_target<F: PortableFileSystem>(
@@ -1256,6 +1318,61 @@ mod tests {
             .contains(&SyncAction::ProtectDelete(PathBuf::from(
                 "dst/protected.bak"
             ))));
+    }
+
+    #[test]
+    fn selected_source_paths_match_filter_and_files_from_selection() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/keep.txt", b"keep").unwrap();
+        fs.add_file("src/drop.tmp", b"drop").unwrap();
+        fs.add_file("src/dir/keep.dat", b"nested").unwrap();
+        fs.add_file("src/dir/drop.tmp", b"nested-drop").unwrap();
+        let files_from = vec![PathBuf::from("dir/keep.dat")];
+
+        let paths = selected_source_paths(
+            &fs,
+            &[PathBuf::from("src")],
+            SourceSelectionOptions {
+                recursive: true,
+                filter_rules: &RuleSet::new(vec![Rule::exclude("*.tmp").unwrap()]),
+                files_from: Some(&files_from),
+                symlink_mode: SymlinkMode::Preserve,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("src"),
+                PathBuf::from("src/dir"),
+                PathBuf::from("src/dir/keep.dat"),
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_source_paths_skip_nonrecursive_child_directories() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/top.txt", b"top").unwrap();
+        fs.add_file("src/nested/file.txt", b"nested").unwrap();
+
+        let paths = selected_source_paths(
+            &fs,
+            &[PathBuf::from("src")],
+            SourceSelectionOptions {
+                recursive: false,
+                filter_rules: &RuleSet::empty(),
+                files_from: None,
+                symlink_mode: SymlinkMode::Preserve,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("src"), PathBuf::from("src/top.txt")]
+        );
     }
 
     #[test]
