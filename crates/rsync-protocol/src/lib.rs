@@ -1,8 +1,14 @@
+pub mod daemon;
 pub mod flist;
 pub mod io;
 pub mod session;
 pub mod version;
 
+pub use daemon::{
+    daemon_auth_response, request_daemon_module_list, setup_daemon_transfer, write_daemon_args,
+    DaemonAuth, DaemonEndpoint, DaemonError, DaemonGreeting, DaemonHandshake, DaemonModule,
+    DaemonModuleList, DAEMON_CLIENT_PROTOCOL, RSYNC_DAEMON_PORT,
+};
 pub use flist::{
     read_file_list, read_internal_file_list, read_rsync27_file_list,
     read_rsync27_file_list_with_options, read_rsync31_file_list,

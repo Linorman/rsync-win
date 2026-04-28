@@ -5,7 +5,7 @@
 
 `rsync-win` is a native Windows rsync-compatible command line application written in Rust. It aims to provide useful rsync-style local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
 
-This is an early development release. Version `v0.1.5` maps to Cargo package version `0.1.5` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, and concise transfer logging.
+This is an early development release. Version `v0.1.5` maps to Cargo package version `0.1.5` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, daemon client mode, streaming file data, and concise transfer logging.
 
 ## Status
 
@@ -20,7 +20,7 @@ This is an early development release. Version `v0.1.5` maps to Cargo package ver
 | Remote shell | Experimental ordinary-file push/pull over SSH with protocol 31 work, protocol 27 compatibility fallback, rsync-style `-e`, multiple local-source push, and multiple remote-source pull from one host. |
 | Logging | Default output is a concise summary with file counts, byte counts, and change totals; `-v` prints per-file transfer progress and `-vv` expands detailed actions. |
 | Windows-native metadata | Long path, collision, link, and metadata policy work is in progress. |
-| Daemon mode | Planned, not implemented in v0.1.5. |
+| Daemon mode | Experimental TCP client support for module listing plus ordinary-file no-auth/auth pull and push. |
 
 ## Install
 
@@ -108,6 +108,26 @@ Download multiple remote directories from the same host into one destination, pr
 ```powershell
 rsync-win -av --no-o --no-g -e "ssh -p 22" root@example:/srv/one root@example:/srv/two .\backup\
 ```
+
+List daemon modules:
+
+```powershell
+rsync-win rsync://example.com/
+```
+
+Pull from a daemon module:
+
+```powershell
+rsync-win -r rsync://example.com/module/path/ .\data\
+```
+
+Push to a writable daemon module with a password file:
+
+```powershell
+rsync-win -r --password-file .\rsync.pass .\source\ user@example.com::module/path/
+```
+
+Rsync daemon authentication is not transport encryption. Use SSH or a TLS wrapper when transfer confidentiality matters.
 
 Use `-v` for concise live progress. The command prints a compact final summary by default, for example file counts, byte counts, and a `changes:` line. Use `--dry-run` or `-vv` when you need the full action list, and `--stats` for structured counters.
 
