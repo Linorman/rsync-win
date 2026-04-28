@@ -1198,6 +1198,11 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         "protocol: rsync {}",
         handshake.selected_protocol.value()
     ));
+    if plan.delete {
+        let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
+        write_i32_le(&mut writer, 0).map_err(protocol31_setup_error)?;
+        writer.flush().map_err(protocol31_setup_error)?;
+    }
     {
         let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
         write_rsync31_file_list_with_options(
@@ -4903,9 +4908,9 @@ mod tests {
         assert!(output.contains("[warning] W_METADATA_OWNER"));
         assert!(output.contains("[warning] W_METADATA_GROUP"));
         assert!(output.contains("[warning] W_METADATA_DEVICE"));
-        assert!(
-            output.contains("remote --server argv: rsync --server --delete --perms -ntre.LsfxCIvu")
-        );
+        assert!(output.contains(
+            "remote --server argv: rsync --server --delete-before --perms -ntre.LsfxCIvu"
+        ));
         assert!(output.contains("[info] I_REMOTE_PROTOCOL31_MVP"));
         assert!(output.contains("wire protocol: experimental protocol 31"));
     }
@@ -5156,7 +5161,7 @@ mod tests {
 
         ensure_remote_execution_options_supported(&cli, &plan).unwrap();
         let argv = plan.remote_server_argv.as_ref().unwrap();
-        assert!(argv.contains(&"--delete".to_string()));
+        assert!(argv.contains(&"--delete-before".to_string()));
         assert!(argv.contains(&"--exclude=*.tmp".to_string()));
     }
 
@@ -5392,6 +5397,70 @@ mod tests {
             .windows("file.txt".len())
             .any(|window| window == b"file.txt"));
         assert!(!output.contains("transfer note: no file data was sent"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_push_protocol31_accepts_local_source_with_trailing_forward_separator() {
+        let root = unique_temp_dir("rsync-cli-remote-push-trailing-separator");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+        let source_arg = format!("{}/", source.to_string_lossy());
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--dry-run".to_string(),
+            source_arg,
+            "host:/tmp/dest".to_string(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_push_dry_run_input());
+
+        let output = execute_remote_push(&cli, &plan, &mut transport).unwrap();
+
+        assert!(output.contains("files offered: 1"));
+        assert!(transport
+            .written
+            .windows("file.txt".len())
+            .any(|window| window == b"file.txt"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_push_protocol31_delete_sends_filter_list_terminator_before_file_list() {
+        let root = unique_temp_dir("rsync-cli-remote-push-delete-filter-list");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--delete".to_string(),
+            "--dry-run".to_string(),
+            source.to_string_lossy().into_owned(),
+            "host:/tmp/dest".to_string(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_push_dry_run_input());
+
+        let output = execute_remote_push(&cli, &plan, &mut transport).unwrap();
+        let payloads = written_protocol31_mux_payloads(&transport.written);
+
+        assert!(output.contains("files offered: 1"));
+        assert_eq!(
+            payloads.first().map(Vec::as_slice),
+            Some(&[0_u8, 0, 0, 0][..])
+        );
+        assert!(payloads.iter().skip(1).any(|payload| {
+            payload
+                .windows("file.txt".len())
+                .any(|window| window == b"file.txt")
+        }));
 
         fs::remove_dir_all(root).unwrap();
     }

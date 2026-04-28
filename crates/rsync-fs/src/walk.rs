@@ -942,21 +942,35 @@ fn local_os_path(path: &Path) -> PathBuf {
         return path.to_path_buf();
     }
 
-    if let Ok(stripped) = path.strip_prefix(r"\\") {
-        return PathBuf::from(format!(r"\\?\UNC\{}", stripped.display()));
-    }
-
-    if path.is_absolute() {
-        return PathBuf::from(format!(r"\\?\{}", path.display()));
-    }
-
     if let Some(Component::Prefix(prefix)) = path.components().next() {
-        if matches!(prefix.kind(), Prefix::Verbatim(_) | Prefix::VerbatimDisk(_)) {
-            return path.to_path_buf();
+        match prefix.kind() {
+            Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) => {
+                return path.to_path_buf();
+            }
+            Prefix::DeviceNS(_) => return path.to_path_buf(),
+            Prefix::UNC(_, _) => return unc_verbatim_path(path),
+            _ => {}
         }
     }
 
+    if path.is_absolute() {
+        let normalized = verbatim_path_text(path);
+        return PathBuf::from(format!(r"\\?\{normalized}"));
+    }
+
     path.to_path_buf()
+}
+
+#[cfg(windows)]
+fn unc_verbatim_path(path: &Path) -> PathBuf {
+    let normalized = verbatim_path_text(path);
+    let stripped = normalized.strip_prefix(r"\\").unwrap_or(&normalized);
+    PathBuf::from(format!(r"\\?\UNC\{stripped}"))
+}
+
+#[cfg(windows)]
+fn verbatim_path_text(path: &Path) -> String {
+    path.as_os_str().to_string_lossy().replace('/', r"\")
 }
 
 #[cfg(not(windows))]
@@ -1045,6 +1059,31 @@ mod tests {
             .all(|path| !path.as_os_str().to_string_lossy().starts_with(r"\\?\")));
 
         fs_adapter.remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_os_path_normalizes_forward_slashes_before_verbatim_prefix() {
+        let path = local_os_path(Path::new(r"C:/temp/rsync-win/source/"));
+        let text = path.as_os_str().to_string_lossy();
+
+        assert_eq!(text, r"\\?\C:\temp\rsync-win\source\");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_os_path_uses_unc_verbatim_prefix_for_unc_paths() {
+        let backslash = local_os_path(Path::new(r"\\server\share\rsync-win/source/"));
+        let forward = local_os_path(Path::new("//server/share/rsync-win/source/"));
+
+        assert_eq!(
+            backslash.as_os_str().to_string_lossy(),
+            r"\\?\UNC\server\share\rsync-win\source\"
+        );
+        assert_eq!(
+            forward.as_os_str().to_string_lossy(),
+            r"\\?\UNC\server\share\rsync-win\source\"
+        );
     }
 
     #[test]

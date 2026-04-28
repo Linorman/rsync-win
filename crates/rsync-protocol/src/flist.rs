@@ -30,7 +30,6 @@ const XMIT31_SAME_GID: u32 = 1 << 4;
 const XMIT31_SAME_NAME: u32 = 1 << 5;
 const XMIT31_LONG_NAME: u32 = 1 << 6;
 const XMIT31_SAME_TIME: u32 = 1 << 7;
-const XMIT31_NO_CONTENT_DIR: u32 = 1 << 8;
 const XMIT31_USER_NAME_FOLLOWS: u32 = 1 << 10;
 const XMIT31_GROUP_NAME_FOLLOWS: u32 = 1 << 11;
 const XMIT31_MOD_NSEC: u32 = 1 << 13;
@@ -202,7 +201,7 @@ pub fn write_rsync27_file_list_with_options<W: Write>(
         if last_mtime == Some(entry.mtime_unix) {
             status |= XMIT_SAME_TIME;
         }
-        if entry.file_type == WireFileType::Directory && !entry.path.components().any(|_| true) {
+        if entry.file_type == WireFileType::Directory && entry.path == Path::new(".") {
             status |= XMIT_TOP_DIR;
         }
 
@@ -384,11 +383,8 @@ pub fn write_rsync31_file_list_with_options<W: Write>(
         let suffix = &path[inherited..];
         let mut flags = XMIT31_SAME_UID | XMIT31_SAME_GID;
 
-        if entry.file_type == WireFileType::Directory {
-            flags |= XMIT31_NO_CONTENT_DIR;
-            if entry.path == Path::new(".") {
-                flags |= XMIT31_TOP_DIR;
-            }
+        if entry.file_type == WireFileType::Directory && entry.path == Path::new(".") {
+            flags |= XMIT31_TOP_DIR;
         }
         if last_mode == Some(entry.mode) {
             flags |= XMIT31_SAME_MODE;
@@ -902,6 +898,28 @@ mod tests {
             read_rsync31_file_list(&mut bytes.as_slice(), 16, 256).unwrap(),
             entries
         );
+    }
+
+    #[test]
+    fn protocol_file_list_marks_dot_as_content_top_directory() {
+        let entries = vec![RsyncFileListEntry {
+            path: PathBuf::from("."),
+            file_type: WireFileType::Directory,
+            len: 0,
+            mtime_unix: 1_700_000_000,
+            mode: RSYNC_DIRECTORY_MODE,
+            checksum: None,
+        }];
+
+        let mut protocol27 = Vec::new();
+        write_rsync27_file_list(&mut protocol27, &entries).unwrap();
+        assert_eq!(protocol27[0] & XMIT_TOP_DIR, XMIT_TOP_DIR);
+
+        let mut protocol31 = Vec::new();
+        write_rsync31_file_list(&mut protocol31, &entries).unwrap();
+        let flags = read_varint(&mut protocol31.as_slice()).unwrap();
+        assert_eq!(flags & XMIT31_TOP_DIR, XMIT31_TOP_DIR);
+        assert_eq!(flags & (1 << 8), 0);
     }
 
     #[test]

@@ -244,7 +244,7 @@ pub fn build_remote_shell_argv_for_paths(
         argv.push("--times".to_string());
     }
     if options.delete {
-        argv.push("--delete".to_string());
+        argv.push("--delete-before".to_string());
     }
     if matches!(options.direction, TransferDirection::Pull) && options.recursive {
         argv.push("--no-inc-recursive".to_string());
@@ -281,7 +281,7 @@ pub fn build_remote_shell_protocol31_argv_for_paths(
         argv.push("--sender".to_string());
     }
     if options.delete {
-        argv.push("--delete".to_string());
+        argv.push("--delete-before".to_string());
     }
     if matches!(options.direction, TransferDirection::Pull) && options.recursive {
         argv.push("--no-inc-recursive".to_string());
@@ -794,7 +794,7 @@ mod tests {
                 "--server",
                 "--recursive",
                 "--times",
-                "--delete",
+                "--delete-before",
                 "--dry-run",
                 "--whole-file",
                 "-v",
@@ -840,7 +840,7 @@ mod tests {
             vec![
                 "rsync",
                 "--server",
-                "--delete",
+                "--delete-before",
                 "-vnWtre.LsfxCIvu",
                 ".",
                 "dest",
@@ -863,7 +863,7 @@ mod tests {
         let protocol31 = build_remote_shell_protocol31_argv(&options, Path::new("dest")).unwrap();
 
         for argv in [protocol27, protocol31] {
-            assert!(argv.contains(&"--delete".to_string()));
+            assert!(argv.contains(&"--delete-before".to_string()));
             assert!(argv.contains(&"--include=src/**".to_string()));
             assert!(argv.contains(&"--exclude=*.tmp".to_string()));
             assert!(argv.contains(&"--filter=protect *.bak".to_string()));
