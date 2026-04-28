@@ -206,6 +206,12 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 - Compatibility report for applied/degraded/rejected metadata.
 - Linux/macOS metadata interop tests.
 
+**Current Implementation Status:**
+
+- CLI accepts and reports POSIX metadata requests: `-p/--perms`, `-o/--owner`, `-g/--group`, `--executability`, `--acls`, `--xattrs`, `--fake-super`, `--omit-link-times`, `--numeric-ids`, and `--chmod`.
+- Remote-shell sender file lists carry POSIX mode-like bits, including Windows executable-name inference for `--executability`.
+- Owner/group, ACL, xattr, fake-super, and symlink mtime behavior is explicitly reported as applied/stored/degraded/ignored/rejected instead of silently approximated.
+
 **Exit Criteria:**
 
 - POSIX metadata requests either apply correctly, store via explicit compatibility mechanism, or fail with clear diagnostics.
@@ -231,6 +237,13 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 - `rsync-winfs::streams`
 - `rsync-winfs::vss`
 - Native metadata sidecar or extension format.
+
+**Current Implementation Status:**
+
+- `rsync-winfs::security` captures a stable summary/hash of Windows security descriptors where available.
+- `rsync-winfs::streams` enumerates alternate data stream names and sizes on Windows and safely reports none elsewhere.
+- `rsync-winfs::vss` exposes explicit VSS request status; snapshot creation/restore remains rejected with diagnostics.
+- `NtfsNativeSidecar` records file type, times, attributes, sparse/reparse status, identity fields, security summary, stream summaries, and VSS status. Restore and stream payload copying are not wired into local sync yet.
 
 **Exit Criteria:**
 

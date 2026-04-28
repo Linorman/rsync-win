@@ -3,8 +3,10 @@ pub mod sync;
 pub mod walk;
 
 pub use metadata::{
-    FileType, MetadataAction, MetadataDegradation, MetadataFeature, MetadataReport,
-    PortableMetadata,
+    default_permissions, path_looks_executable, posix_file_type_bits, FileType, MetadataAction,
+    MetadataDegradation, MetadataFeature, MetadataReport, PortableMetadata,
+    POSIX_DIRECTORY_DEFAULT_PERMS, POSIX_FILE_DEFAULT_PERMS, POSIX_FILE_EXECUTABLE_PERMS,
+    POSIX_SYMLINK_DEFAULT_PERMS, POSIX_TYPE_DIRECTORY, POSIX_TYPE_REGULAR, POSIX_TYPE_SYMLINK,
 };
 pub use sync::{
     source_relative_paths, sync_sources, sync_tree, DestinationPathPreflight, SymlinkMode,

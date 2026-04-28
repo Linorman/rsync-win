@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,7 +10,8 @@ use anyhow::{bail, Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use rsync_core::{
     archive_mode_components, archive_mode_degradations, metadata_policy_degradations, Diagnostic,
-    MetadataDegradation, MetadataFeature, MetadataPolicy, Report, Severity,
+    MetadataDegradation, MetadataFeature, MetadataPolicy, NtfsNativeMetadataRequest,
+    PosixMetadataRequest, Report, Severity,
 };
 use rsync_filter::{
     normalize_files_from_records, parse_files_from_bytes, EntryKind, Rule, RuleAction, RuleSet,
@@ -32,13 +33,13 @@ use rsync_protocol::{
     RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, RsyncMd4Checksum, SessionError,
     TransferDirection, WireFileType, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
     REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
-    RSYNC_INDEX_DONE, RSYNC_REGULAR_FILE_MODE,
+    RSYNC_INDEX_DONE,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
     spawn_ssh_remote_command, SshRemoteCommand,
 };
-use rsync_winfs::{to_long_path_safe, WindowsDriveKind};
+use rsync_winfs::{capture_ntfs_native_sidecar, to_long_path_safe, WindowsDriveKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliMetadataPolicy {
@@ -109,6 +110,33 @@ pub struct Cli {
 
     #[arg(long, action = ArgAction::SetTrue, help = "Treat unsupported requested metadata as an error")]
     fail_on_metadata_loss: bool,
+
+    #[arg(short = 'p', long = "perms", action = ArgAction::SetTrue, help = "Request POSIX permission preservation")]
+    preserve_permissions: bool,
+
+    #[arg(short = 'o', long = "owner", action = ArgAction::SetTrue, help = "Request POSIX owner preservation")]
+    preserve_owner: bool,
+
+    #[arg(short = 'g', long = "group", action = ArgAction::SetTrue, help = "Request POSIX group preservation")]
+    preserve_group: bool,
+
+    #[arg(long = "executability", action = ArgAction::SetTrue, help = "Preserve executable-ness where POSIX mode metadata is supported")]
+    executability: bool,
+
+    #[arg(long = "acls", action = ArgAction::SetTrue, help = "Request POSIX ACL preservation")]
+    acls: bool,
+
+    #[arg(long = "xattrs", action = ArgAction::SetTrue, help = "Request POSIX extended attribute preservation")]
+    xattrs: bool,
+
+    #[arg(long = "fake-super", action = ArgAction::SetTrue, help = "Request fake-super style metadata sidecar storage")]
+    fake_super: bool,
+
+    #[arg(long = "omit-link-times", action = ArgAction::SetTrue, help = "Do not request symlink mtime preservation")]
+    omit_link_times: bool,
+
+    #[arg(long = "vss", action = ArgAction::SetTrue, help = "Request VSS snapshot source mode for ntfs-native transfers")]
+    vss: bool,
 
     #[arg(long = "include", help = "Add an include filter pattern")]
     includes: Vec<String>,
@@ -284,6 +312,16 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
         symlink_mode_label(plan.symlink_mode)
     ));
     output.push_str(&format!(
+        "posix metadata: {}\n",
+        posix_metadata_summary(plan)
+    ));
+    if plan.metadata_policy == MetadataPolicy::NtfsNative || plan.vss {
+        output.push_str(&format!(
+            "ntfs-native metadata: sidecar-capture prototype, vss={}\n",
+            plan.vss
+        ));
+    }
+    output.push_str(&format!(
         "filter rules: {}\n",
         plan.filter_rules.rules().len()
     ));
@@ -376,6 +414,7 @@ struct LocalSourceCollectContext<'a> {
     files_from: Option<&'a [PathBuf]>,
     symlink_mode: SymlinkMode,
     include_checksums: bool,
+    preserve_executability: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -728,6 +767,7 @@ fn build_protocol27_fallback_command(
             whole_file: plan.whole_file
                 && !(direction == TransferDirection::Push && plan.append_verify),
             verbosity: plan.verbosity,
+            preserve_permissions: plan.preserve_permissions,
             checksum: plan.update_mode == UpdateMode::Checksum,
             size_only: direction == TransferDirection::Push
                 && plan.update_mode == UpdateMode::SizeOnly,
@@ -744,12 +784,14 @@ fn build_protocol27_fallback_command(
             inplace: direction == TransferDirection::Push
                 && plan.file_write_mode == FileWriteMode::InPlace,
             append_verify: direction == TransferDirection::Push && plan.append_verify,
+            executability: direction == TransferDirection::Push && plan.preserve_executability,
             numeric_ids: direction == TransferDirection::Push && plan.numeric_ids,
             chmod: if direction == TransferDirection::Push {
                 plan.chmod.clone()
             } else {
                 None
             },
+            omit_link_times: plan.omit_link_times,
             copy_links: direction == TransferDirection::Pull
                 && plan.symlink_mode == SymlinkMode::CopyAll,
             safe_links: direction == TransferDirection::Push
@@ -872,6 +914,7 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         files_from.as_deref(),
         plan.symlink_mode,
         plan.update_mode == UpdateMode::Checksum,
+        plan.preserve_executability,
     )?;
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
@@ -950,6 +993,7 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         files_from.as_deref(),
         plan.symlink_mode,
         plan.update_mode == UpdateMode::Checksum,
+        plan.preserve_executability,
     )?;
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
@@ -1345,6 +1389,7 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         "local sync finished: {} action(s)",
         sync_report.actions().len()
     ));
+    let ntfs_sidecars = handle_ntfs_native_sidecars(&sources, dest, &plan)?;
 
     let mut output = String::new();
     output.push_str("rsync-win local portable sync\n");
@@ -1352,6 +1397,23 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     output.push_str(&format!("destination: {}\n", dest.display()));
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     output.push_str(&format!("metadata policy: {}\n", plan.metadata_policy));
+    output.push_str(&format!(
+        "posix metadata: {}\n",
+        posix_metadata_summary(&plan)
+    ));
+    if plan.metadata_policy == MetadataPolicy::NtfsNative || plan.vss {
+        output.push_str(&format!(
+            "ntfs-native metadata: sidecar-capture prototype, vss={}\n",
+            plan.vss
+        ));
+    }
+    if let Some(sidecars) = ntfs_sidecars {
+        output.push_str(&format!(
+            "ntfs sidecars: planned {}, written {}\n",
+            sidecars.planned, sidecars.written
+        ));
+        output.push_str(&format!("ntfs sidecar root: {}\n", sidecars.root.display()));
+    }
 
     if !plan.report.is_empty() {
         output.push_str("diagnostics:\n");
@@ -1361,6 +1423,146 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     append_action_report(&mut output, cli, sync_report.actions());
 
     Ok(output)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NtfsSidecarExecution {
+    root: PathBuf,
+    planned: usize,
+    written: usize,
+}
+
+fn handle_ntfs_native_sidecars(
+    sources: &[PathBuf],
+    dest: &Path,
+    plan: &TransferPlan,
+) -> Result<Option<NtfsSidecarExecution>> {
+    if plan.metadata_policy != MetadataPolicy::NtfsNative {
+        return Ok(None);
+    }
+
+    let fs = LocalFileSystem;
+    let sidecar_root = ntfs_sidecar_root(dest);
+    let capture_paths = collect_ntfs_sidecar_paths(&fs, sources, plan.recursive)?;
+    if plan.dry_run {
+        return Ok(Some(NtfsSidecarExecution {
+            root: sidecar_root,
+            planned: capture_paths.len(),
+            written: 0,
+        }));
+    }
+
+    fs::create_dir_all(&sidecar_root)?;
+    let mut written = 0;
+    for source_path in &capture_paths {
+        let sidecar = capture_ntfs_native_sidecar(source_path, plan.vss)
+            .with_context(|| format!("capture NTFS metadata for {}", source_path.display()))?;
+        let relative = ntfs_sidecar_relative_name(sources, source_path);
+        let manifest_path = sidecar_root.join(format!("{relative}.ntfs.meta"));
+        fs::write(&manifest_path, sidecar.manifest())?;
+        written += 1;
+    }
+
+    Ok(Some(NtfsSidecarExecution {
+        root: sidecar_root,
+        planned: capture_paths.len(),
+        written,
+    }))
+}
+
+fn collect_ntfs_sidecar_paths(
+    fs: &LocalFileSystem,
+    sources: &[PathBuf],
+    recursive: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for source in sources {
+        let metadata = fs.metadata(source)?;
+        paths.push(source.clone());
+        if recursive && metadata.file_type == FileType::Directory {
+            paths.extend(walk_tree(fs, source)?.into_iter().map(|entry| entry.path));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn ntfs_sidecar_root(dest: &Path) -> PathBuf {
+    let dest_is_file = fs::metadata(dest)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    if dest_is_file {
+        dest.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".rsync-win.ntfs-native")
+    } else {
+        dest.join(".rsync-win.ntfs-native")
+    }
+}
+
+fn ntfs_sidecar_relative_name(sources: &[PathBuf], path: &Path) -> String {
+    let relative = sources
+        .iter()
+        .find_map(|source| {
+            if path == source {
+                source.file_name().map(PathBuf::from)
+            } else {
+                path.strip_prefix(source).ok().map(|relative| {
+                    source
+                        .file_name()
+                        .map(|name| PathBuf::from(name).join(relative))
+                        .unwrap_or_else(|| relative.to_path_buf())
+                })
+            }
+        })
+        .unwrap_or_else(|| path.file_name().map(PathBuf::from).unwrap_or_default());
+    let display_name = sanitize_sidecar_name(&relative);
+    let hash = stable_sidecar_path_hash(&relative);
+    format!("{display_name}--{hash:016x}")
+}
+
+fn sanitize_sidecar_name(path: &Path) -> String {
+    let mut name = String::new();
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        if !name.is_empty() {
+            name.push_str("__");
+        }
+        for ch in part.to_string_lossy().chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                name.push(ch);
+            } else {
+                name.push('_');
+            }
+        }
+    }
+    if name.is_empty() {
+        "_root".to_string()
+    } else {
+        name
+    }
+}
+
+fn stable_sidecar_path_hash(path: &Path) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        for byte in part.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn local_source_paths(cli: &Cli) -> Vec<PathBuf> {
@@ -1532,6 +1734,7 @@ fn collect_local_source_entries(
     files_from: Option<&[PathBuf]>,
     symlink_mode: SymlinkMode,
     include_checksums: bool,
+    preserve_executability: bool,
 ) -> Result<Vec<RemoteSourceEntry>> {
     if sources.len() == 1 {
         return collect_single_local_source_entries(
@@ -1541,6 +1744,7 @@ fn collect_local_source_entries(
             files_from,
             symlink_mode,
             include_checksums,
+            preserve_executability,
         );
     }
 
@@ -1551,6 +1755,7 @@ fn collect_local_source_entries(
         files_from,
         symlink_mode,
         include_checksums,
+        preserve_executability,
     )
 }
 
@@ -1561,6 +1766,7 @@ fn collect_single_local_source_entries(
     files_from: Option<&[PathBuf]>,
     symlink_mode: SymlinkMode,
     include_checksums: bool,
+    preserve_executability: bool,
 ) -> Result<Vec<RemoteSourceEntry>> {
     let fs = LocalFileSystem;
     let source_metadata = remote_sender_metadata(&fs, source, fs.metadata(source)?, symlink_mode)?
@@ -1579,11 +1785,16 @@ fn collect_single_local_source_entries(
         }
         entries.push(RemoteSourceEntry {
             wire: RsyncFileListEntry {
-                path: relative,
+                path: relative.clone(),
                 file_type: WireFileType::File,
                 len: source_metadata.len,
                 mtime_unix: system_time_to_unix(source_metadata.modified),
-                mode: RSYNC_REGULAR_FILE_MODE,
+                mode: remote_wire_mode(
+                    &source_metadata,
+                    WireFileType::File,
+                    &relative,
+                    preserve_executability,
+                ),
                 checksum: include_checksums
                     .then(|| checksum_local_path(source))
                     .transpose()?,
@@ -1617,6 +1828,7 @@ fn collect_single_local_source_entries(
             files_from,
             symlink_mode,
             include_checksums,
+            preserve_executability,
         },
         source,
         Path::new(""),
@@ -1634,6 +1846,7 @@ fn collect_batch_local_source_entries(
     files_from: Option<&[PathBuf]>,
     symlink_mode: SymlinkMode,
     include_checksums: bool,
+    preserve_executability: bool,
 ) -> Result<Vec<RemoteSourceEntry>> {
     let fs = LocalFileSystem;
     let mut entries = Vec::new();
@@ -1650,8 +1863,24 @@ fn collect_batch_local_source_entries(
         };
 
         let (file_type, mode) = match metadata.file_type {
-            FileType::Directory => (WireFileType::Directory, RSYNC_DIRECTORY_MODE),
-            FileType::File => (WireFileType::File, RSYNC_REGULAR_FILE_MODE),
+            FileType::Directory => (
+                WireFileType::Directory,
+                remote_wire_mode(
+                    &metadata,
+                    WireFileType::Directory,
+                    &relative,
+                    preserve_executability,
+                ),
+            ),
+            FileType::File => (
+                WireFileType::File,
+                remote_wire_mode(
+                    &metadata,
+                    WireFileType::File,
+                    &relative,
+                    preserve_executability,
+                ),
+            ),
             other => {
                 bail!(
                     "remote-shell MVP does not transfer {:?}: {}",
@@ -1697,6 +1926,7 @@ fn collect_batch_local_source_entries(
                     files_from,
                     symlink_mode,
                     include_checksums,
+                    preserve_executability,
                 },
                 &child_root,
                 &relative,
@@ -1731,8 +1961,24 @@ fn collect_local_directory_source_entries(
         };
 
         let (file_type, mode) = match metadata.file_type {
-            FileType::Directory => (WireFileType::Directory, RSYNC_DIRECTORY_MODE),
-            FileType::File => (WireFileType::File, RSYNC_REGULAR_FILE_MODE),
+            FileType::Directory => (
+                WireFileType::Directory,
+                remote_wire_mode(
+                    &metadata,
+                    WireFileType::Directory,
+                    &relative,
+                    ctx.preserve_executability,
+                ),
+            ),
+            FileType::File => (
+                WireFileType::File,
+                remote_wire_mode(
+                    &metadata,
+                    WireFileType::File,
+                    &relative,
+                    ctx.preserve_executability,
+                ),
+            ),
             other => {
                 bail!(
                     "remote-shell MVP does not transfer {:?}: {}",
@@ -1780,6 +2026,19 @@ fn collect_local_directory_source_entries(
     }
 
     Ok(())
+}
+
+fn remote_wire_mode(
+    metadata: &rsync_fs::PortableMetadata,
+    file_type: WireFileType,
+    path: &Path,
+    preserve_executability: bool,
+) -> u32 {
+    match file_type {
+        WireFileType::File | WireFileType::Directory | WireFileType::Symlink => {
+            metadata.posix_mode_for_path(Some(path), preserve_executability)
+        }
+    }
 }
 
 fn remote_sender_metadata(
@@ -3171,6 +3430,15 @@ struct TransferPlan {
     partial_dir: Option<PathBuf>,
     append_verify: bool,
     symlink_mode: SymlinkMode,
+    preserve_permissions: bool,
+    preserve_owner: bool,
+    preserve_group: bool,
+    preserve_executability: bool,
+    preserve_acls: bool,
+    preserve_xattrs: bool,
+    fake_super: bool,
+    omit_link_times: bool,
+    vss: bool,
     numeric_ids: bool,
     chmod: Option<String>,
     metadata_policy: MetadataPolicy,
@@ -3217,6 +3485,22 @@ impl TransferPlan {
             metadata_policy_degradations(metadata_policy),
             cli.fail_on_metadata_loss,
         );
+        add_metadata_degradations(
+            &mut report,
+            posix_metadata_request_from_cli(cli).degradations(metadata_policy),
+            cli.fail_on_metadata_loss,
+        );
+        if cli.vss {
+            add_metadata_degradations(
+                &mut report,
+                NtfsNativeMetadataRequest {
+                    vss_snapshot: true,
+                    ..Default::default()
+                }
+                .degradations(),
+                cli.fail_on_metadata_loss,
+            );
+        }
         add_explicit_option_diagnostics(cli, &mut report);
 
         let filter_rules = build_filter_rules(cli, &mut report);
@@ -3391,6 +3675,15 @@ impl TransferPlan {
             partial_dir: cli.partial_dir.clone().map(PathBuf::from),
             append_verify: cli.append_verify,
             symlink_mode,
+            preserve_permissions: cli.preserve_permissions || cli.archive,
+            preserve_owner: cli.preserve_owner || (cli.archive && !cli.no_owner),
+            preserve_group: cli.preserve_group || (cli.archive && !cli.no_group),
+            preserve_executability: cli.executability,
+            preserve_acls: cli.acls,
+            preserve_xattrs: cli.xattrs,
+            fake_super: cli.fake_super,
+            omit_link_times: cli.omit_link_times,
+            vss: cli.vss,
             numeric_ids: cli.numeric_ids,
             chmod: cli.chmod.clone(),
             metadata_policy,
@@ -3422,6 +3715,7 @@ fn remote_shell_options_from_cli(
         dry_run: cli.dry_run,
         whole_file: cli.whole_file && !(direction == TransferDirection::Push && cli.append_verify),
         verbosity: cli.verbosity,
+        preserve_permissions: cli.preserve_permissions || cli.archive,
         checksum: cli.checksum,
         size_only: direction == TransferDirection::Push && cli.size_only,
         ignore_times: direction == TransferDirection::Push && cli.ignore_times,
@@ -3431,10 +3725,12 @@ fn remote_shell_options_from_cli(
             .flatten(),
         inplace: direction == TransferDirection::Push && cli.inplace,
         append_verify: direction == TransferDirection::Push && cli.append_verify,
+        executability: direction == TransferDirection::Push && cli.executability,
         numeric_ids: direction == TransferDirection::Push && cli.numeric_ids,
         chmod: (direction == TransferDirection::Push)
             .then(|| cli.chmod.clone())
             .flatten(),
+        omit_link_times: cli.omit_link_times,
         copy_links: direction == TransferDirection::Pull && symlink_mode == SymlinkMode::CopyAll,
         safe_links: direction == TransferDirection::Push && symlink_mode == SymlinkMode::SafeOnly,
         copy_unsafe_links: direction == TransferDirection::Pull
@@ -3551,22 +3847,77 @@ fn archive_mode_degradations_for_cli(
         .collect()
 }
 
+fn posix_metadata_request_from_cli(cli: &Cli) -> PosixMetadataRequest {
+    PosixMetadataRequest {
+        permissions: cli.preserve_permissions,
+        owner: cli.preserve_owner,
+        group: cli.preserve_group,
+        numeric_ids: cli.numeric_ids,
+        chmod: cli.chmod.is_some(),
+        executability: cli.executability,
+        symlink_mtime: cli.archive && !cli.omit_link_times,
+        acls: cli.acls,
+        xattrs: cli.xattrs,
+        fake_super: cli.fake_super,
+    }
+}
+
+fn posix_metadata_summary(plan: &TransferPlan) -> String {
+    let mut parts = Vec::new();
+    if plan.preserve_permissions {
+        parts.push("perms");
+    }
+    if plan.preserve_owner {
+        parts.push("owner");
+    }
+    if plan.preserve_group {
+        parts.push("group");
+    }
+    if plan.preserve_executability {
+        parts.push("executability");
+    }
+    if plan.preserve_acls {
+        parts.push("acls");
+    }
+    if plan.preserve_xattrs {
+        parts.push("xattrs");
+    }
+    if plan.fake_super {
+        parts.push("fake-super");
+    }
+    if plan.omit_link_times {
+        parts.push("omit-link-times");
+    }
+    if plan.numeric_ids {
+        parts.push("numeric-ids");
+    }
+    if plan.chmod.is_some() {
+        parts.push("chmod");
+    }
+
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
 fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
-    let unsupported = [
-        (cli.numeric_ids, "--numeric-ids", MetadataFeature::Owner),
-        (cli.chmod.is_some(), "--chmod", MetadataFeature::Permissions),
-    ];
-    for (enabled, flag, feature) in unsupported {
-        if enabled {
-            report.warn(
-                "W_UNSUPPORTED_OPTION",
-                format!("{flag} is parsed and reported but not applied by the portable executor"),
-            );
-            report.warn(
-                metadata_code(feature, Severity::Warning),
-                format!("{} metadata would be degraded", feature.label()),
-            );
-        }
+    if cli.numeric_ids {
+        report.warn(
+            "W_UNSUPPORTED_OPTION",
+            "--numeric-ids is parsed as an owner/group id mapping modifier; it has no local effect unless owner/group preservation is requested",
+        );
+    }
+    if cli.chmod.is_some() {
+        report.warn(
+            "W_UNSUPPORTED_OPTION",
+            "--chmod is parsed and reported but not applied by the portable executor",
+        );
+        report.warn(
+            metadata_code(MetadataFeature::Permissions, Severity::Warning),
+            "permissions metadata would be degraded",
+        );
     }
 
     for (enabled, flag) in [
@@ -3577,6 +3928,15 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
         (cli.copy_links, "--copy-links"),
         (cli.safe_links, "--safe-links"),
         (cli.copy_unsafe_links, "--copy-unsafe-links"),
+        (cli.preserve_permissions, "--perms"),
+        (cli.preserve_owner, "--owner"),
+        (cli.preserve_group, "--group"),
+        (cli.executability, "--executability"),
+        (cli.acls, "--acls"),
+        (cli.xattrs, "--xattrs"),
+        (cli.fake_super, "--fake-super"),
+        (cli.omit_link_times, "--omit-link-times"),
+        (cli.vss, "--vss"),
         (cli.no_owner, "--no-o"),
         (cli.no_group, "--no-g"),
     ] {
@@ -3646,6 +4006,17 @@ fn ensure_remote_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
     }
     if cli.metadata_policy != CliMetadataPolicy::Portable {
         bail!("remote-shell MVP currently supports only --metadata-policy=portable");
+    }
+    if cli.preserve_owner
+        || cli.preserve_group
+        || cli.acls
+        || cli.xattrs
+        || cli.fake_super
+        || cli.vss
+    {
+        bail!(
+            "remote-shell execution does not yet support owner/group, ACL, xattr, fake-super, or VSS metadata options; run with --plan for diagnostics"
+        );
     }
 
     Ok(())
@@ -3983,6 +4354,7 @@ fn symlink_mode_label(mode: SymlinkMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsync_protocol::RSYNC_REGULAR_FILE_MODE;
     use std::fs;
     use std::io::{Read, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4038,7 +4410,9 @@ mod tests {
         assert!(output.contains("[warning] W_METADATA_OWNER"));
         assert!(output.contains("[warning] W_METADATA_GROUP"));
         assert!(output.contains("[warning] W_METADATA_DEVICE"));
-        assert!(output.contains("remote --server argv: rsync --server --delete -ntre.LsfxCIvu"));
+        assert!(
+            output.contains("remote --server argv: rsync --server --delete --perms -ntre.LsfxCIvu")
+        );
         assert!(output.contains("[info] I_REMOTE_PROTOCOL31_MVP"));
         assert!(output.contains("wire protocol: experimental protocol 31"));
     }
@@ -4729,6 +5103,69 @@ mod tests {
     }
 
     #[test]
+    fn posix_metadata_options_render_plan_and_fail_on_loss() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--metadata-policy",
+            "posix",
+            "--perms",
+            "--owner",
+            "--group",
+            "--executability",
+            "--acls",
+            "--xattrs",
+            "--fake-super",
+            "--fail-on-metadata-loss",
+            "src",
+            "dest",
+        ]);
+
+        assert!(output.contains("metadata policy: posix"));
+        assert!(output
+            .contains("posix metadata: perms,owner,group,executability,acls,xattrs,fake-super"));
+        assert!(output.contains("[error] E_METADATA_OWNER"));
+        assert!(output.contains("[error] E_METADATA_GROUP"));
+        assert!(output.contains("[error] E_METADATA_PERMISSIONS"));
+        assert!(output.contains("fake-super metadata degraded"));
+        assert!(output.contains("acl metadata stored"));
+    }
+
+    #[test]
+    fn numeric_ids_alone_is_reported_without_metadata_loss_error() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--numeric-ids",
+            "--fail-on-metadata-loss",
+            "src",
+            "dest",
+        ]);
+
+        assert!(output.contains("posix metadata: numeric-ids"));
+        assert!(output.contains("[warning] W_UNSUPPORTED_OPTION"));
+        assert!(!output.contains("[error] E_METADATA_OWNER"));
+        assert!(!output.contains("[error] E_METADATA_GROUP"));
+    }
+
+    #[test]
+    fn ntfs_native_plan_reports_sidecar_and_vss_rejection() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--metadata-policy",
+            "ntfs-native",
+            "--vss",
+            "--fail-on-metadata-loss",
+            "src",
+            "dest",
+        ]);
+
+        assert!(output.contains("metadata policy: ntfs-native"));
+        assert!(output.contains("ntfs-native metadata: sidecar-capture prototype, vss=true"));
+        assert!(output.contains("security-descriptor metadata degraded"));
+        assert!(output.contains("alternate-data-stream metadata degraded"));
+        assert!(output.contains("[error] E_METADATA_LOSS: vss-snapshot metadata rejected"));
+    }
+
+    #[test]
     fn parses_filters_without_executing_transfer() {
         let output = parse_and_render([
             "rsync-win",
@@ -4806,6 +5243,80 @@ mod tests {
         assert!(output.contains("sources: 2"));
         assert!(output.contains("changes:"));
         assert!(output.contains("file writes"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_ntfs_native_sync_writes_sidecar_manifests_when_explicit() {
+        let root = unique_temp_dir("rsync-cli-ntfs-sidecar");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--metadata-policy".to_string(),
+            "ntfs-native".to_string(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let sidecar_root = dest.join(".rsync-win.ntfs-native");
+        let sidecar_file = fs::read_dir(&sidecar_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("source__file.txt--") && name.ends_with(".ntfs.meta")
+                    })
+            })
+            .expect("expected source file sidecar");
+
+        assert!(output.contains("ntfs sidecars: planned"));
+        assert!(sidecar_file.exists());
+        assert!(fs::read_to_string(sidecar_file)
+            .unwrap()
+            .contains("rsync-win ntfs-native sidecar v1"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_ntfs_native_sidecar_names_do_not_flatten_to_collisions() {
+        let root = unique_temp_dir("rsync-cli-ntfs-sidecar-collision");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        fs::create_dir_all(source.join("a")).unwrap();
+        fs::write(source.join("a/b.txt"), b"nested").unwrap();
+        fs::write(source.join("a__b.txt"), b"flat").unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--metadata-policy".to_string(),
+            "ntfs-native".to_string(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let sidecar_root = dest.join(".rsync-win.ntfs-native");
+        let sidecar_names: BTreeSet<_> = fs::read_dir(sidecar_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(output.contains("ntfs sidecars: planned 4, written 4"));
+        assert_eq!(sidecar_names.len(), 4);
+        assert!(sidecar_names.iter().any(|name| {
+            name.starts_with("source__a__b.txt--") && name.ends_with(".ntfs.meta")
+        }));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -4942,6 +5453,40 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, FsError::DestinationPathPreflight(_)));
+    }
+
+    #[test]
+    fn remote_sender_executability_sets_execute_bits_for_windows_scripts() {
+        let root = unique_temp_dir("rsync-cli-executability-mode");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("run.cmd"), b"echo hi").unwrap();
+        fs::write(source.join("notes.txt"), b"notes").unwrap();
+
+        let entries = collect_local_source_entries(
+            &[source.clone()],
+            true,
+            &RuleSet::empty(),
+            None,
+            SymlinkMode::Preserve,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let script = entries
+            .iter()
+            .find(|entry| entry.wire.path == PathBuf::from("run.cmd"))
+            .unwrap();
+        let notes = entries
+            .iter()
+            .find(|entry| entry.wire.path == PathBuf::from("notes.txt"))
+            .unwrap();
+
+        assert_eq!(script.wire.mode & 0o111, 0o111);
+        assert_eq!(notes.wire.mode & 0o111, 0);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {

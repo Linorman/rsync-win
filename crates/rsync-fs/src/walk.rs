@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use filetime::FileTime;
 use thiserror::Error;
 
-use crate::metadata::{FileType, PortableMetadata};
+use crate::metadata::{default_permissions, FileType, PortableMetadata};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileWriteMode {
@@ -712,13 +712,36 @@ fn portable_metadata_from_std(
         FileType::Other
     };
 
+    let mode = platform_mode(&metadata, file_type);
+
     PortableMetadata {
         file_type,
         len: metadata.len(),
         modified: metadata.modified().ok(),
-        mode: None,
+        mode: Some(mode),
         symlink_target,
     }
+}
+
+#[cfg(unix)]
+fn platform_mode(metadata: &fs::Metadata, _file_type: FileType) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(windows)]
+fn platform_mode(metadata: &fs::Metadata, file_type: FileType) -> u32 {
+    let mut permissions = default_permissions(file_type);
+    if metadata.permissions().readonly() && file_type == FileType::File {
+        permissions &= !0o222;
+    }
+    permissions
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_mode(_metadata: &fs::Metadata, file_type: FileType) -> u32 {
+    default_permissions(file_type)
 }
 
 #[cfg(windows)]
