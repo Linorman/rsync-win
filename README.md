@@ -3,7 +3,7 @@
 [![CI](https://github.com/Linorman/rsync-win/actions/workflows/ci.yml/badge.svg)](https://github.com/Linorman/rsync-win/actions/workflows/ci.yml)
 [![Release](https://github.com/Linorman/rsync-win/actions/workflows/release.yml/badge.svg)](https://github.com/Linorman/rsync-win/actions/workflows/release.yml)
 
-`rsync-win` is a native Windows rsync-compatible command line application written in Rust. It aims to provide useful rsync-style local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
+`rsync-win` is a native Windows rsync-style command line application written in Rust. It aims to provide useful local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
 
 This is an early development release. Version `v0.1.5` maps to Cargo package version `0.1.5` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, POSIX metadata request reporting, and an NTFS-native sidecar prototype.
 
@@ -11,24 +11,26 @@ This is an early development release. Version `v0.1.5` maps to Cargo package ver
 
 | Area | v0.1.5 status |
 | --- | --- |
-| Local Windows sync | Supported for ordinary files and directories, including multiple source operands. |
-| Recursion and mtimes | `-r`, `-t`, and `-a` planning are supported, with unsupported archive metadata and symlink mtime limitations reported. |
+| Local Windows sync | Implemented for the tested ordinary-file and directory subset, including multiple source operands. |
+| Recursion and mtimes | `-r`, `-t`, and `-a` planning are available for ordinary-file workflows, with unsupported archive metadata and symlink mtime limitations reported. |
 | Deletion and dry-run | `--delete`, `--dry-run`, `--plan`, itemized changes, and structured stats are available. |
 | Filters | `--include`, `--exclude`, `--filter`, `--files-from`, and `--from0` are available. |
-| Update modes | Quick-check, `--checksum`, `--size-only`, `--ignore-times`, `--partial`, `--partial-dir`, `--inplace`, and `--append-verify` are represented. |
+| Update modes | Quick-check, `--checksum`, `--size-only`, `--ignore-times`, `--partial`, `--partial-dir`, `--inplace`, and `--append-verify` are represented in the current local/remote ordinary-file paths. |
 | Large files | Local copies and remote whole-file token IO stream through bounded buffers instead of staging whole files in memory. |
-| Remote shell | Experimental ordinary-file push/pull over SSH with protocol 31 work, protocol 27 compatibility fallback, rsync-style `-e`, multiple local-source push, multiple remote-source pull from one host, `--perms`, and sender-side `--executability` mode mapping. |
+| Remote shell | Experimental ordinary-file push/pull over SSH with a protocol 31 path, protocol 27 fallback tests, rsync-style `-e`, multiple local-source push, multiple remote-source pull from one host, `--perms`, and sender-side `--executability` mode mapping. |
 | Logging | Default output is a concise summary with file counts, byte counts, and change totals; `-v` prints per-file transfer progress and `-vv` expands detailed actions. |
 | POSIX metadata | `--metadata-policy=portable\|posix\|ntfs-native`, `-p/-o/-g`, `--executability`, `--acls`, `--xattrs`, `--fake-super`, and `--omit-link-times` are parsed and reported. Unsupported pieces are degraded/rejected explicitly. |
-| Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request reporting are represented through an NTFS sidecar prototype. |
+| Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request reporting are captured or reported through an NTFS sidecar prototype. Restore is not implemented. |
 | Release hardening | Remote pull rejects path escapes and corrupt literal lengths, release packaging is scripted, and a small local-sync benchmark is available. |
 | Daemon mode | Planned, not implemented in v0.1.5. |
 
 See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the current peer, metadata, hardening, and release compatibility matrix.
 
+Known not implemented in this development build: rsync daemon auth, VSS snapshot reads, NTFS metadata restore, ADS payload copy, and memory-bounded incremental recursion.
+
 ## Install
 
-Download the Windows x64 zip from the `v0.1.5` GitHub Release, extract it, and run:
+When a Windows x64 release zip is published, extract it and run:
 
 ```powershell
 .\rsync-win.exe --version

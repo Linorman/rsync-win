@@ -11,15 +11,15 @@ This matrix describes the current development build behavior. It is intentionall
 | macOS stock rsync 2.6.9 | Best-effort, not release-grade | Older protocol and option behavior is not a first-class target yet. |
 | openrsync | Best-effort, not release-grade | Option and wire behavior may diverge from upstream rsync; test before use. |
 | rsync daemon `host::module` / `rsync://` | Not implemented | Daemon operands are detected and reported instead of routed through remote-shell mode. |
-| Local Windows-to-Windows portable sync | Supported for ordinary files/directories | Supports recursion, mtimes, deletion, filters, multiple sources, update modes, partial/in-place/append planning and execution paths. |
+| Local Windows-to-Windows portable sync | Implemented for tested ordinary files/directories | Covers recursion, mtimes, deletion, filters, multiple sources, and update modes in the current portable test suite. |
 
 ## Metadata Modes
 
 | Mode | Current status | Notes |
 | --- | --- | --- |
-| `portable` | Default | Preserves ordinary files/directories, size, mtime where requested, and explicit delete/filter behavior. |
-| `posix` | Reporting prototype | POSIX permissions/executability requests are represented; owner, group, ACL, xattr, fake-super, and symlink mtime limitations are reported as applied/degraded/rejected. |
-| `ntfs-native` | Sidecar prototype | Captures security descriptor summary, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Restore and stream payload copying are not release-grade. |
+| `portable` | Default | Copies ordinary files/directories, compares size, applies mtime where requested, and applies explicit delete/filter behavior in tested paths. |
+| `posix` | Reporting prototype | POSIX permissions/executability requests are represented; owner, group, ACL, xattr, fake-super, and symlink mtime limitations are reported. POSIX ACL/xattr/fake-super storage is not implemented unless a future sidecar says so explicitly. |
+| `ntfs-native` | Capture-only sidecar prototype | Captures security descriptor summary, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Restore and stream payload copying are not implemented. |
 | VSS snapshot mode | Rejected with diagnostics | `--vss` is parsed and reported, but snapshot reads are not implemented. |
 
 ## Hardening Status
@@ -35,6 +35,14 @@ This matrix describes the current development build behavior. It is intentionall
 | Compression | `-z/--compress` is accepted for CLI compatibility but compression is not applied yet. |
 | Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow. |
 | Benchmarks | `cargo bench -p rsync-fs --bench local_sync` runs a small local recursive sync benchmark. |
+
+## Known Not Implemented
+
+- Daemon auth and daemon transfers are not implemented.
+- VSS snapshot reads are not implemented.
+- NTFS metadata restore is not implemented.
+- Alternate data stream payload copying is not implemented.
+- Full memory-bounded incremental recursion is not implemented.
 
 ## Recommended Smoke Tests
 
