@@ -88,6 +88,8 @@ pub enum FileListError {
     InvalidFileType(u8),
     #[error("file path is not valid UTF-8")]
     InvalidUtf8,
+    #[error("wire file path `{0}` contains a backslash; this transfer subset requires slash-separated rsync paths")]
+    BackslashInPath(String),
     #[error("file length {0} cannot be represented on the wire")]
     LengthTooLarge(u64),
     #[error("file path length {0} cannot be represented in protocol 27")]
@@ -144,7 +146,7 @@ pub fn read_internal_file_list<R: Read>(
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let path_bytes = read_bytes_with_u32_len(reader, max_path_len)?;
-        let path = String::from_utf8(path_bytes).map_err(|_| FileListError::InvalidUtf8)?;
+        let path = wire_path_from_bytes(&path_bytes)?;
         let file_type = WireFileType::from_byte(read_u8(reader)?)?;
         let len = read_i64_le(reader)?;
         if len < 0 {
@@ -155,7 +157,7 @@ pub fn read_internal_file_list<R: Read>(
         }
         let mtime = read_i64_le(reader)?;
         entries.push(FileListEntry {
-            path: PathBuf::from(path),
+            path,
             file_type,
             len: len as u64,
             mtime_unix: (mtime >= 0).then_some(mtime),
@@ -335,7 +337,7 @@ pub fn read_rsync27_file_list_with_options<R: Read>(
             read_i32_le(reader)? as u32
         };
 
-        let path = String::from_utf8(path_bytes.clone()).map_err(|_| FileListError::InvalidUtf8)?;
+        let path = wire_path_from_bytes(&path_bytes)?;
         let file_type = file_type_from_mode(mode)?;
         let checksum = if expect_checksums && file_type == WireFileType::File {
             Some(read_checksum(reader)?)
@@ -343,7 +345,7 @@ pub fn read_rsync27_file_list_with_options<R: Read>(
             None
         };
         entries.push(RsyncFileListEntry {
-            path: PathBuf::from(path),
+            path,
             file_type,
             len,
             mtime_unix: mtime,
@@ -561,7 +563,7 @@ pub fn read_rsync31_file_list_with_options<R: Read>(
                 read_ignored_name(reader)?;
             }
         }
-        let path = String::from_utf8(path_bytes.clone()).map_err(|_| FileListError::InvalidUtf8)?;
+        let path = wire_path_from_bytes(&path_bytes)?;
         let file_type = file_type_from_mode(mode)?;
         let checksum = if expect_checksums && file_type == WireFileType::File {
             Some(read_checksum(reader)?)
@@ -569,7 +571,7 @@ pub fn read_rsync31_file_list_with_options<R: Read>(
             None
         };
         entries.push(RsyncFileListEntry {
-            path: PathBuf::from(path),
+            path,
             file_type,
             len,
             mtime_unix: mtime,
@@ -618,6 +620,14 @@ pub fn read_rsync_long<R: Read>(reader: &mut R) -> Result<u64, FileListError> {
 
 fn wire_path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().replace('\\', "/").into_bytes()
+}
+
+fn wire_path_from_bytes(path_bytes: &[u8]) -> Result<PathBuf, FileListError> {
+    let path = std::str::from_utf8(path_bytes).map_err(|_| FileListError::InvalidUtf8)?;
+    if path.contains('\\') {
+        return Err(FileListError::BackslashInPath(path.to_owned()));
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
@@ -686,6 +696,62 @@ mod tests {
         write_u32_le(&mut bytes, 2).unwrap();
         let err = read_file_list(&mut bytes.as_slice(), 1, 128).unwrap_err();
         assert!(matches!(err, FileListError::Io(_)));
+    }
+
+    #[test]
+    fn internal_reader_rejects_backslash_paths_before_pathbuf_conversion() {
+        let mut bytes = Vec::new();
+        write_u32_le(&mut bytes, 1).unwrap();
+        write_bytes_with_u32_len(&mut bytes, b"a\\b").unwrap();
+        write_u8(&mut bytes, WireFileType::File as u8).unwrap();
+        write_i64_le(&mut bytes, 1).unwrap();
+        write_i64_le(&mut bytes, 1_700_000_000).unwrap();
+
+        let err = read_internal_file_list(&mut bytes.as_slice(), 16, 256).unwrap_err();
+
+        assert!(matches!(
+            err,
+            FileListError::BackslashInPath(path) if path == "a\\b"
+        ));
+    }
+
+    #[test]
+    fn protocol27_reader_rejects_backslash_paths_before_pathbuf_conversion() {
+        let mut bytes = Vec::new();
+        write_u8(&mut bytes, XMIT_LONG_NAME).unwrap();
+        write_i32_le(&mut bytes, 3).unwrap();
+        bytes.extend_from_slice(b"a\\b");
+        write_i32_le(&mut bytes, 1).unwrap();
+        write_i32_le(&mut bytes, 1_700_000_000).unwrap();
+        write_i32_le(&mut bytes, RSYNC_REGULAR_FILE_MODE as i32).unwrap();
+        write_u8(&mut bytes, 0).unwrap();
+
+        let err = read_rsync27_file_list(&mut bytes.as_slice(), 16, 256).unwrap_err();
+
+        assert!(matches!(
+            err,
+            FileListError::BackslashInPath(path) if path == "a\\b"
+        ));
+    }
+
+    #[test]
+    fn protocol31_reader_rejects_backslash_paths_before_pathbuf_conversion() {
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, XMIT31_SAME_UID | XMIT31_SAME_GID).unwrap();
+        write_u8(&mut bytes, 3).unwrap();
+        bytes.extend_from_slice(b"a\\b");
+        write_varlong(&mut bytes, 1, 3).unwrap();
+        write_varlong(&mut bytes, 1_700_000_000, 4).unwrap();
+        write_i32_le(&mut bytes, RSYNC_REGULAR_FILE_MODE as i32).unwrap();
+        write_varint(&mut bytes, 0).unwrap();
+        write_varint(&mut bytes, 0).unwrap();
+
+        let err = read_rsync31_file_list(&mut bytes.as_slice(), 16, 256).unwrap_err();
+
+        assert!(matches!(
+            err,
+            FileListError::BackslashInPath(path) if path == "a\\b"
+        ));
     }
 
     #[test]

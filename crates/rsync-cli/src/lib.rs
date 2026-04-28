@@ -250,9 +250,10 @@ pub fn supported_protocol_range() -> String {
 
 pub fn version_output() -> String {
     format!(
-        "rsync-win {}\nprotocol primitives range: {}\ntransfer execution: local portable sync supported; remote-shell MVP uses protocol {} compatibility mode\n",
+        "rsync-win {}\nprotocol primitives range: {}\ntransfer execution: local portable sync supported; remote-shell MVP tries protocol {} first with protocol {} compatibility fallback\n",
         env!("CARGO_PKG_VERSION"),
         supported_protocol_range(),
+        REMOTE_SHELL_MODERN_PROTOCOL,
         REMOTE_SHELL_MVP_PROTOCOL
     )
 }
@@ -4422,6 +4423,9 @@ mod tests {
 
         assert!(output.contains(&format!("rsync-win {}", env!("CARGO_PKG_VERSION"))));
         assert!(output.contains("protocol primitives range: 20-32"));
+        assert!(output.contains(
+            "remote-shell MVP tries protocol 31 first with protocol 27 compatibility fallback"
+        ));
     }
 
     #[test]
@@ -5079,6 +5083,51 @@ mod tests {
         assert!(!root.join("escape.txt").exists());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_pull_rejects_absolute_or_prefixed_file_list_paths_before_writes() {
+        for (label, wire_path) in [
+            ("drive", "C:/escape.txt"),
+            ("root", "/escape.txt"),
+            ("unc", "//server/share/escape.txt"),
+        ] {
+            let root = unique_temp_dir(&format!("rsync-cli-remote-pull-{label}-path"));
+            let dest = root.join("dest");
+            fs::create_dir_all(&root).unwrap();
+
+            let cli = Cli::parse_from(vec![
+                "rsync-win".to_string(),
+                "host:/tmp/source".to_string(),
+                dest.to_string_lossy().into_owned(),
+            ]);
+            let plan = TransferPlan::from_cli(&cli);
+            let mut transport = TestTransport::with_input(remote_pull_file_list_only_input(&[
+                test_remote_entry(".", WireFileType::Directory),
+                RsyncFileListEntry {
+                    path: PathBuf::from(wire_path),
+                    file_type: WireFileType::File,
+                    len: 3,
+                    mtime_unix: 0,
+                    mode: RSYNC_REGULAR_FILE_MODE,
+                    checksum: None,
+                },
+            ]));
+
+            let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+            assert!(
+                err.to_string().contains("destination path preflight failed"),
+                "{wire_path}: {err:#}"
+            );
+            assert!(!dest.exists(), "{wire_path}: destination directory was created");
+            assert!(
+                fs::read_dir(&root).unwrap().next().is_none(),
+                "{wire_path}: rejected path left files under test root"
+            );
+
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
