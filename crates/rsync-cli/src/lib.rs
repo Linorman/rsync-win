@@ -5032,6 +5032,88 @@ mod tests {
     }
 
     #[test]
+    fn remote_push_protocol31_rejects_append_basis_larger_than_sender() {
+        let root = unique_temp_dir("rsync-cli-remote-push-append-oversize");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"abcdef").unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--append-verify".to_string(),
+            source.to_string_lossy().into_owned(),
+            "host:/tmp/dest".to_string(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport =
+            TestTransport::with_input(remote_push_append_verify_oversized_basis_input());
+
+        let err = execute_remote_push(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("remote append basis is larger than sender file"),
+            "{err:#}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_push_protocol31_rejects_unsupported_mux_during_transfer() {
+        let root = unique_temp_dir("rsync-cli-remote-push-bad-mux-transfer");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            source.to_string_lossy().into_owned(),
+            "host:/tmp/dest".to_string(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_push_unsupported_mux_input());
+
+        let err = execute_remote_push(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(
+            err.to_string().contains("unsupported multiplex message"),
+            "{err:#}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_push_protocol31_rejects_unsupported_mux_during_final_goodbye() {
+        let root = unique_temp_dir("rsync-cli-remote-push-bad-mux-final");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--dry-run".to_string(),
+            source.to_string_lossy().into_owned(),
+            "host:/tmp/dest".to_string(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_push_final_unsupported_mux_input());
+
+        let err = execute_remote_push(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(
+            err.to_string().contains("unsupported multiplex message"),
+            "{err:#}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn remote_push_protocol31_filters_local_sender_entries() {
         let root = unique_temp_dir("rsync-cli-remote-push-filter");
         let source = root.join("source");
@@ -5219,6 +5301,34 @@ mod tests {
         let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
 
         assert!(err.to_string().contains("below advertised length 6"));
+        assert!(!dest.join("file.txt").exists());
+        assert!(fs::read_dir(&dest).unwrap().next().is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_pull_rejects_checksum_mismatch_without_final_file() {
+        let root = unique_temp_dir("rsync-cli-remote-pull-checksum");
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "host:/tmp/source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_transfer_input_with_checksum(
+            "file.txt",
+            3,
+            &[b"abc".as_slice()],
+            [0_u8; 16],
+        ));
+
+        let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(err.to_string().contains("checksum mismatch"), "{err:#}");
         assert!(!dest.join("file.txt").exists());
         assert!(fs::read_dir(&dest).unwrap().next().is_none());
 
@@ -5783,6 +5893,24 @@ mod tests {
     }
 
     fn remote_push_append_verify_input() -> Vec<u8> {
+        remote_push_append_verify_input_with_sum_head(RemoteSumHead {
+            block_count: 1,
+            block_len: 3,
+            checksum_len: 2,
+            remainder: 0,
+        })
+    }
+
+    fn remote_push_append_verify_oversized_basis_input() -> Vec<u8> {
+        remote_push_append_verify_input_with_sum_head(RemoteSumHead {
+            block_count: 3,
+            block_len: 3,
+            checksum_len: 2,
+            remainder: 0,
+        })
+    }
+
+    fn remote_push_append_verify_input_with_sum_head(sum_head: RemoteSumHead) -> Vec<u8> {
         let mut input = remote_handshake_input();
         let mut request = Vec::new();
         let mut state = RsyncIndexState::default();
@@ -5793,22 +5921,36 @@ mod tests {
         )
         .unwrap();
         request.push(0);
-        write_sum_head(
-            &mut request,
-            RemoteSumHead {
-                block_count: 1,
-                block_len: 3,
-                checksum_len: 2,
-                remainder: 0,
-            },
-        )
-        .unwrap();
+        write_sum_head(&mut request, sum_head).unwrap();
         append_mux_payload(&mut input, &request);
         append_mux_payload(&mut input, &[0]);
         append_mux_payload(&mut input, &[0]);
         append_mux_payload(&mut input, &[0]);
         append_mux_payload(&mut input, &[0]);
         append_mux_payload(&mut input, &[0]);
+        input
+    }
+
+    fn remote_push_unsupported_mux_input() -> Vec<u8> {
+        let mut input = remote_handshake_input();
+        append_mux_frame(&mut input, 6, &[]);
+        input
+    }
+
+    fn remote_push_final_unsupported_mux_input() -> Vec<u8> {
+        let mut input = remote_handshake_input();
+        append_mux_payload(
+            &mut input,
+            &[
+                1,
+                (RSYNC_ITEM_IS_NEW | RSYNC_ITEM_LOCAL_CHANGE) as u8,
+                ((RSYNC_ITEM_IS_NEW | RSYNC_ITEM_LOCAL_CHANGE) >> 8) as u8,
+            ],
+        );
+        append_mux_payload(&mut input, &[0]);
+        append_mux_payload(&mut input, &[0]);
+        append_mux_payload(&mut input, &[0]);
+        append_mux_frame(&mut input, 6, &[]);
         input
     }
 
@@ -5849,6 +5991,24 @@ mod tests {
         advertised_len: u64,
         literal_chunks: &[&[u8]],
     ) -> Vec<u8> {
+        let mut checksum = RsyncMd4Checksum::plain();
+        for chunk in literal_chunks {
+            checksum.update(chunk);
+        }
+        remote_pull_transfer_input_with_checksum(
+            path,
+            advertised_len,
+            literal_chunks,
+            checksum.finalize(),
+        )
+    }
+
+    fn remote_pull_transfer_input_with_checksum(
+        path: &str,
+        advertised_len: u64,
+        literal_chunks: &[&[u8]],
+        remote_checksum: [u8; 16],
+    ) -> Vec<u8> {
         let mut input = remote_pull_file_list_only_input(&[
             RsyncFileListEntry {
                 path: PathBuf::from("."),
@@ -5883,14 +6043,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut checksum = RsyncMd4Checksum::plain();
         for chunk in literal_chunks {
-            checksum.update(chunk);
             write_i32_le(&mut response, chunk.len() as i32).unwrap();
             response.extend_from_slice(chunk);
         }
         write_i32_le(&mut response, 0).unwrap();
-        response.extend_from_slice(&checksum.finalize());
+        response.extend_from_slice(&remote_checksum);
         write_rsync_index(&mut response, &mut index_state, RSYNC_INDEX_DONE).unwrap();
         append_mux_payload(&mut input, &response);
 
@@ -5967,7 +6125,11 @@ mod tests {
     }
 
     fn append_mux_payload(out: &mut Vec<u8>, payload: &[u8]) {
-        let header = (7_u32 << 24) | payload.len() as u32;
+        append_mux_frame(out, 7, payload);
+    }
+
+    fn append_mux_frame(out: &mut Vec<u8>, tag: u32, payload: &[u8]) {
+        let header = (tag << 24) | payload.len() as u32;
         out.extend_from_slice(&header.to_le_bytes());
         out.extend_from_slice(payload);
     }
