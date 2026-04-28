@@ -5599,7 +5599,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_pull_rejects_file_list_parent_escape_before_writes() {
+    fn remote_pull_rejects_security_file_list_parent_escape_before_writes() {
         let root = unique_temp_dir("rsync-cli-remote-pull-escape");
         let dest = root.join("dest");
         fs::create_dir_all(&root).unwrap();
@@ -5632,7 +5632,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_pull_rejects_absolute_or_prefixed_file_list_paths_before_writes() {
+    fn remote_pull_rejects_security_absolute_or_prefixed_file_list_paths_before_writes() {
         for (label, wire_path) in [
             ("drive", "C:/escape.txt"),
             ("root", "/escape.txt"),
@@ -5681,7 +5681,78 @@ mod tests {
     }
 
     #[test]
-    fn remote_pull_rejects_oversized_literal_stream_without_final_file() {
+    fn remote_pull_rejects_security_reserved_trailing_and_unicode_paths_before_writes() {
+        for (label, wire_path, expected) in [
+            ("reserved", "CON.txt", "reserved Windows device name"),
+            ("trailing-dot", "dir/bad.", "ends with a space or dot"),
+            ("trailing-space", "dir/bad ", "ends with a space or dot"),
+        ] {
+            let root = unique_temp_dir(&format!("rsync-cli-remote-pull-{label}"));
+            let dest = root.join("dest");
+            fs::create_dir_all(&root).unwrap();
+
+            let cli = Cli::parse_from(vec![
+                "rsync-win".to_string(),
+                "host:/tmp/source".to_string(),
+                dest.to_string_lossy().into_owned(),
+            ]);
+            let plan = TransferPlan::from_cli(&cli);
+            let mut transport = TestTransport::with_input(remote_pull_file_list_only_input(&[
+                test_remote_entry(".", WireFileType::Directory),
+                RsyncFileListEntry {
+                    path: PathBuf::from(wire_path),
+                    file_type: WireFileType::File,
+                    len: 3,
+                    mtime_unix: 0,
+                    mode: RSYNC_REGULAR_FILE_MODE,
+                    checksum: None,
+                },
+            ]));
+
+            let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+            assert!(err.to_string().contains(expected), "{wire_path}: {err:#}");
+            assert!(
+                !dest.exists(),
+                "{wire_path}: destination directory was created"
+            );
+            assert!(
+                fs::read_dir(&root).unwrap().next().is_none(),
+                "{wire_path}: rejected path left files under test root"
+            );
+
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        let root = unique_temp_dir("rsync-cli-remote-pull-unicode-collision");
+        let dest = root.join("dest");
+        fs::create_dir_all(&root).unwrap();
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "host:/tmp/source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_file_list_only_input(&[
+            test_remote_entry(".", WireFileType::Directory),
+            test_remote_entry("caf\u{00e9}.txt", WireFileType::File),
+            test_remote_entry("cafe\u{301}.txt", WireFileType::File),
+        ]));
+
+        let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(
+            err.to_string().contains("case/normalization collision"),
+            "{err:#}"
+        );
+        assert!(!dest.exists());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_pull_rejects_security_oversized_literal_stream_without_final_file() {
         let root = unique_temp_dir("rsync-cli-remote-pull-oversize");
         let dest = root.join("dest");
         fs::create_dir_all(&dest).unwrap();
@@ -5708,7 +5779,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_pull_rejects_short_literal_stream_without_final_file() {
+    fn remote_pull_rejects_security_short_literal_stream_without_final_file() {
         let root = unique_temp_dir("rsync-cli-remote-pull-short");
         let dest = root.join("dest");
         fs::create_dir_all(&dest).unwrap();
@@ -5735,7 +5806,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_pull_rejects_checksum_mismatch_without_final_file() {
+    fn remote_pull_rejects_security_checksum_mismatch_without_final_file() {
         let root = unique_temp_dir("rsync-cli-remote-pull-checksum");
         let dest = root.join("dest");
         fs::create_dir_all(&dest).unwrap();

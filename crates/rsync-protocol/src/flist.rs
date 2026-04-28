@@ -691,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_excessive_file_count() {
+    fn security_internal_reader_rejects_excessive_file_count() {
         let mut bytes = Vec::new();
         write_u32_le(&mut bytes, 2).unwrap();
         let err = read_file_list(&mut bytes.as_slice(), 1, 128).unwrap_err();
@@ -699,7 +699,40 @@ mod tests {
     }
 
     #[test]
-    fn internal_reader_rejects_backslash_paths_before_pathbuf_conversion() {
+    fn security_internal_reader_rejects_excessive_path_length() {
+        let mut bytes = Vec::new();
+        write_u32_le(&mut bytes, 1).unwrap();
+        write_bytes_with_u32_len(&mut bytes, b"abcde").unwrap();
+
+        let err = read_internal_file_list(&mut bytes.as_slice(), 16, 4).unwrap_err();
+
+        assert!(matches!(err, FileListError::Io(_)));
+    }
+
+    #[test]
+    fn security_rsync31_reader_rejects_excessive_file_count() {
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, XMIT31_SAME_UID | XMIT31_SAME_GID).unwrap();
+
+        let err = read_rsync31_file_list(&mut bytes.as_slice(), 0, 256).unwrap_err();
+
+        assert!(matches!(err, FileListError::Io(_)));
+    }
+
+    #[test]
+    fn security_rsync31_reader_rejects_excessive_path_length() {
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, XMIT31_SAME_UID | XMIT31_SAME_GID).unwrap();
+        write_u8(&mut bytes, 5).unwrap();
+        bytes.extend_from_slice(b"abcde");
+
+        let err = read_rsync31_file_list(&mut bytes.as_slice(), 16, 4).unwrap_err();
+
+        assert!(matches!(err, FileListError::Io(_)));
+    }
+
+    #[test]
+    fn security_internal_reader_rejects_backslash_paths_before_pathbuf_conversion() {
         let mut bytes = Vec::new();
         write_u32_le(&mut bytes, 1).unwrap();
         write_bytes_with_u32_len(&mut bytes, b"a\\b").unwrap();
@@ -716,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol27_reader_rejects_backslash_paths_before_pathbuf_conversion() {
+    fn security_protocol27_reader_rejects_backslash_paths_before_pathbuf_conversion() {
         let mut bytes = Vec::new();
         write_u8(&mut bytes, XMIT_LONG_NAME).unwrap();
         write_i32_le(&mut bytes, 3).unwrap();
@@ -735,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol31_reader_rejects_backslash_paths_before_pathbuf_conversion() {
+    fn security_protocol31_reader_rejects_backslash_paths_before_pathbuf_conversion() {
         let mut bytes = Vec::new();
         write_varint(&mut bytes, XMIT31_SAME_UID | XMIT31_SAME_GID).unwrap();
         write_u8(&mut bytes, 3).unwrap();
