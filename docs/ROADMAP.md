@@ -273,6 +273,16 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 - Release packaging scripts.
 - User-facing compatibility matrix.
 
+**Current Implementation Status:**
+
+- Local file copy, append, checksum comparison, prefix comparison, and remote whole-file token IO stream through bounded buffers.
+- Remote pull validates all received file-list paths before filtering or writing, rejects destination escapes and Windows-invalid paths, and rejects literal token streams that exceed or undershoot the advertised file length.
+- Remote file-list readers enforce entry-count and path-length limits; full incremental recursion remains future work.
+- Progress logging, concise summaries, itemized changes, and structured stats are available through existing CLI output.
+- `scripts/package-release.ps1` produces the Windows x64 release zip and SHA-256 checksum used by the GitHub release workflow.
+- `cargo bench -p rsync-fs --bench local_sync` provides a small local recursive sync benchmark.
+- `docs/COMPATIBILITY.md` documents Linux rsync, Homebrew/macOS rsync, macOS stock/openrsync, daemon mode, metadata modes, and hardening status.
+
 **Exit Criteria:**
 
 - Large-tree transfer completes within defined memory limits.

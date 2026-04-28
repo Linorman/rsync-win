@@ -1095,6 +1095,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
         )?
     };
     sort_remote_entries_for_sender_indexes(&mut entries);
+    validate_remote_file_list_paths(&entries)?;
     let files_from = load_files_from(cli)?;
     let selected_indexes =
         selected_remote_entry_indexes(&entries, &plan.filter_rules, files_from.as_deref());
@@ -1234,6 +1235,7 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
         .map_err(protocol31_setup_error)?
     };
     sort_remote_entries_for_sender_indexes(&mut entries);
+    validate_remote_file_list_paths(&entries)?;
     let files_from = load_files_from(cli)?;
     let selected_indexes =
         selected_remote_entry_indexes(&entries, &plan.filter_rules, files_from.as_deref());
@@ -2492,6 +2494,7 @@ fn receive_remote_sender_files<T: Read>(
             RemoteFileChecksum::SeededMd4(ctx.checksum_seed),
             &entry.path,
             &temp_path,
+            entry.len,
             Some(&mut file_progress),
         ) {
             Ok(bytes) => {
@@ -2570,6 +2573,7 @@ fn receive_remote_sender_files_protocol31<T: Read>(
             RemoteFileChecksum::PlainMd4,
             &entry.path,
             &temp_path,
+            entry.len,
             Some(&mut file_progress),
         ) {
             Ok(bytes) => {
@@ -3212,6 +3216,7 @@ fn read_file_tokens_to_path<T: Read>(
     checksum: RemoteFileChecksum,
     path: &Path,
     output_path: &Path,
+    expected_len: u64,
     mut progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     if let Some(parent) = output_path.parent() {
@@ -3224,6 +3229,24 @@ fn read_file_tokens_to_path<T: Read>(
     loop {
         let token = read_multiplexed_i32(transport, mux)?;
         if token > 0 {
+            let literal_len = token as u64;
+            let next_total =
+                total
+                    .checked_add(literal_len)
+                    .ok_or(RemoteSessionError::FileLengthExceeded {
+                        path: path.display().to_string(),
+                        expected: expected_len,
+                        actual: u64::MAX,
+                    })?;
+            if next_total > expected_len {
+                return Err(RemoteSessionError::FileLengthExceeded {
+                    path: path.display().to_string(),
+                    expected: expected_len,
+                    actual: next_total,
+                }
+                .into());
+            }
+
             let mut remaining = token as usize;
             while remaining > 0 {
                 let len = buf.len().min(remaining);
@@ -3238,6 +3261,14 @@ fn read_file_tokens_to_path<T: Read>(
         } else if token == 0 {
             output.sync_all()?;
             drop(output);
+            if total != expected_len {
+                return Err(RemoteSessionError::FileLengthShort {
+                    path: path.display().to_string(),
+                    expected: expected_len,
+                    actual: total,
+                }
+                .into());
+            }
             let mut remote_checksum = [0_u8; 16];
             read_multiplexed_exact(transport, mux, &mut remote_checksum)?;
             let local_checksum = remote_file_checksum_for_path(checksum, output_path)?;
@@ -3414,6 +3445,16 @@ fn append_remote_messages(output: &mut String, mux: &MultiplexReadState) {
 fn windows_destination_path_preflight(paths: &[PathBuf]) -> Result<(), FsError> {
     rsync_winfs::path::preflight_destination_paths(paths)
         .map_err(|err| FsError::DestinationPathPreflight(err.to_string()))
+}
+
+fn validate_remote_file_list_paths(entries: &[RsyncFileListEntry]) -> Result<()> {
+    let destination_relatives: Vec<_> = entries
+        .iter()
+        .filter(|entry| !remote_entry_is_top_dir(entry))
+        .map(|entry| entry.path.clone())
+        .collect();
+    windows_destination_path_preflight(&destination_relatives)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4556,6 +4597,7 @@ mod tests {
                 RemoteFileChecksum::PlainMd4,
                 Path::new("dest.txt"),
                 &dest,
+                3,
                 None
             )
             .unwrap(),
@@ -5002,6 +5044,93 @@ mod tests {
         assert!(output.contains("write-file"));
         assert!(output.contains("files received: 1"));
         assert!(!dest.join("file.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_pull_rejects_file_list_parent_escape_before_writes() {
+        let root = unique_temp_dir("rsync-cli-remote-pull-escape");
+        let dest = root.join("dest");
+        fs::create_dir_all(&root).unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "host:/tmp/source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_file_list_only_input(&[
+            test_remote_entry(".", WireFileType::Directory),
+            RsyncFileListEntry {
+                path: PathBuf::from("../escape.txt"),
+                file_type: WireFileType::File,
+                len: 3,
+                mtime_unix: 0,
+                mode: RSYNC_REGULAR_FILE_MODE,
+                checksum: None,
+            },
+        ]));
+
+        let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(err.to_string().contains("portable"), "{err:#}");
+        assert!(!dest.exists());
+        assert!(!root.join("escape.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_pull_rejects_oversized_literal_stream_without_final_file() {
+        let root = unique_temp_dir("rsync-cli-remote-pull-oversize");
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "host:/tmp/source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_transfer_input(
+            "file.txt",
+            3,
+            &[b"abcdef".as_slice()],
+        ));
+
+        let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(err.to_string().contains("exceeding advertised length 3"));
+        assert!(!dest.join("file.txt").exists());
+        assert!(fs::read_dir(&dest).unwrap().next().is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_pull_rejects_short_literal_stream_without_final_file() {
+        let root = unique_temp_dir("rsync-cli-remote-pull-short");
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let cli = Cli::parse_from(vec![
+            "rsync-win".to_string(),
+            "host:/tmp/source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_transfer_input(
+            "file.txt",
+            6,
+            &[b"abc".as_slice()],
+        ));
+
+        let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(err.to_string().contains("below advertised length 6"));
+        assert!(!dest.join("file.txt").exists());
+        assert!(fs::read_dir(&dest).unwrap().next().is_none());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5585,6 +5714,73 @@ mod tests {
             ],
             1,
         )
+    }
+
+    fn remote_pull_file_list_only_input(entries: &[RsyncFileListEntry]) -> Vec<u8> {
+        let mut input = remote_handshake_input();
+        let mut flist = Vec::new();
+        write_rsync31_file_list_with_options(&mut flist, entries, false).unwrap();
+        append_mux_payload(&mut input, &flist);
+        input
+    }
+
+    fn remote_pull_transfer_input(
+        path: &str,
+        advertised_len: u64,
+        literal_chunks: &[&[u8]],
+    ) -> Vec<u8> {
+        let mut input = remote_pull_file_list_only_input(&[
+            RsyncFileListEntry {
+                path: PathBuf::from("."),
+                file_type: WireFileType::Directory,
+                len: 0,
+                mtime_unix: 0,
+                mode: RSYNC_DIRECTORY_MODE,
+                checksum: None,
+            },
+            RsyncFileListEntry {
+                path: PathBuf::from(path),
+                file_type: WireFileType::File,
+                len: advertised_len,
+                mtime_unix: 0,
+                mode: RSYNC_REGULAR_FILE_MODE,
+                checksum: None,
+            },
+        ]);
+
+        let mut response = Vec::new();
+        let mut index_state = RsyncIndexState::default();
+        write_rsync_index(&mut response, &mut index_state, 1).unwrap();
+        write_u16_le(&mut response, RSYNC_ITEM_TRANSFER | RSYNC_ITEM_IS_NEW).unwrap();
+        write_sum_head(
+            &mut response,
+            RemoteSumHead {
+                block_count: 0,
+                block_len: 32 * 1024,
+                checksum_len: 2,
+                remainder: 0,
+            },
+        )
+        .unwrap();
+
+        let mut checksum = RsyncMd4Checksum::plain();
+        for chunk in literal_chunks {
+            checksum.update(chunk);
+            write_i32_le(&mut response, chunk.len() as i32).unwrap();
+            response.extend_from_slice(chunk);
+        }
+        write_i32_le(&mut response, 0).unwrap();
+        response.extend_from_slice(&checksum.finalize());
+        write_rsync_index(&mut response, &mut index_state, RSYNC_INDEX_DONE).unwrap();
+        append_mux_payload(&mut input, &response);
+
+        let mut stats = Vec::new();
+        for value in [0_u64, 0, advertised_len, 0, 0] {
+            rsync_protocol::write_varlong(&mut stats, value, 3).unwrap();
+        }
+        append_mux_payload(&mut input, &stats);
+        append_mux_payload(&mut input, &[0]);
+        input
     }
 
     fn remote_pull_filter_dry_run_input() -> Vec<u8> {
