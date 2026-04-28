@@ -43,6 +43,8 @@ const S_IFLNK: u32 = 0o120000;
 pub const RSYNC_REGULAR_FILE_MODE: u32 = S_IFREG | 0o644;
 pub const RSYNC_DIRECTORY_MODE: u32 = S_IFDIR | 0o755;
 pub const RSYNC_SYMLINK_MODE: u32 = S_IFLNK | 0o777;
+pub const DEFAULT_MAX_FILE_LIST_ENTRIES: usize = 100_000;
+pub const DEFAULT_MAX_FILE_LIST_PATH_LEN: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireFileType {

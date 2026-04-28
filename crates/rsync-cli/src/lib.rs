@@ -33,7 +33,8 @@ use rsync_protocol::{
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
     DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter, RemoteSessionError,
     RemoteShellOperand, RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, RsyncMd4Checksum,
-    SessionError, TransferDirection, WireFileType, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+    SessionError, TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
+    DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
     REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
     RSYNC_INDEX_DONE,
 };
@@ -1275,8 +1276,8 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
         let mut reader = MultiplexedReader::new(transport, &mut mux);
         read_rsync27_file_list_with_options(
             &mut reader,
-            100_000,
-            32 * 1024,
+            DEFAULT_MAX_FILE_LIST_ENTRIES,
+            DEFAULT_MAX_FILE_LIST_PATH_LEN,
             plan.update_mode == UpdateMode::Checksum,
         )?
     };
@@ -1414,8 +1415,8 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
         let mut reader = MultiplexedReader::new(transport, &mut mux);
         read_rsync31_file_list_with_options(
             &mut reader,
-            100_000,
-            32 * 1024,
+            DEFAULT_MAX_FILE_LIST_ENTRIES,
+            DEFAULT_MAX_FILE_LIST_PATH_LEN,
             plan.update_mode == UpdateMode::Checksum,
         )
         .map_err(protocol31_setup_error)?

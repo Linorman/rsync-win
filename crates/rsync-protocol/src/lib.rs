@@ -16,7 +16,8 @@ pub use flist::{
     read_rsync31_file_list_with_options, read_rsync_long, write_file_list,
     write_internal_file_list, write_rsync27_file_list, write_rsync27_file_list_with_options,
     write_rsync31_file_list, write_rsync31_file_list_with_options, write_rsync_long, FileListEntry,
-    FileListError, RsyncFileListEntry, WireFileType, RSYNC_DIRECTORY_MODE, RSYNC_REGULAR_FILE_MODE,
+    FileListError, RsyncFileListEntry, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
+    DEFAULT_MAX_FILE_LIST_PATH_LEN, RSYNC_DIRECTORY_MODE, RSYNC_REGULAR_FILE_MODE,
     RSYNC_SYMLINK_MODE,
 };
 pub use io::{

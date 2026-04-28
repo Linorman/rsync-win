@@ -26,16 +26,16 @@ This matrix describes the current development build behavior. It is intentionall
 
 | Area | Current status |
 | --- | --- |
-| Local file data | Local copy, append, checksum comparison, and prefix comparison use bounded streaming IO. |
-| Remote whole-file tokens | Upload and download literal token IO streams through fixed-size buffers and checksums received data before finalizing. |
+| Local file data | Local copy, append, checksum comparison, and prefix comparison use bounded streaming IO. The local filesystem copy path uses a fixed 64 KiB buffer. |
+| Remote whole-file tokens | Upload and download literal token IO streams through fixed 32 KiB buffers and checksums received data before finalizing. |
 | Remote file-list paths | Remote pull validates all received file-list paths before filtering or writing, rejecting parent escapes, absolute paths, reserved Windows names, invalid characters, trailing dots/spaces, and case/normalization collisions. |
 | Remote pull selection | Filters and `--files-from` are applied locally after receiving the remote sender file-list. Remote push routes include/exclude/filter rules to the remote receiver for delete protection; `--files-from` is not routed to the receiver yet. |
 | Remote token lengths | Remote pull rejects literal token streams that exceed or undershoot the advertised file-list length and removes temporary receive files on error. |
-| File-list size | Remote file-list readers enforce entry-count and path-length limits. Full incremental recursion is still future work. |
+| File-list size | Remote file-list readers enforce a 100,000 entry limit and 32 KiB path limit for the current non-incremental receive path. Full incremental recursion is still future work. |
 | Multiplexing | Data frames are streamed; remote error messages are surfaced; unsupported multiplex tags are rejected. |
 | Compression | `-z/--compress` is accepted for CLI compatibility but compression is not applied yet. |
 | Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow. |
-| Benchmarks | `cargo bench -p rsync-fs --bench local_sync` runs a small local recursive sync benchmark. |
+| Benchmarks | `cargo bench -p rsync-fs --bench local_sync` runs local sync scenarios for a 128-file tree, many small files, and one large ordinary file. |
 
 ## Known Not Implemented
 

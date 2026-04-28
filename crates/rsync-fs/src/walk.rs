@@ -10,6 +10,8 @@ use thiserror::Error;
 
 use crate::metadata::{default_permissions, FileType, PortableMetadata};
 
+const LOCAL_COPY_BUFFER_SIZE: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileWriteMode {
     Atomic,
@@ -526,7 +528,7 @@ impl PortableFileSystem for LocalFileSystem {
             .create(true)
             .append(true)
             .open(local_os_path(path))?;
-        let copied = io::copy(&mut input, &mut output)?;
+        let copied = copy_stream_bounded(&mut input, &mut output)?;
         output.sync_all()?;
         Ok(copied)
     }
@@ -609,7 +611,7 @@ impl LocalFileSystem {
 
         let mut input = File::open(local_os_path(source))?;
         let mut output = File::create(local_os_path(dest))?;
-        let copied = io::copy(&mut input, &mut output)?;
+        let copied = copy_stream_bounded(&mut input, &mut output)?;
         output.sync_all()?;
         Ok(copied)
     }
@@ -676,8 +678,8 @@ fn streams_equal_for_len<L: Read, R: Read>(
     right: &mut R,
     mut remaining: u64,
 ) -> io::Result<bool> {
-    let mut left_buf = [0_u8; 64 * 1024];
-    let mut right_buf = [0_u8; 64 * 1024];
+    let mut left_buf = [0_u8; LOCAL_COPY_BUFFER_SIZE];
+    let mut right_buf = [0_u8; LOCAL_COPY_BUFFER_SIZE];
 
     while remaining > 0 {
         let len = if remaining > left_buf.len() as u64 {
@@ -694,6 +696,19 @@ fn streams_equal_for_len<L: Read, R: Read>(
     }
 
     Ok(true)
+}
+
+fn copy_stream_bounded<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<u64> {
+    let mut buf = [0_u8; LOCAL_COPY_BUFFER_SIZE];
+    let mut total = 0_u64;
+    loop {
+        let read = input.read(&mut buf)?;
+        if read == 0 {
+            return Ok(total);
+        }
+        output.write_all(&buf[..read])?;
+        total += read as u64;
+    }
 }
 
 fn portable_metadata_from_std(
@@ -1030,6 +1045,54 @@ mod tests {
             .all(|path| !path.as_os_str().to_string_lossy().starts_with(r"\\?\")));
 
         fs_adapter.remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn memory_bound_large_copy_uses_fixed_read_buffer() {
+        let total_len = (LOCAL_COPY_BUFFER_SIZE * 3 + 17) as u64;
+        let mut reader = TrackingReader {
+            remaining: total_len,
+            position: 0,
+            max_read_request: 0,
+        };
+        let mut output = Vec::new();
+
+        let copied = copy_stream_bounded(&mut reader, &mut output).unwrap();
+
+        assert_eq!(copied, total_len);
+        assert_eq!(output.len() as u64, total_len);
+        assert!(reader.max_read_request <= LOCAL_COPY_BUFFER_SIZE);
+        assert_eq!(output[0], 0);
+        assert_eq!(
+            output[LOCAL_COPY_BUFFER_SIZE],
+            (LOCAL_COPY_BUFFER_SIZE as u64 % 251) as u8
+        );
+    }
+
+    struct TrackingReader {
+        remaining: u64,
+        position: u64,
+        max_read_request: usize,
+    }
+
+    impl std::io::Read for TrackingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.max_read_request = self.max_read_request.max(buf.len());
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let read = if self.remaining > buf.len() as u64 {
+                buf.len()
+            } else {
+                self.remaining as usize
+            };
+            for byte in &mut buf[..read] {
+                *byte = (self.position % 251) as u8;
+                self.position += 1;
+            }
+            self.remaining -= read as u64;
+            Ok(read)
+        }
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
