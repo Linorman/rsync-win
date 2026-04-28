@@ -5,21 +5,22 @@
 
 `rsync-win` is a native Windows rsync-compatible command line application written in Rust. It aims to provide useful rsync-style local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
 
-This is an early development release. Version `v0.1.5` maps to Cargo package version `0.1.5` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, and concise transfer logging.
+This is an early development release. Version `v0.1.5` maps to Cargo package version `0.1.5` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, POSIX metadata request reporting, and an NTFS-native sidecar prototype.
 
 ## Status
 
 | Area | v0.1.5 status |
 | --- | --- |
 | Local Windows sync | Supported for ordinary files and directories, including multiple source operands. |
-| Recursion and mtimes | `-r`, `-t`, and `-a` planning are supported, with unsupported archive metadata reported. |
+| Recursion and mtimes | `-r`, `-t`, and `-a` planning are supported, with unsupported archive metadata and symlink mtime limitations reported. |
 | Deletion and dry-run | `--delete`, `--dry-run`, `--plan`, itemized changes, and structured stats are available. |
 | Filters | `--include`, `--exclude`, `--filter`, `--files-from`, and `--from0` are available. |
 | Update modes | Quick-check, `--checksum`, `--size-only`, `--ignore-times`, `--partial`, `--partial-dir`, `--inplace`, and `--append-verify` are represented. |
 | Large files | Local copies and remote whole-file token IO stream through bounded buffers instead of staging whole files in memory. |
-| Remote shell | Experimental ordinary-file push/pull over SSH with protocol 31 work, protocol 27 compatibility fallback, rsync-style `-e`, multiple local-source push, and multiple remote-source pull from one host. |
+| Remote shell | Experimental ordinary-file push/pull over SSH with protocol 31 work, protocol 27 compatibility fallback, rsync-style `-e`, multiple local-source push, multiple remote-source pull from one host, `--perms`, and sender-side `--executability` mode mapping. |
 | Logging | Default output is a concise summary with file counts, byte counts, and change totals; `-v` prints per-file transfer progress and `-vv` expands detailed actions. |
-| Windows-native metadata | Long path, collision, link, and metadata policy work is in progress. |
+| POSIX metadata | `--metadata-policy=portable\|posix\|ntfs-native`, `-p/-o/-g`, `--executability`, `--acls`, `--xattrs`, `--fake-super`, and `--omit-link-times` are parsed and reported. Unsupported pieces are degraded/rejected explicitly. |
+| Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request reporting are represented through an NTFS sidecar prototype. |
 | Daemon mode | Planned, not implemented in v0.1.5. |
 
 ## Install
@@ -83,6 +84,18 @@ Preview archive mode metadata handling:
 rsync-win --plan -a --fail-on-metadata-loss .\source .\dest
 ```
 
+Preview POSIX metadata compatibility:
+
+```powershell
+rsync-win --plan --metadata-policy posix -p --executability --acls --xattrs --fake-super .\source .\dest
+```
+
+Preview NTFS-native sidecar mode and VSS diagnostics:
+
+```powershell
+rsync-win --plan --metadata-policy ntfs-native --vss .\source .\dest
+```
+
 Use filters:
 
 ```powershell
@@ -116,13 +129,13 @@ Use `-v` for concise live progress. The command prints a compact final summary b
 | Path | Purpose |
 | --- | --- |
 | `crates/rsync-cli` | CLI parser, transfer planning, local execution, and remote-shell orchestration. |
-| `crates/rsync-core` | Shared diagnostics, metadata policies, and reporting types. |
+| `crates/rsync-core` | Shared diagnostics, POSIX/NTFS metadata policies, and reporting types. |
 | `crates/rsync-delta` | Rolling checksum, block signatures, matching, and token application primitives. |
 | `crates/rsync-filter` | Include, exclude, protect, and files-from parsing. |
 | `crates/rsync-fs` | Portable filesystem model and local sync engine. |
 | `crates/rsync-protocol` | Rsync protocol encoding, file list handling, checksums, and session primitives. |
 | `crates/rsync-transport` | SSH subprocess and TCP transport helpers. |
-| `crates/rsync-winfs` | Windows path, metadata, and link behavior helpers. |
+| `crates/rsync-winfs` | Windows path, metadata, security descriptor summary, alternate stream enumeration, VSS status, and link behavior helpers. |
 | `tests/interop` | Tests that discover optional real `rsync` and `ssh` peers. |
 
 ## Clean-Room and License Notes

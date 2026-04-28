@@ -34,6 +34,7 @@ pub struct RemoteShellOptions {
     pub dry_run: bool,
     pub whole_file: bool,
     pub verbosity: u8,
+    pub preserve_permissions: bool,
     pub checksum: bool,
     pub size_only: bool,
     pub ignore_times: bool,
@@ -41,8 +42,10 @@ pub struct RemoteShellOptions {
     pub partial_dir: Option<String>,
     pub inplace: bool,
     pub append_verify: bool,
+    pub executability: bool,
     pub numeric_ids: bool,
     pub chmod: Option<String>,
+    pub omit_link_times: bool,
     pub copy_links: bool,
     pub safe_links: bool,
     pub copy_unsafe_links: bool,
@@ -58,6 +61,7 @@ impl Default for RemoteShellOptions {
             dry_run: true,
             whole_file: true,
             verbosity: 0,
+            preserve_permissions: false,
             checksum: false,
             size_only: false,
             ignore_times: false,
@@ -65,8 +69,10 @@ impl Default for RemoteShellOptions {
             partial_dir: None,
             inplace: false,
             append_verify: false,
+            executability: false,
             numeric_ids: false,
             chmod: None,
+            omit_link_times: false,
             copy_links: false,
             safe_links: false,
             copy_unsafe_links: false,
@@ -308,6 +314,12 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     if options.checksum {
         argv.push("--checksum".to_string());
     }
+    if options.preserve_permissions {
+        argv.push("--perms".to_string());
+    }
+    if options.executability {
+        argv.push("--executability".to_string());
+    }
     if options.size_only {
         argv.push("--size-only".to_string());
     }
@@ -331,6 +343,9 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     }
     if let Some(chmod) = &options.chmod {
         argv.push(format!("--chmod={chmod}"));
+    }
+    if options.omit_link_times {
+        argv.push("--omit-link-times".to_string());
     }
     if options.copy_links {
         argv.push("--copy-links".to_string());

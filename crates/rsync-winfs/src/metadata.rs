@@ -1,8 +1,12 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rsync_fs::{FileType, PortableMetadata};
+use rsync_fs::{default_permissions, FileType, PortableMetadata};
+
+use crate::security::{capture_security_descriptor_summary, SecurityDescriptorSummary};
+use crate::streams::{enumerate_alternate_data_streams, AlternateDataStream};
+use crate::vss::{vss_snapshot_status, VssSnapshotStatus};
 
 #[cfg(windows)]
 use crate::links::{FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_SYMLINK};
@@ -25,6 +29,57 @@ struct PlatformFileIdentity {
     link_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsNativeSidecar {
+    pub path: PathBuf,
+    pub file_type: FileType,
+    pub len: u64,
+    pub modified_unix_nanos: Option<i128>,
+    pub creation_time_unix_nanos: Option<i128>,
+    pub attributes: Option<u32>,
+    pub sparse_file: bool,
+    pub reparse_tag: Option<u32>,
+    pub file_id: Option<u64>,
+    pub volume_serial: Option<u32>,
+    pub link_count: Option<u64>,
+    pub security: SecurityDescriptorSummary,
+    pub streams: Vec<AlternateDataStream>,
+    pub vss: VssSnapshotStatus,
+}
+
+impl NtfsNativeSidecar {
+    pub fn manifest(&self) -> String {
+        let mut output = String::new();
+        output.push_str("rsync-win ntfs-native sidecar v1\n");
+        output.push_str(&format!("path={}\n", self.path.display()));
+        output.push_str(&format!("file_type={:?}\n", self.file_type));
+        output.push_str(&format!("len={}\n", self.len));
+        output.push_str(&format!("modified={:?}\n", self.modified_unix_nanos));
+        output.push_str(&format!(
+            "creation_time={:?}\n",
+            self.creation_time_unix_nanos
+        ));
+        output.push_str(&format!("attributes={:?}\n", self.attributes));
+        output.push_str(&format!("sparse_file={}\n", self.sparse_file));
+        output.push_str(&format!("reparse_tag={:?}\n", self.reparse_tag));
+        output.push_str(&format!("file_id={:?}\n", self.file_id));
+        output.push_str(&format!("volume_serial={:?}\n", self.volume_serial));
+        output.push_str(&format!("link_count={:?}\n", self.link_count));
+        output.push_str(&format!("security_captured={}\n", self.security.captured));
+        output.push_str(&format!("security_len={:?}\n", self.security.byte_len));
+        output.push_str(&format!("security_hash={:?}\n", self.security.stable_hash));
+        output.push_str(&format!("streams={}\n", self.streams.len()));
+        for stream in &self.streams {
+            output.push_str(&format!("stream={},{}\n", stream.name, stream.size));
+        }
+        output.push_str(&format!("vss_requested={}\n", self.vss.requested));
+        output.push_str(&format!("vss_available={}\n", self.vss.available));
+        output
+    }
+}
+
+const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+
 pub fn read_windows_metadata(path: &Path) -> std::io::Result<WindowsMetadata> {
     let metadata = fs::symlink_metadata(path)?;
     let identity = platform_file_identity(path);
@@ -42,7 +97,7 @@ pub fn read_windows_metadata(path: &Path) -> std::io::Result<WindowsMetadata> {
         file_type,
         len: metadata.len(),
         modified: metadata.modified().ok(),
-        mode: None,
+        mode: Some(default_permissions(file_type)),
         symlink_target: if file_type == FileType::Symlink {
             fs::read_link(path).ok()
         } else {
@@ -58,6 +113,33 @@ pub fn read_windows_metadata(path: &Path) -> std::io::Result<WindowsMetadata> {
         volume_serial: identity.map(|identity| identity.volume_serial),
         reparse_tag: platform_reparse_tag(&metadata, file_type),
         link_count: identity.map(|identity| identity.link_count),
+    })
+}
+
+pub fn capture_ntfs_native_sidecar(
+    path: &Path,
+    request_vss: bool,
+) -> std::io::Result<NtfsNativeSidecar> {
+    let metadata = read_windows_metadata(path)?;
+    let attributes = metadata.attributes;
+    Ok(NtfsNativeSidecar {
+        path: path.to_path_buf(),
+        file_type: metadata.portable.file_type,
+        len: metadata.portable.len,
+        modified_unix_nanos: metadata
+            .portable
+            .modified
+            .and_then(system_time_to_unix_nanos),
+        creation_time_unix_nanos: metadata.creation_time.and_then(system_time_to_unix_nanos),
+        attributes,
+        sparse_file: attributes.is_some_and(|attrs| attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0),
+        reparse_tag: metadata.reparse_tag,
+        file_id: metadata.file_id,
+        volume_serial: metadata.volume_serial,
+        link_count: metadata.link_count,
+        security: capture_security_descriptor_summary(path)?,
+        streams: enumerate_alternate_data_streams(path)?,
+        vss: vss_snapshot_status(request_vss),
     })
 }
 
@@ -159,6 +241,21 @@ fn platform_file_identity(_path: &Path) -> Option<PlatformFileIdentity> {
     None
 }
 
+fn system_time_to_unix_nanos(time: SystemTime) -> Option<i128> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Some(
+            i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos()),
+        ),
+        Err(err) => {
+            let duration = err.duration();
+            Some(
+                -(i128::from(duration.as_secs()) * 1_000_000_000
+                    + i128::from(duration.subsec_nanos())),
+            )
+        }
+    }
+}
+
 #[cfg(windows)]
 fn windows_filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
     if filetime == 0 {
@@ -196,6 +293,42 @@ mod tests {
         let metadata = read_windows_metadata(&file).unwrap();
         assert_eq!(metadata.portable.file_type, FileType::File);
         assert_eq!(metadata.portable.len, 3);
+        assert_eq!(metadata.portable.mode, Some(0o644));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn captures_ntfs_native_sidecar_manifest_for_regular_file() {
+        let root = unique_temp_dir("rsync-winfs-sidecar");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file.txt");
+        fs::write(&file, b"abc").unwrap();
+
+        let sidecar = capture_ntfs_native_sidecar(&file, false).unwrap();
+        let manifest = sidecar.manifest();
+
+        assert_eq!(sidecar.file_type, FileType::File);
+        assert_eq!(sidecar.len, 3);
+        assert!(manifest.contains("rsync-win ntfs-native sidecar v1"));
+        assert!(manifest.contains("file_type=File"));
+        assert!(manifest.contains("streams="));
+        assert!(manifest.contains("vss_requested=false"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sidecar_marks_requested_vss_as_unavailable() {
+        let root = unique_temp_dir("rsync-winfs-sidecar-vss");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file.txt");
+        fs::write(&file, b"abc").unwrap();
+
+        let sidecar = capture_ntfs_native_sidecar(&file, true).unwrap();
+
+        assert!(sidecar.vss.requested);
+        assert!(!sidecar.vss.available);
 
         fs::remove_dir_all(root).unwrap();
     }

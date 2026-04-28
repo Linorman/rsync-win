@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,6 +18,14 @@ pub struct PortableMetadata {
     pub mode: Option<u32>,
     pub symlink_target: Option<PathBuf>,
 }
+
+pub const POSIX_TYPE_REGULAR: u32 = 0o100000;
+pub const POSIX_TYPE_DIRECTORY: u32 = 0o040000;
+pub const POSIX_TYPE_SYMLINK: u32 = 0o120000;
+pub const POSIX_FILE_DEFAULT_PERMS: u32 = 0o644;
+pub const POSIX_FILE_EXECUTABLE_PERMS: u32 = 0o755;
+pub const POSIX_DIRECTORY_DEFAULT_PERMS: u32 = 0o755;
+pub const POSIX_SYMLINK_DEFAULT_PERMS: u32 = 0o777;
 
 impl PortableMetadata {
     pub fn file(len: u64) -> Self {
@@ -59,6 +67,50 @@ impl PortableMetadata {
         self.mode = Some(mode);
         self
     }
+
+    pub fn posix_mode_for_path(&self, path: Option<&Path>, preserve_executability: bool) -> u32 {
+        let file_type_bits = posix_file_type_bits(self.file_type);
+        let mut permissions = self
+            .mode
+            .unwrap_or_else(|| default_permissions(self.file_type));
+        permissions &= 0o7777;
+
+        if self.file_type == FileType::File
+            && preserve_executability
+            && path.is_some_and(path_looks_executable)
+        {
+            permissions |= 0o111;
+        }
+
+        file_type_bits | permissions
+    }
+}
+
+pub fn posix_file_type_bits(file_type: FileType) -> u32 {
+    match file_type {
+        FileType::Directory => POSIX_TYPE_DIRECTORY,
+        FileType::Symlink => POSIX_TYPE_SYMLINK,
+        FileType::File | FileType::Hardlink | FileType::Other => POSIX_TYPE_REGULAR,
+    }
+}
+
+pub fn default_permissions(file_type: FileType) -> u32 {
+    match file_type {
+        FileType::Directory => POSIX_DIRECTORY_DEFAULT_PERMS,
+        FileType::Symlink => POSIX_SYMLINK_DEFAULT_PERMS,
+        FileType::File | FileType::Hardlink | FileType::Other => POSIX_FILE_DEFAULT_PERMS,
+    }
+}
+
+pub fn path_looks_executable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "bat" | "cmd" | "com" | "exe" | "ps1"
+            )
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,5 +208,29 @@ mod tests {
 
         assert!(report.has_loss());
         assert_eq!(report.degradations().len(), 1);
+    }
+
+    #[test]
+    fn infers_executable_mode_from_windows_filename_conventions() {
+        let metadata = PortableMetadata::file(12);
+
+        assert_eq!(
+            metadata.posix_mode_for_path(Some(Path::new("tool.exe")), true),
+            POSIX_TYPE_REGULAR | POSIX_FILE_EXECUTABLE_PERMS
+        );
+        assert_eq!(
+            metadata.posix_mode_for_path(Some(Path::new("notes.txt")), true),
+            POSIX_TYPE_REGULAR | POSIX_FILE_DEFAULT_PERMS
+        );
+    }
+
+    #[test]
+    fn explicit_mode_overrides_default_permissions() {
+        let metadata = PortableMetadata::file(12).with_mode(0o600);
+
+        assert_eq!(
+            metadata.posix_mode_for_path(Some(Path::new("tool.exe")), false),
+            POSIX_TYPE_REGULAR | 0o600
+        );
     }
 }
