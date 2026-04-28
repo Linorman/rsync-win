@@ -20,6 +20,9 @@ rsync-protocol = { path = "../rsync-protocol" }
 rsync-transport = { path = "../rsync-transport" }
 rsync-winfs = { path = "../rsync-winfs" }
 
+[build-dependencies]
+embed-manifest = "=1.4.0"
+
 [[test]]
 name = "interop_discovery"
 path = "../../tests/interop/rsync_discovery.rs"

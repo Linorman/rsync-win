@@ -416,16 +416,20 @@ pub struct LocalFileSystem;
 
 impl PortableFileSystem for LocalFileSystem {
     fn metadata(&self, path: &Path) -> Result<PortableMetadata, FsError> {
-        let metadata = fs::symlink_metadata(path)?;
+        let os_path = local_os_path(path);
+        let metadata = fs::symlink_metadata(&os_path)?;
         let mut portable = portable_metadata_from_std(metadata, None);
         if portable.file_type == FileType::Symlink {
-            portable.symlink_target = fs::read_link(path).ok();
+            portable.symlink_target = fs::read_link(&os_path).ok();
         }
         Ok(portable)
     }
 
     fn metadata_follow(&self, path: &Path) -> Result<PortableMetadata, FsError> {
-        Ok(portable_metadata_from_std(fs::metadata(path)?, None))
+        Ok(portable_metadata_from_std(
+            fs::metadata(local_os_path(path))?,
+            None,
+        ))
     }
 
     fn resolve_path_for_prefix_check(&self, path: &Path) -> Result<PathBuf, FsError> {
@@ -433,7 +437,7 @@ impl PortableFileSystem for LocalFileSystem {
     }
 
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, FsError> {
-        Ok(fs::read(path)?)
+        Ok(fs::read(local_os_path(path))?)
     }
 
     fn write_file_atomic(&mut self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
@@ -442,10 +446,10 @@ impl PortableFileSystem for LocalFileSystem {
 
     fn write_file_direct(&mut self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(local_os_path(parent))?;
         }
 
-        let mut file = File::create(path)?;
+        let mut file = File::create(local_os_path(path))?;
         file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
@@ -470,10 +474,13 @@ impl PortableFileSystem for LocalFileSystem {
 
     fn append_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(local_os_path(parent))?;
         }
 
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(local_os_path(path))?;
         file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
@@ -502,7 +509,7 @@ impl PortableFileSystem for LocalFileSystem {
         source: &Path,
         offset: u64,
     ) -> Result<u64, FsError> {
-        let source_len = fs::metadata(source)?.len();
+        let source_len = fs::metadata(local_os_path(source))?.len();
         if offset > source_len {
             return Err(FsError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -510,12 +517,15 @@ impl PortableFileSystem for LocalFileSystem {
             )));
         }
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(local_os_path(parent))?;
         }
 
-        let mut input = File::open(source)?;
+        let mut input = File::open(local_os_path(source))?;
         input.seek(SeekFrom::Start(offset))?;
-        let mut output = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut output = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(local_os_path(path))?;
         let copied = io::copy(&mut input, &mut output)?;
         output.sync_all()?;
         Ok(copied)
@@ -530,24 +540,25 @@ impl PortableFileSystem for LocalFileSystem {
     }
 
     fn create_dir_all(&mut self, path: &Path) -> Result<(), FsError> {
-        Ok(fs::create_dir_all(path)?)
+        Ok(fs::create_dir_all(local_os_path(path))?)
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<(), FsError> {
-        Ok(fs::remove_file(path)?)
+        Ok(fs::remove_file(local_os_path(path))?)
     }
 
     fn remove_dir_all(&mut self, path: &Path) -> Result<(), FsError> {
-        Ok(fs::remove_dir_all(path)?)
+        Ok(fs::remove_dir_all(local_os_path(path))?)
     }
 
     fn list(&self, path: &Path) -> Result<Vec<WalkEntry>, FsError> {
         let mut entries = Vec::new();
-        for entry in fs::read_dir(path)? {
+        for entry in fs::read_dir(local_os_path(path))? {
             let entry = entry?;
+            let logical_path = path.join(entry.file_name());
             entries.push(WalkEntry {
-                path: entry.path(),
-                metadata: self.metadata(&entry.path())?,
+                metadata: self.metadata(&logical_path)?,
+                path: logical_path,
             });
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -556,7 +567,7 @@ impl PortableFileSystem for LocalFileSystem {
 
     fn set_mtime(&mut self, path: &Path, modified: SystemTime) -> Result<(), FsError> {
         let file_time = FileTime::from_system_time(modified);
-        filetime::set_file_mtime(path, file_time)?;
+        filetime::set_file_mtime(local_os_path(path), file_time)?;
         Ok(())
     }
 }
@@ -570,22 +581,22 @@ impl LocalFileSystem {
         keep_partial: bool,
     ) -> Result<(), FsError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(local_os_path(parent))?;
         }
 
         let temp_path = temp_path_for(path, partial_dir);
         if let Some(parent) = temp_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(local_os_path(parent))?;
         }
         let write_result = (|| {
-            let mut file = File::create(&temp_path)?;
+            let mut file = File::create(local_os_path(&temp_path))?;
             file.write_all(bytes)?;
             file.sync_all()?;
             replace_file(&temp_path, path)
         })();
 
         if write_result.is_err() && !keep_partial {
-            let _ = fs::remove_file(&temp_path);
+            let _ = fs::remove_file(local_os_path(&temp_path));
         }
 
         write_result.map_err(FsError::Io)
@@ -593,11 +604,11 @@ impl LocalFileSystem {
 
     fn copy_file_direct(&mut self, source: &Path, dest: &Path) -> Result<u64, FsError> {
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(local_os_path(parent))?;
         }
 
-        let mut input = File::open(source)?;
-        let mut output = File::create(dest)?;
+        let mut input = File::open(local_os_path(source))?;
+        let mut output = File::create(local_os_path(dest))?;
         let copied = io::copy(&mut input, &mut output)?;
         output.sync_all()?;
         Ok(copied)
@@ -611,12 +622,12 @@ impl LocalFileSystem {
         keep_partial: bool,
     ) -> Result<u64, FsError> {
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(local_os_path(parent))?;
         }
 
         let temp_path = temp_path_for(dest, partial_dir);
         if let Some(parent) = temp_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(local_os_path(parent))?;
         }
         let write_result = (|| {
             let copied = self.copy_file_direct(source, &temp_path)?;
@@ -625,7 +636,7 @@ impl LocalFileSystem {
         })();
 
         if write_result.is_err() && !keep_partial {
-            let _ = fs::remove_file(&temp_path);
+            let _ = fs::remove_file(local_os_path(&temp_path));
         }
 
         write_result
@@ -633,26 +644,30 @@ impl LocalFileSystem {
 }
 
 fn files_equal_streaming(left: &Path, right: &Path) -> io::Result<bool> {
-    let left_len = fs::metadata(left)?.len();
-    let right_len = fs::metadata(right)?.len();
+    let left_os_path = local_os_path(left);
+    let right_os_path = local_os_path(right);
+    let left_len = fs::metadata(&left_os_path)?.len();
+    let right_len = fs::metadata(&right_os_path)?.len();
     if left_len != right_len {
         return Ok(false);
     }
 
-    let mut left_file = File::open(left)?;
-    let mut right_file = File::open(right)?;
+    let mut left_file = File::open(left_os_path)?;
+    let mut right_file = File::open(right_os_path)?;
     streams_equal_for_len(&mut left_file, &mut right_file, left_len)
 }
 
 fn file_prefix_matches_streaming(path: &Path, prefix: &Path) -> io::Result<bool> {
-    let path_len = fs::metadata(path)?.len();
-    let prefix_len = fs::metadata(prefix)?.len();
+    let path_os_path = local_os_path(path);
+    let prefix_os_path = local_os_path(prefix);
+    let path_len = fs::metadata(&path_os_path)?.len();
+    let prefix_len = fs::metadata(&prefix_os_path)?.len();
     if prefix_len > path_len {
         return Ok(false);
     }
 
-    let mut path_file = File::open(path)?;
-    let mut prefix_file = File::open(prefix)?;
+    let mut path_file = File::open(path_os_path)?;
+    let mut prefix_file = File::open(prefix_os_path)?;
     streams_equal_for_len(&mut path_file, &mut prefix_file, prefix_len)
 }
 
@@ -726,6 +741,8 @@ fn replace_file(source: &Path, dest: &Path) -> io::Result<()> {
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
+    let source = local_os_path(source);
+    let dest = local_os_path(dest);
     let source: Vec<u16> = source
         .as_os_str()
         .encode_wide()
@@ -753,7 +770,7 @@ fn replace_file(source: &Path, dest: &Path) -> io::Result<()> {
 
 #[cfg(not(windows))]
 fn replace_file(source: &Path, dest: &Path) -> io::Result<()> {
-    fs::rename(source, dest)
+    fs::rename(local_os_path(source), local_os_path(dest))
 }
 
 pub fn walk_tree<F: PortableFileSystem>(fs: &F, root: &Path) -> Result<Vec<WalkEntry>, FsError> {
@@ -819,7 +836,7 @@ fn temp_file_name(file_name: &str) -> String {
 }
 
 fn canonicalize_existing_or_missing(path: &Path) -> io::Result<PathBuf> {
-    if let Ok(canonical) = fs::canonicalize(path) {
+    if let Ok(canonical) = canonicalize_local_path(path) {
         return Ok(canonical);
     }
 
@@ -833,7 +850,7 @@ fn canonicalize_existing_or_missing(path: &Path) -> io::Result<PathBuf> {
 
         match current.parent() {
             Some(parent) if parent != current => {
-                if let Ok(mut base) = fs::canonicalize(parent) {
+                if let Ok(mut base) = canonicalize_local_path(parent) {
                     for component in missing.iter().rev() {
                         base.push(component);
                     }
@@ -848,10 +865,65 @@ fn canonicalize_existing_or_missing(path: &Path) -> io::Result<PathBuf> {
     let mut absolute = if path.is_absolute() {
         PathBuf::new()
     } else {
-        fs::canonicalize(std::env::current_dir()?)?
+        let current_dir = std::env::current_dir()?;
+        canonicalize_local_path(&current_dir)?
     };
     absolute.push(path);
     Ok(absolute)
+}
+
+fn canonicalize_local_path(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path)
+        .or_else(|_| fs::canonicalize(local_os_path(path)))
+        .map(logical_path_from_os_path)
+}
+
+#[cfg(windows)]
+fn logical_path_from_os_path(path: PathBuf) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{stripped}"));
+    }
+    if let Some(stripped) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(stripped);
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn logical_path_from_os_path(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(windows)]
+fn local_os_path(path: &Path) -> PathBuf {
+    use std::path::Prefix;
+
+    let text = path.as_os_str().to_string_lossy();
+    if text.starts_with(r"\\?\") {
+        return path.to_path_buf();
+    }
+
+    if let Ok(stripped) = path.strip_prefix(r"\\") {
+        return PathBuf::from(format!(r"\\?\UNC\{}", stripped.display()));
+    }
+
+    if path.is_absolute() {
+        return PathBuf::from(format!(r"\\?\{}", path.display()));
+    }
+
+    if let Some(Component::Prefix(prefix)) = path.components().next() {
+        if matches!(prefix.kind(), Prefix::Verbatim(_) | Prefix::VerbatimDisk(_)) {
+            return path.to_path_buf();
+        }
+    }
+
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn local_os_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -894,6 +966,47 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), b"new");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_filesystem_handles_windows_long_paths_without_leaking_verbatim_prefixes() {
+        let root = unique_temp_dir("rsync-fs-long-path");
+        let mut long_dir = root.clone();
+        while long_dir.as_os_str().to_string_lossy().len() < 280 {
+            long_dir.push("segment0123456789");
+        }
+        let file_path = long_dir.join("file.txt");
+        let copy_path = long_dir.join("copy.txt");
+        assert!(file_path.as_os_str().to_string_lossy().len() > 260);
+
+        let mut fs_adapter = LocalFileSystem;
+        fs_adapter.write_file_atomic(&file_path, b"abc").unwrap();
+        fs_adapter.append_file(&file_path, b"def").unwrap();
+        fs_adapter
+            .copy_file_with_options(&file_path, &copy_path, &FileWriteOptions::default())
+            .unwrap();
+        fs_adapter.set_mtime(&copy_path, UNIX_EPOCH).unwrap();
+
+        assert_eq!(fs_adapter.read_file(&file_path).unwrap(), b"abcdef");
+        assert!(fs_adapter.files_equal(&file_path, &copy_path).unwrap());
+        assert!(fs_adapter
+            .file_prefix_matches(&copy_path, &file_path)
+            .unwrap());
+
+        let paths: Vec<_> = fs_adapter
+            .list(&long_dir)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        assert!(paths.contains(&file_path));
+        assert!(paths.contains(&copy_path));
+        assert!(paths
+            .iter()
+            .all(|path| !path.as_os_str().to_string_lossy().starts_with(r"\\?\")));
+
+        fs_adapter.remove_dir_all(&root).unwrap();
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
