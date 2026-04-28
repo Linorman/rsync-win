@@ -122,6 +122,18 @@ pub enum RemoteSessionError {
     NonFileBlockRequest { index: usize },
     #[error("remote file checksum mismatch for {path}")]
     FileChecksumMismatch { path: String },
+    #[error("remote sent {actual} bytes for {path}, exceeding advertised length {expected}")]
+    FileLengthExceeded {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("remote ended {path} after {actual} bytes, below advertised length {expected}")]
+    FileLengthShort {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("remote sent invalid phase acknowledgement {0}")]
     InvalidPhaseAck(i32),
     #[error("remote sent invalid final acknowledgement {0}")]

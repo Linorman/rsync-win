@@ -65,24 +65,12 @@ jobs:
         run: cargo test --workspace --all-features
 
       - name: Build release binary
-        run: cargo build --release -p rsync-cli
+        run: cargo build --release -p rsync-cli --target x86_64-pc-windows-msvc
 
       - name: Package
         shell: pwsh
         run: |
-          $packageDir = "dist/package"
-          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
-          Copy-Item "target/release/rsync-win.exe" "$packageDir/rsync-win.exe"
-          Copy-Item "README.md" "$packageDir/README.md"
-          Copy-Item "LICENSE" "$packageDir/LICENSE"
-          Copy-Item "LICENSE-MIT" "$packageDir/LICENSE-MIT"
-          Copy-Item "LICENSE-APACHE" "$packageDir/LICENSE-APACHE"
-          Copy-Item "THIRD-PARTY-NOTICES.md" "$packageDir/THIRD-PARTY-NOTICES.md"
-
-          $asset = "${{ steps.release.outputs.asset_name }}"
-          Compress-Archive -Path "$packageDir/*" -DestinationPath "dist/$asset" -Force
-          $hash = Get-FileHash "dist/$asset" -Algorithm SHA256
-          "$($hash.Hash.ToLowerInvariant())  $asset" | Set-Content "dist/$asset.sha256" -Encoding utf8
+          .\scripts\package-release.ps1 -Tag "${{ steps.release.outputs.tag }}" -Target "x86_64-pc-windows-msvc" -SkipBuild
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4

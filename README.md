@@ -21,7 +21,10 @@ This is an early development release. Version `v0.1.5` maps to Cargo package ver
 | Logging | Default output is a concise summary with file counts, byte counts, and change totals; `-v` prints per-file transfer progress and `-vv` expands detailed actions. |
 | POSIX metadata | `--metadata-policy=portable\|posix\|ntfs-native`, `-p/-o/-g`, `--executability`, `--acls`, `--xattrs`, `--fake-super`, and `--omit-link-times` are parsed and reported. Unsupported pieces are degraded/rejected explicitly. |
 | Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request reporting are represented through an NTFS sidecar prototype. |
+| Release hardening | Remote pull rejects path escapes and corrupt literal lengths, release packaging is scripted, and a small local-sync benchmark is available. |
 | Daemon mode | Planned, not implemented in v0.1.5. |
+
+See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the current peer, metadata, hardening, and release compatibility matrix.
 
 ## Install
 
@@ -56,6 +59,18 @@ Formatting and lint checks used by CI:
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-features -- -D warnings
+```
+
+Run the local sync benchmark:
+
+```powershell
+cargo bench -p rsync-fs --bench local_sync
+```
+
+Build a release zip and SHA-256 checksum locally:
+
+```powershell
+.\scripts\package-release.ps1 -Tag v0.1.5
 ```
 
 ## Usage Examples
@@ -137,6 +152,8 @@ Use `-v` for concise live progress. The command prints a compact final summary b
 | `crates/rsync-transport` | SSH subprocess and TCP transport helpers. |
 | `crates/rsync-winfs` | Windows path, metadata, security descriptor summary, alternate stream enumeration, VSS status, and link behavior helpers. |
 | `tests/interop` | Tests that discover optional real `rsync` and `ssh` peers. |
+| `docs/COMPATIBILITY.md` | Current peer, metadata, hardening, and release compatibility matrix. |
+| `scripts/package-release.ps1` | Local/GitHub release zip and checksum packaging script. |
 
 ## Clean-Room and License Notes
 
