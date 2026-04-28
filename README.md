@@ -36,7 +36,7 @@ When a Windows x64 release zip is published, extract it and run:
 .\rsync-win.exe --version
 ```
 
-The release zip also includes the project license files and third-party dependency notice. A SHA-256 checksum file is published next to the zip.
+The release zip also includes the project license files, third-party dependency notice, compatibility matrix, and release notes template. Packaging runs the staged `rsync-win.exe --version`, verifies required zip entries, and writes a SHA-256 checksum file next to the zip.
 
 ## Build From Source
 
