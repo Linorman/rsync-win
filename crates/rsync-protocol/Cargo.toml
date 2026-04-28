@@ -9,4 +9,5 @@ authors.workspace = true
 [dependencies]
 digest = "0.10"
 md4 = "0.10"
+md-5 = "0.10"
 thiserror.workspace = true

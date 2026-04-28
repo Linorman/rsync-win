@@ -18,15 +18,15 @@ This is an early development release. Version `v0.1.5` maps to Cargo package ver
 | Update modes | Quick-check, `--checksum`, `--size-only`, `--ignore-times`, `--partial`, `--partial-dir`, `--inplace`, and `--append-verify` are represented in the current local/remote ordinary-file paths. |
 | Large files | Local copies and remote whole-file token IO stream through bounded buffers instead of staging whole files in memory. |
 | Remote shell | Experimental ordinary-file push/pull over SSH with a protocol 31 path, protocol 27 fallback tests, rsync-style `-e`, multiple local-source push, multiple remote-source pull from one host, `--perms`, and sender-side `--executability` mode mapping. |
+| Daemon mode | Experimental client MVP for module listing, no-auth ordinary-file pull, and `--password-file` auth over `host::module/path` or `rsync://host/module/path`. Daemon push is not implemented. |
 | Logging | Default output is a concise summary with file counts, byte counts, and change totals; `-v` prints per-file transfer progress and `-vv` expands detailed actions. |
 | POSIX metadata | `--metadata-policy=portable\|posix\|ntfs-native`, `-p/-o/-g`, `--executability`, `--acls`, `--xattrs`, `--fake-super`, and `--omit-link-times` are parsed and reported. Unsupported pieces are degraded/rejected explicitly. |
 | Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request reporting are captured or reported through an NTFS sidecar prototype. Restore is not implemented. |
 | Release hardening | Remote pull rejects path escapes and corrupt literal lengths, release packaging is scripted, and a small local-sync benchmark is available. |
-| Daemon mode | Planned, not implemented in v0.1.5. |
 
 See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the current peer, metadata, hardening, and release compatibility matrix.
 
-Known not implemented in this development build: rsync daemon auth, VSS snapshot reads, NTFS metadata restore, ADS payload copy, and memory-bounded incremental recursion.
+Known not implemented in this development build: daemon push, VSS snapshot reads, NTFS metadata restore, ADS payload copy, and memory-bounded incremental recursion. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport.
 
 ## Install
 
@@ -137,6 +137,18 @@ Download multiple remote directories from the same host into one destination, pr
 
 ```powershell
 rsync-win -av --no-o --no-g -e "ssh -p 22" root@example:/srv/one root@example:/srv/two .\backup\
+```
+
+List daemon modules:
+
+```powershell
+rsync-win --list-only rsync://example.test:873/
+```
+
+Download one daemon module path. `--password-file` is rsync daemon challenge-response auth only; it does not encrypt file data or metadata:
+
+```powershell
+rsync-win -r --password-file .\rsyncd.pass rsync://user@example.test:873/module/path .\data\
 ```
 
 Remote-shell interop tests are gated by environment variables so normal test runs do not require external hosts:

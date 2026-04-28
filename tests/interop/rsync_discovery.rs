@@ -194,7 +194,14 @@ fn remote_shell_push_delete_tree_skips_without_ssh_target() {
     let source_arg = format!("{}/", source.to_string_lossy());
     let dest_arg = format!("{target}:{remote_dest}/");
     let output = Command::new(&rsync_win)
-        .args(["-r", "-t", "--delete", "--whole-file", &source_arg, &dest_arg])
+        .args([
+            "-r",
+            "-t",
+            "--delete",
+            "--whole-file",
+            &source_arg,
+            &dest_arg,
+        ])
         .output()
         .unwrap();
 

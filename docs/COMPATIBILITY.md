@@ -10,7 +10,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Homebrew/macOS rsync 3.x over SSH | Experimental ordinary-file push/pull | Expected to follow the Linux rsync path when protocol 31 is available. Older protocol behavior remains best-effort. |
 | macOS stock rsync 2.6.9 | Best-effort, not release-grade | Older protocol and option behavior is not a first-class target yet. |
 | openrsync | Best-effort, not release-grade | Option and wire behavior may diverge from upstream rsync; test before use. |
-| rsync daemon `host::module` / `rsync://` | Not implemented | Daemon operands are detected and reported instead of routed through remote-shell mode. |
+| rsync daemon `host::module` / `rsync://` | Experimental client MVP | Module listing, no-auth ordinary-file pull, and `--password-file` auth are implemented. Daemon push, encrypted transport, and broad option parity are not implemented. |
 | Local Windows-to-Windows portable sync | Implemented for tested ordinary files/directories | Covers recursion, mtimes, deletion, filters, multiple sources, and update modes in the current portable test suite. |
 
 ## Metadata Modes
@@ -39,7 +39,8 @@ This matrix describes the current development build behavior. It is intentionall
 
 ## Known Not Implemented
 
-- Daemon auth and daemon transfers are not implemented.
+- Daemon push is not implemented.
+- Daemon auth is not transport encryption; `--password-file` only answers the rsync daemon challenge-response prompt.
 - VSS snapshot reads are not implemented.
 - NTFS metadata restore is not implemented.
 - Alternate data stream payload copying is not implemented.
@@ -57,6 +58,12 @@ rsync-win -rt --delete .\source .\dest
 $env:RSYNC_WIN_SSH_TARGET = "user@host"
 $env:RSYNC_WIN_SSH_TMP_ROOT = "/tmp"
 cargo test -p rsync-cli --test interop_discovery --all-features -- --nocapture
+$env:RSYNC_WIN_DAEMON_URL = "rsync://host:873"
+$env:RSYNC_WIN_DAEMON_MODULE = "module"
+$env:RSYNC_WIN_DAEMON_PATH = "path/to/readable-fixture"
+cargo test -p rsync-cli --test daemon --all-features -- --nocapture
 ```
 
 `RSYNC_WIN_SSH_TARGET` enables disposable remote-shell smoke tests against the configured SSH host. The tests create and remove `rsync-win-*` directories under `RSYNC_WIN_SSH_TMP_ROOT`, which defaults to `/tmp`; use a path reserved for test data. `RSYNC_WIN_SSH_PROTOCOL27_TARGET` is optional and should only be set to a peer that explicitly exercises protocol 27 fallback behavior.
+
+`RSYNC_WIN_DAEMON_URL` enables daemon module listing smoke tests. Set `RSYNC_WIN_DAEMON_MODULE` and `RSYNC_WIN_DAEMON_PATH` only for a controlled no-auth readable fixture; the daemon test writes only to a local disposable destination.

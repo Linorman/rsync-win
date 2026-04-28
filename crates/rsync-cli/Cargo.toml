@@ -26,3 +26,7 @@ embed-manifest = "=1.4.0"
 [[test]]
 name = "interop_discovery"
 path = "../../tests/interop/rsync_discovery.rs"
+
+[[test]]
+name = "daemon"
+path = "../../tests/interop/daemon.rs"

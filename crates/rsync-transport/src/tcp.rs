@@ -14,6 +14,8 @@ impl TcpTransport {
             match TcpStream::connect_timeout(&addr, timeout) {
                 Ok(stream) => {
                     stream.set_nodelay(true)?;
+                    stream.set_read_timeout(Some(timeout))?;
+                    stream.set_write_timeout(Some(timeout))?;
                     return Ok(Self { stream });
                 }
                 Err(err) => last_error = Some(err),
@@ -27,6 +29,14 @@ impl TcpTransport {
 
     pub fn from_stream(stream: TcpStream) -> Self {
         Self { stream }
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(timeout)
     }
 }
 

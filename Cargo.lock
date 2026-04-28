@@ -312,6 +312,7 @@ name = "rsync-protocol"
 version = "0.1.5"
 dependencies = [
  "digest",
+ "md-5",
  "md4",
  "thiserror",
 ]

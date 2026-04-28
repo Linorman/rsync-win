@@ -21,17 +21,19 @@ use rsync_fs::{
     PortableFileSystem, SymlinkMode, SyncAction, SyncOptions, UpdateMode,
 };
 use rsync_protocol::{
-    build_remote_shell_argv_for_paths, build_remote_shell_protocol31_argv,
-    build_remote_shell_protocol31_argv_for_paths, exchange_remote_shell_mvp_handshake,
+    authenticate_daemon_module, build_remote_shell_argv_for_paths,
+    build_remote_shell_protocol31_argv, build_remote_shell_protocol31_argv_for_paths,
+    exchange_daemon_greeting, exchange_remote_shell_mvp_handshake,
     exchange_remote_shell_protocol31_handshake, read_i32_le, read_multiplexed_i32,
     read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
-    read_vstring, rsync_plain_md4_checksum_reader, rsync_whole_file_checksum_reader, write_i32_le,
+    read_vstring, request_module_list, rsync_plain_md4_checksum_reader,
+    rsync_whole_file_checksum_reader, select_daemon_module, write_daemon_args, write_i32_le,
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_options, write_rsync_i32,
-    write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, MultiplexReadState,
-    MultiplexedReader, MultiplexedWriter, RemoteSessionError, RemoteShellOperand,
-    RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, RsyncMd4Checksum, SessionError,
-    TransferDirection, WireFileType, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+    write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
+    DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter, RemoteSessionError,
+    RemoteShellOperand, RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, RsyncMd4Checksum,
+    SessionError, TransferDirection, WireFileType, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
     REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
     RSYNC_INDEX_DONE,
 };
@@ -39,6 +41,7 @@ use rsync_transport::remote_shell::{
     build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
     spawn_ssh_remote_command, SshRemoteCommand,
 };
+use rsync_transport::tcp::TcpTransport;
 use rsync_winfs::{capture_ntfs_native_sidecar, to_long_path_safe, WindowsDriveKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -104,6 +107,9 @@ pub struct Cli {
 
     #[arg(long = "stats", action = ArgAction::SetTrue, help = "Print structured transfer statistics")]
     stats: bool,
+
+    #[arg(long = "list-only", action = ArgAction::SetTrue, help = "List daemon modules or remote entries without copying")]
+    list_only: bool,
 
     #[arg(long = "metadata-policy", value_enum, default_value_t = CliMetadataPolicy::Portable, help = "Metadata compatibility policy")]
     metadata_policy: CliMetadataPolicy,
@@ -202,6 +208,12 @@ pub struct Cli {
         help = "Specify the remote shell command, e.g. \"ssh -p 10080\""
     )]
     remote_shell: Option<String>,
+
+    #[arg(
+        long = "password-file",
+        help = "Read rsync daemon password from a local file"
+    )]
+    password_file: Option<PathBuf>,
 
     #[arg(long = "copy-links", action = ArgAction::SetTrue, help = "Copy symlink referents")]
     copy_links: bool,
@@ -341,6 +353,34 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
             }
         ));
     }
+    if let Some(daemon) = &plan.daemon_operand {
+        output.push_str("daemon mode: client\n");
+        output.push_str(&format!(
+            "daemon endpoint: {}:{}\n",
+            daemon.host, daemon.port
+        ));
+        if let Some(direction) = plan.daemon_direction {
+            output.push_str(&format!(
+                "daemon direction: {} ({})\n",
+                transfer_direction_label(direction),
+                match direction {
+                    TransferDirection::Push => "local -> daemon",
+                    TransferDirection::Pull => "daemon -> local",
+                }
+            ));
+        }
+        if let Some(module) = &daemon.module {
+            output.push_str(&format!("daemon module: {module}\n"));
+        } else {
+            output.push_str("daemon module: <list>\n");
+        }
+        if let Some(path) = &daemon.path {
+            output.push_str(&format!("daemon path: {path}\n"));
+        }
+        if cli.password_file.is_some() {
+            output.push_str("daemon auth: password-file configured\n");
+        }
+    }
 
     if let Some(argv) = &plan.remote_server_argv {
         output.push_str("remote --server argv:");
@@ -385,7 +425,7 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
 }
 
 fn execute_or_render(cli: &Cli) -> Result<String> {
-    if cli.version || cli.protocol_range || cli.plan || cli.paths.len() < 2 {
+    if cli.version || cli.protocol_range || cli.plan {
         return Ok(render_output(cli));
     }
 
@@ -394,7 +434,15 @@ fn execute_or_render(cli: &Cli) -> Result<String> {
         return Ok(render_transfer_plan_with(cli, &plan));
     }
 
-    if cli.paths.iter().any(|path| is_remote_operand(path)) {
+    if plan.daemon_operand.is_some() {
+        return execute_daemon_sync(cli, plan);
+    }
+
+    if cli.paths.len() < 2 {
+        return Ok(render_transfer_plan_with(cli, &plan));
+    }
+
+    if cli.paths.iter().any(|path| is_remote_shell_operand(path)) {
         return execute_remote_shell_sync(cli, plan);
     }
 
@@ -620,6 +668,145 @@ struct Rsync31ItemAttrs {
 enum RemoteFileChecksum {
     SeededMd4(i32),
     PlainMd4,
+}
+
+fn execute_daemon_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
+    ensure_daemon_execution_options_supported(cli, &plan)?;
+
+    let daemon = plan
+        .daemon_operand
+        .as_ref()
+        .context("daemon operand was not planned")?;
+    let progress = ProgressLog::from_cli(cli);
+    progress.info(format!(
+        "daemon connection started: {}:{}",
+        daemon.host, daemon.port
+    ));
+    let mut transport =
+        TcpTransport::connect((daemon.host.as_str(), daemon.port), Duration::from_secs(30))
+            .with_context(|| format!("failed to connect to {}:{}", daemon.host, daemon.port))?;
+    execute_daemon_sync_with_transport(cli, &plan, &mut transport)
+}
+
+fn execute_daemon_sync_with_transport<T: Read + Write>(
+    cli: &Cli,
+    plan: &TransferPlan,
+    mut transport: &mut T,
+) -> Result<String> {
+    ensure_daemon_execution_options_supported(cli, plan)?;
+
+    let daemon = plan
+        .daemon_operand
+        .as_ref()
+        .context("daemon operand was not planned")?;
+    let progress = ProgressLog::from_cli(cli);
+    let greeting = exchange_daemon_greeting(&mut transport, REMOTE_SHELL_MODERN_PROTOCOL)
+        .context("failed to exchange daemon greeting")?;
+    progress.detail(format!(
+        "daemon protocol: {}.{}",
+        greeting.peer_protocol, greeting.peer_subprotocol
+    ));
+
+    if daemon.module.is_none() {
+        let listing =
+            request_module_list(&mut transport).context("failed to list daemon modules")?;
+        let mut output = String::new();
+        output.push_str("rsync-win daemon module list\n");
+        output.push_str(&format!("endpoint: {}:{}\n", daemon.host, daemon.port));
+        output.push_str(&format!(
+            "protocol: {}.{}\n",
+            greeting.peer_protocol, greeting.peer_subprotocol
+        ));
+        if !listing.motd.is_empty() {
+            output.push_str("motd:\n");
+            for line in listing.motd {
+                output.push_str(&format!("- {line}\n"));
+            }
+        }
+        output.push_str("modules:\n");
+        if listing.modules.is_empty() {
+            output.push_str("- <none>\n");
+        } else {
+            for module in listing.modules {
+                output.push_str(&format!("- {}\t{}\n", module.name, module.comment));
+            }
+        }
+        return Ok(output);
+    }
+
+    let module = daemon.module.as_deref().expect("checked module");
+    match select_daemon_module(&mut transport, module).context("failed to select daemon module")? {
+        DaemonModuleSelection::Ok { .. } => {}
+        DaemonModuleSelection::AuthRequired { challenge, motd: _ } => {
+            let password_file = cli
+                .password_file
+                .as_ref()
+                .context("daemon module requires auth; pass --password-file")?;
+            let password = read_password_file(password_file)?;
+            let user = daemon.user.as_deref().unwrap_or("nobody");
+            authenticate_daemon_module(
+                &mut transport,
+                user,
+                &password,
+                &challenge,
+                greeting.auth_checksum,
+            )
+            .context("daemon authentication failed")?;
+        }
+    }
+
+    let args = daemon_server_args_for_pull(cli, plan, daemon, greeting.peer_protocol)?;
+    progress.detail(format!("daemon args: {} argument(s)", args.len()));
+    write_daemon_args(&mut transport, greeting.peer_protocol, &args)
+        .context("failed to send daemon server args")?;
+
+    if greeting.peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL {
+        execute_remote_pull_protocol31(cli, plan, transport)
+    } else {
+        execute_remote_pull_protocol27(cli, plan, transport)
+    }
+}
+
+fn daemon_server_args_for_pull(
+    cli: &Cli,
+    plan: &TransferPlan,
+    daemon: &DaemonOperand,
+    protocol: u32,
+) -> Result<Vec<String>> {
+    let path_arg = daemon_module_path_arg(daemon)?;
+    let options = remote_shell_options_from_cli(
+        cli,
+        TransferDirection::Pull,
+        plan.recursive,
+        plan.preserve_times,
+        plan.symlink_mode,
+    );
+    let argv = if protocol < REMOTE_SHELL_MODERN_PROTOCOL {
+        build_remote_shell_argv_for_paths(&options, &[Path::new(&path_arg)])?
+    } else {
+        build_remote_shell_protocol31_argv_for_paths(&options, &[Path::new(&path_arg)])?
+    };
+    Ok(argv.into_iter().skip(1).collect())
+}
+
+fn daemon_module_path_arg(daemon: &DaemonOperand) -> Result<String> {
+    let module = daemon
+        .module
+        .as_ref()
+        .context("daemon pull requires a module")?;
+    Ok(match &daemon.path {
+        Some(path) => format!("{module}/{path}"),
+        None => format!("{module}/"),
+    })
+}
+
+fn read_password_file(path: &Path) -> Result<String> {
+    let mut password = fs::read_to_string(path)
+        .with_context(|| format!("failed to read daemon password file {}", path.display()))?;
+    while password.ends_with('\n') || password.ends_with('\r') {
+        password.pop();
+    }
+    Ok(password)
 }
 
 fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
@@ -1191,14 +1378,14 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
     write_rsync_i32(transport, -1)?;
     transport.flush()?;
 
-    let remote = plan
-        .remote_operand
-        .as_ref()
-        .context("remote operand was not planned")?;
     let mut output = String::new();
-    output.push_str("rsync-win remote-shell pull\n");
+    if plan.daemon_operand.is_some() {
+        output.push_str("rsync-win daemon pull\n");
+    } else {
+        output.push_str("rsync-win remote-shell pull\n");
+    }
     output.push_str("direction: download (remote -> local)\n");
-    append_remote_pull_sources_summary(&mut output, plan, remote);
+    append_pull_sources_summary(&mut output, plan)?;
     output.push_str(&format!("destination: {}\n", dest.display()));
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
@@ -1335,14 +1522,14 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
     }
     write_rsync31_done(transport)?;
 
-    let remote = plan
-        .remote_operand
-        .as_ref()
-        .context("remote operand was not planned")?;
     let mut output = String::new();
-    output.push_str("rsync-win remote-shell pull\n");
+    if plan.daemon_operand.is_some() {
+        output.push_str("rsync-win daemon pull\n");
+    } else {
+        output.push_str("rsync-win remote-shell pull\n");
+    }
     output.push_str("direction: download (remote -> local)\n");
-    append_remote_pull_sources_summary(&mut output, plan, remote);
+    append_pull_sources_summary(&mut output, plan)?;
     output.push_str(&format!("destination: {}\n", dest.display()));
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
@@ -1591,11 +1778,25 @@ fn append_sources_summary(output: &mut String, sources: &[PathBuf]) {
     }
 }
 
-fn append_remote_pull_sources_summary(
-    output: &mut String,
-    plan: &TransferPlan,
-    fallback_remote: &RemoteShellOperand,
-) {
+fn append_pull_sources_summary(output: &mut String, plan: &TransferPlan) -> Result<()> {
+    if let Some(daemon) = &plan.daemon_operand {
+        let module = daemon
+            .module
+            .as_ref()
+            .context("daemon pull requires a module")?;
+        let path = daemon
+            .path
+            .as_ref()
+            .map(|path| format!("/{path}"))
+            .unwrap_or_else(String::new);
+        output.push_str(&format!("source: {}::{module}{path}\n", daemon.host));
+        return Ok(());
+    }
+
+    let fallback_remote = plan
+        .remote_operand
+        .as_ref()
+        .context("remote operand was not planned")?;
     let sources = if plan.remote_operands.is_empty() {
         std::slice::from_ref(fallback_remote)
     } else {
@@ -1607,13 +1808,14 @@ fn append_remote_pull_sources_summary(
             "source: {}:{}\n",
             sources[0].host, sources[0].path
         ));
-        return;
+        return Ok(());
     }
 
     output.push_str(&format!("sources: {}\n", sources.len()));
     for source in sources {
         output.push_str(&format!("- source {}:{}\n", source.host, source.path));
     }
+    Ok(())
 }
 
 fn remote_session_label(plan: &TransferPlan, direction: TransferDirection) -> String {
@@ -3496,6 +3698,8 @@ struct TransferPlan {
     remote_operands: Vec<RemoteShellOperand>,
     remote_direction: Option<TransferDirection>,
     remote_wire_protocol: Option<RemoteWireProtocol>,
+    daemon_operand: Option<DaemonOperand>,
+    daemon_direction: Option<TransferDirection>,
     report: Report,
 }
 
@@ -3557,6 +3761,8 @@ impl TransferPlan {
             FileWriteMode::Atomic
         };
         let symlink_mode = symlink_mode_from_cli(cli);
+        let (daemon_operand, daemon_direction, has_daemon_operand) =
+            plan_daemon_operands(cli, &mut report);
         let (
             remote_server_argv,
             remote_ssh_argv,
@@ -3565,7 +3771,9 @@ impl TransferPlan {
             remote_operands,
             remote_direction,
             remote_wire_protocol,
-        ) = if cli.paths.len() >= 2 {
+        ) = if has_daemon_operand {
+            (None, None, None, None, Vec::new(), None, None)
+        } else if cli.paths.len() >= 2 {
             let sources = &cli.paths[..cli.paths.len() - 1];
             let destination = cli.paths.last().expect("checked len");
             let source_remotes: Vec<_> = sources
@@ -3741,9 +3949,80 @@ impl TransferPlan {
             remote_operands,
             remote_direction,
             remote_wire_protocol,
+            daemon_operand,
+            daemon_direction,
             report,
         }
     }
+}
+
+fn plan_daemon_operands(
+    cli: &Cli,
+    report: &mut Report,
+) -> (Option<DaemonOperand>, Option<TransferDirection>, bool) {
+    let mut present = false;
+    let mut operands = Vec::new();
+    for (index, operand) in cli.paths.iter().enumerate() {
+        if !is_daemon_operand_syntax(operand) {
+            continue;
+        }
+        present = true;
+        match DaemonOperand::parse(operand) {
+            Ok(Some(daemon)) => operands.push((index, daemon)),
+            Ok(None) => {}
+            Err(err) => report.error("E_DAEMON_OPERAND", err.to_string()),
+        }
+    }
+
+    if !present {
+        return (None, None, false);
+    }
+    if operands.len() != 1 {
+        if operands.len() > 1 {
+            report.error(
+                "E_DAEMON_OPERANDS",
+                "daemon client MVP supports one daemon operand per command",
+            );
+        }
+        return (None, None, true);
+    }
+
+    let (index, operand) = operands.remove(0);
+    if cli.paths.len() == 1 {
+        if cli.list_only && operand.module.is_none() {
+            return (Some(operand), Some(TransferDirection::Pull), true);
+        }
+        report.error(
+            "E_DAEMON_OPERANDS",
+            "daemon commands require --list-only host:: for module listing or daemon source plus a local destination for pull",
+        );
+        return (Some(operand), None, true);
+    }
+
+    if index == 0 && cli.paths.len() == 2 {
+        if operand.module.is_none() {
+            report.error(
+                "E_DAEMON_OPERANDS",
+                "daemon pull requires a module, e.g. host::module/path",
+            );
+            return (Some(operand), None, true);
+        }
+        return (Some(operand), Some(TransferDirection::Pull), true);
+    }
+
+    if index == cli.paths.len() - 1 {
+        report.error(
+            "E_DAEMON_PUSH_UNSUPPORTED",
+            "daemon push is out of scope for this MVP; use a remote-shell destination or pull from a daemon module",
+        );
+        return (Some(operand), Some(TransferDirection::Push), true);
+    }
+
+    report.error(
+        "E_DAEMON_OPERANDS",
+        "daemon operands cannot be mixed with additional local or remote sources in this MVP",
+    );
+    (Some(operand), None, true)
 }
 
 fn remote_shell_options_from_cli(
@@ -4050,7 +4329,7 @@ fn ensure_remote_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
     if plan.remote_direction == Some(TransferDirection::Push)
         && cli.paths[..cli.paths.len() - 1]
             .iter()
-            .any(|path| is_remote_operand(path))
+            .any(|path| is_remote_shell_operand(path))
     {
         bail!("remote-shell push sources must be local paths");
     }
@@ -4084,11 +4363,58 @@ fn ensure_remote_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
     Ok(())
 }
 
-fn is_remote_operand(operand: &str) -> bool {
-    if operand.starts_with("rsync://") || operand.contains("::") {
-        return true;
+fn ensure_daemon_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> Result<()> {
+    let daemon = plan
+        .daemon_operand
+        .as_ref()
+        .context("daemon execution could not be planned; run with --plan for diagnostics")?;
+    if cli.remote_shell.is_some() {
+        bail!("daemon client mode does not use --rsh/-e; omit the remote-shell option");
+    }
+    if plan.daemon_direction != Some(TransferDirection::Pull) {
+        bail!("daemon client MVP currently supports module listing and pull only");
+    }
+    if daemon.module.is_none() && !cli.list_only {
+        bail!("daemon module listing requires --list-only host::");
+    }
+    if daemon.module.is_none() && cli.paths.len() != 1 {
+        bail!("daemon module listing takes exactly one daemon operand");
+    }
+    if daemon.module.is_some() && cli.paths.len() != 2 {
+        bail!("daemon pull requires one daemon source and one local destination");
+    }
+    if cli.list_only && daemon.module.is_some() {
+        bail!("daemon --list-only currently supports module listing only; use a destination for pull dry runs");
+    }
+    if cli.inplace && cli.partial_dir.is_some() {
+        bail!("--inplace and --partial-dir cannot both control the same daemon write path");
+    }
+    if cli.metadata_policy != CliMetadataPolicy::Portable {
+        bail!("daemon client MVP currently supports only --metadata-policy=portable");
+    }
+    if cli.preserve_owner
+        || cli.preserve_group
+        || cli.acls
+        || cli.xattrs
+        || cli.fake_super
+        || cli.vss
+    {
+        bail!(
+            "daemon execution does not yet support owner/group, ACL, xattr, fake-super, or VSS metadata options; run with --plan for diagnostics"
+        );
     }
 
+    Ok(())
+}
+
+fn is_daemon_operand_syntax(operand: &str) -> bool {
+    operand.starts_with("rsync://") || operand.contains("::")
+}
+
+fn is_remote_shell_operand(operand: &str) -> bool {
+    if is_daemon_operand_syntax(operand) {
+        return false;
+    }
     matches!(RemoteShellOperand::parse(operand), Ok(Some(_)) | Err(_))
 }
 
@@ -4747,9 +5073,9 @@ mod tests {
 
         let err = ensure_remote_execution_options_supported(&cli, &plan).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("remote-shell push does not yet support --delete together with --files-from"));
+        assert!(err.to_string().contains(
+            "remote-shell push does not yet support --delete together with --files-from"
+        ));
     }
 
     #[test]
@@ -5240,10 +5566,14 @@ mod tests {
             let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
 
             assert!(
-                err.to_string().contains("destination path preflight failed"),
+                err.to_string()
+                    .contains("destination path preflight failed"),
                 "{wire_path}: {err:#}"
             );
-            assert!(!dest.exists(), "{wire_path}: destination directory was created");
+            assert!(
+                !dest.exists(),
+                "{wire_path}: destination directory was created"
+            );
             assert!(
                 fs::read_dir(&root).unwrap().next().is_none(),
                 "{wire_path}: rejected path left files under test root"
@@ -5407,7 +5737,8 @@ mod tests {
         ];
         let files_from = vec![PathBuf::from("dir/keep.txt")];
 
-        let selected = selected_remote_entry_indexes(&entries, &RuleSet::empty(), Some(&files_from));
+        let selected =
+            selected_remote_entry_indexes(&entries, &RuleSet::empty(), Some(&files_from));
         let selected_paths: Vec<_> = entries
             .iter()
             .enumerate()
@@ -5417,21 +5748,148 @@ mod tests {
 
         assert_eq!(
             selected_paths,
-            vec![
-                Path::new("."),
-                Path::new("dir"),
-                Path::new("dir/keep.txt")
-            ]
+            vec![Path::new("."), Path::new("dir"), Path::new("dir/keep.txt")]
         );
     }
 
     #[test]
-    fn daemon_operands_are_reported_as_future_phase_without_remote_shell_plan() {
-        let output = parse_and_render(["rsync-win", "--plan", "src", "host::module"]);
+    fn daemon_operands_route_to_daemon_plan_without_remote_shell_argv() {
+        let output = parse_and_render(["rsync-win", "--plan", "host::module/path", "dest"]);
 
-        assert!(output.contains("[error] E_REMOTE_OPERAND"));
-        assert!(output.contains("daemon client mode"));
+        assert!(output.contains("daemon mode: client"));
+        assert!(output.contains("daemon endpoint: host:873"));
+        assert!(output.contains("daemon direction: download (daemon -> local)"));
+        assert!(output.contains("daemon module: module"));
+        assert!(output.contains("daemon path: path"));
+        assert!(!output.contains("E_REMOTE_OPERAND"));
         assert!(!output.contains("remote ssh argv:"));
+    }
+
+    #[test]
+    fn daemon_url_operands_route_to_daemon_plan() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--plan",
+            "rsync://user@example.test:8873/pub/dir",
+            "dest",
+        ]);
+
+        assert!(output.contains("daemon mode: client"));
+        assert!(output.contains("daemon endpoint: example.test:8873"));
+        assert!(output.contains("daemon module: pub"));
+        assert!(output.contains("daemon path: dir"));
+        assert!(!output.contains("remote ssh argv:"));
+    }
+
+    #[test]
+    fn daemon_module_listing_plan_uses_daemon_mode() {
+        let output = parse_and_render(["rsync-win", "--plan", "--list-only", "host::"]);
+
+        assert!(output.contains("daemon mode: client"));
+        assert!(output.contains("daemon module: <list>"));
+        assert!(!output.contains("remote ssh argv:"));
+    }
+
+    #[test]
+    fn windows_drive_operands_are_not_daemon_operands() {
+        let output = parse_and_render(["rsync-win", "--plan", r"C:\src", "dest"]);
+
+        assert!(!output.contains("daemon mode: client"));
+        assert!(!output.contains("remote ssh argv:"));
+    }
+
+    #[test]
+    fn daemon_password_file_does_not_render_secret_or_path() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--plan",
+            "--password-file",
+            "secret-password.txt",
+            "user@host::module/path",
+            "dest",
+        ]);
+
+        assert!(output.contains("daemon auth: password-file configured"));
+        assert!(!output.contains("secret-password"));
+        assert!(!output.contains("remote ssh argv:"));
+    }
+
+    #[test]
+    fn daemon_module_listing_executes_over_in_memory_transport() {
+        let cli = Cli::parse_from(["rsync-win", "--list-only", "host::"]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(
+            b"@RSYNCD: 31.0\nhello\npublic\tPublic files\n@RSYNCD: EXIT\n".to_vec(),
+        );
+
+        let output = execute_daemon_sync_with_transport(&cli, &plan, &mut transport).unwrap();
+
+        assert!(output.contains("rsync-win daemon module list"));
+        assert!(output.contains("endpoint: host:873"));
+        assert!(output.contains("- hello"));
+        assert!(output.contains("- public\tPublic files"));
+        assert_eq!(transport.written, b"@RSYNCD: 31.0 md5 md4\n#list\n");
+    }
+
+    #[test]
+    fn daemon_no_auth_pull_uses_remote_pull_receive_path() {
+        let root = unique_temp_dir("rsync-cli-daemon-pull");
+        let dest = root.join("dest");
+        let cli = Cli::parse_from([
+            "rsync-win",
+            "--dry-run",
+            "host::module/file.txt",
+            &dest.to_string_lossy(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut input = b"@RSYNCD: 31.0\n@RSYNCD: OK\n".to_vec();
+        input.extend_from_slice(&remote_pull_dry_run_input());
+        let mut transport = TestTransport::with_input(input);
+
+        let output = execute_daemon_sync_with_transport(&cli, &plan, &mut transport).unwrap();
+
+        assert!(output.contains("rsync-win daemon pull"));
+        assert!(output.contains("source: host::module/file.txt"));
+        assert!(output.contains("dry run: true"));
+        assert!(transport
+            .written
+            .starts_with(b"@RSYNCD: 31.0 md5 md4\nmodule\n--server\0--sender\0"));
+        assert!(transport
+            .written
+            .windows(b"module/file.txt\0".len())
+            .any(|window| window == b"module/file.txt\0"));
+        if root.exists() {
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn daemon_password_file_auth_hashes_without_logging_secret() {
+        let root = unique_temp_dir("rsync-cli-daemon-auth");
+        fs::create_dir_all(&root).unwrap();
+        let password_file = root.join("pw.txt");
+        let dest = root.join("dest");
+        fs::write(&password_file, "secret\n").unwrap();
+        let cli = Cli::parse_from([
+            "rsync-win",
+            "--dry-run",
+            "--password-file",
+            &password_file.to_string_lossy(),
+            "alice@host::module/file.txt",
+            &dest.to_string_lossy(),
+        ]);
+        let plan = TransferPlan::from_cli(&cli);
+        let mut input = b"@RSYNCD: 31.0\n@RSYNCD: AUTHREQD challenge\n@RSYNCD: OK\n".to_vec();
+        input.extend_from_slice(&remote_pull_dry_run_input());
+        let mut transport = TestTransport::with_input(input);
+
+        let output = execute_daemon_sync_with_transport(&cli, &plan, &mut transport).unwrap();
+        let written = String::from_utf8_lossy(&transport.written);
+
+        assert!(output.contains("rsync-win daemon pull"));
+        assert!(written.contains("alice "));
+        assert!(!written.contains("secret"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
