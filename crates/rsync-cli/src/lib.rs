@@ -5286,6 +5286,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_pull_files_from_retains_needed_parent_dirs_only() {
+        let entries = vec![
+            test_remote_entry(".", WireFileType::Directory),
+            test_remote_entry("dir", WireFileType::Directory),
+            test_remote_entry("dir/keep.txt", WireFileType::File),
+            test_remote_entry("dir/drop.txt", WireFileType::File),
+            test_remote_entry("other", WireFileType::Directory),
+            test_remote_entry("other/file.txt", WireFileType::File),
+        ];
+        let files_from = vec![PathBuf::from("dir/keep.txt")];
+
+        let selected = selected_remote_entry_indexes(&entries, &RuleSet::empty(), Some(&files_from));
+        let selected_paths: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| selected.contains(index))
+            .map(|(_, entry)| entry.path.as_path())
+            .collect();
+
+        assert_eq!(
+            selected_paths,
+            vec![
+                Path::new("."),
+                Path::new("dir"),
+                Path::new("dir/keep.txt")
+            ]
+        );
+    }
+
+    #[test]
     fn daemon_operands_are_reported_as_future_phase_without_remote_shell_plan() {
         let output = parse_and_render(["rsync-win", "--plan", "src", "host::module"]);
 

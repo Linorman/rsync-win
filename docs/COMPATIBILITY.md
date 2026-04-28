@@ -29,6 +29,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Local file data | Local copy, append, checksum comparison, and prefix comparison use bounded streaming IO. |
 | Remote whole-file tokens | Upload and download literal token IO streams through fixed-size buffers and checksums received data before finalizing. |
 | Remote file-list paths | Remote pull validates all received file-list paths before filtering or writing, rejecting parent escapes, absolute paths, reserved Windows names, invalid characters, trailing dots/spaces, and case/normalization collisions. |
+| Remote pull selection | Filters and `--files-from` are applied locally after receiving the remote sender file-list. Remote push routes include/exclude/filter rules to the remote receiver for delete protection; `--files-from` is not routed to the receiver yet. |
 | Remote token lengths | Remote pull rejects literal token streams that exceed or undershoot the advertised file-list length and removes temporary receive files on error. |
 | File-list size | Remote file-list readers enforce entry-count and path-length limits. Full incremental recursion is still future work. |
 | Multiplexing | Data frames are streamed; remote error messages are surfaced; unsupported multiplex tags are rejected. |
