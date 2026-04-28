@@ -5,7 +5,7 @@
 
 `rsync-win` is a native Windows rsync-style command line application written in Rust. It aims to provide useful local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
 
-This is an early development release. Version `v0.1.5` maps to Cargo package version `0.1.5` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, POSIX metadata request reporting, and an NTFS-native sidecar prototype.
+This is an early development release. Version `v0.1.5` maps to Cargo package version `0.1.5` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, POSIX metadata request reporting, and a narrow NTFS-native sidecar restore path.
 
 ## Status
 
@@ -21,12 +21,12 @@ This is an early development release. Version `v0.1.5` maps to Cargo package ver
 | Daemon mode | Experimental client MVP for module listing, no-auth ordinary-file pull, and `--password-file` auth over `host::module/path` or `rsync://host/module/path`. Daemon push is not implemented. |
 | Logging | Default output is a concise summary with file counts, byte counts, and change totals; `-v` prints per-file transfer progress and `-vv` expands detailed actions. |
 | POSIX metadata | `--metadata-policy=portable\|posix\|ntfs-native`, `-p/-o/-g`, `--executability`, numeric `--chmod`, `--acls`, `--xattrs`, `--fake-super`, and `--omit-link-times` are parsed and reported. `--executability` and supported `--chmod` forms affect peer mode bits for remote uploads, not NTFS execute enforcement. Unsupported pieces are degraded/rejected explicitly. |
-| Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request reporting are captured or reported through an NTFS sidecar prototype. Restore is not implemented. |
+| Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request reporting are captured or reported through a parseable NTFS sidecar. Local Windows syncs restore the tested readonly/hidden/archive/system attribute subset and copy named ADS payloads when `--metadata-policy=ntfs-native` is explicit. |
 | Release hardening | Remote pull rejects path escapes and corrupt literal lengths, release packaging is scripted, and a small local-sync benchmark is available. |
 
 See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the current peer, metadata, hardening, and release compatibility matrix.
 
-Known not implemented in this development build: daemon push, VSS snapshot reads, NTFS metadata restore, ADS payload copy, and memory-bounded incremental recursion. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport.
+Known not implemented in this development build: daemon push, VSS snapshot reads, NTFS security descriptor restore, sparse range preservation, arbitrary reparse restore, and memory-bounded incremental recursion. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport.
 
 ## Install
 
@@ -107,7 +107,7 @@ Preview POSIX metadata compatibility:
 rsync-win --plan --metadata-policy posix -p --executability --acls --xattrs --fake-super .\source .\dest
 ```
 
-Preview NTFS-native sidecar mode and VSS diagnostics:
+Run NTFS-native sidecar mode and preview VSS diagnostics:
 
 ```powershell
 rsync-win --plan --metadata-policy ntfs-native --vss .\source .\dest

@@ -1,12 +1,13 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rsync_fs::{default_permissions, FileType, PortableMetadata};
 
-use crate::security::{capture_security_descriptor_summary, SecurityDescriptorSummary};
-use crate::streams::{enumerate_alternate_data_streams, AlternateDataStream};
-use crate::vss::{vss_snapshot_status, VssSnapshotStatus};
+use crate::security::capture_security_descriptor_summary;
+use crate::sidecar::NtfsNativeSidecar;
+use crate::streams::enumerate_alternate_data_streams;
+use crate::vss::vss_snapshot_status;
 
 #[cfg(windows)]
 use crate::links::{FILE_ATTRIBUTE_REPARSE_POINT, IO_REPARSE_TAG_SYMLINK};
@@ -29,56 +30,23 @@ struct PlatformFileIdentity {
     link_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NtfsNativeSidecar {
-    pub path: PathBuf,
-    pub file_type: FileType,
-    pub len: u64,
-    pub modified_unix_nanos: Option<i128>,
-    pub creation_time_unix_nanos: Option<i128>,
-    pub attributes: Option<u32>,
-    pub sparse_file: bool,
-    pub reparse_tag: Option<u32>,
-    pub file_id: Option<u64>,
-    pub volume_serial: Option<u32>,
-    pub link_count: Option<u64>,
-    pub security: SecurityDescriptorSummary,
-    pub streams: Vec<AlternateDataStream>,
-    pub vss: VssSnapshotStatus,
-}
-
-impl NtfsNativeSidecar {
-    pub fn manifest(&self) -> String {
-        let mut output = String::new();
-        output.push_str("rsync-win ntfs-native sidecar v1\n");
-        output.push_str(&format!("path={}\n", self.path.display()));
-        output.push_str(&format!("file_type={:?}\n", self.file_type));
-        output.push_str(&format!("len={}\n", self.len));
-        output.push_str(&format!("modified={:?}\n", self.modified_unix_nanos));
-        output.push_str(&format!(
-            "creation_time={:?}\n",
-            self.creation_time_unix_nanos
-        ));
-        output.push_str(&format!("attributes={:?}\n", self.attributes));
-        output.push_str(&format!("sparse_file={}\n", self.sparse_file));
-        output.push_str(&format!("reparse_tag={:?}\n", self.reparse_tag));
-        output.push_str(&format!("file_id={:?}\n", self.file_id));
-        output.push_str(&format!("volume_serial={:?}\n", self.volume_serial));
-        output.push_str(&format!("link_count={:?}\n", self.link_count));
-        output.push_str(&format!("security_captured={}\n", self.security.captured));
-        output.push_str(&format!("security_len={:?}\n", self.security.byte_len));
-        output.push_str(&format!("security_hash={:?}\n", self.security.stable_hash));
-        output.push_str(&format!("streams={}\n", self.streams.len()));
-        for stream in &self.streams {
-            output.push_str(&format!("stream={},{}\n", stream.name, stream.size));
-        }
-        output.push_str(&format!("vss_requested={}\n", self.vss.requested));
-        output.push_str(&format!("vss_available={}\n", self.vss.available));
-        output
-    }
-}
-
 const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+pub const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+pub const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+pub const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0000_0004;
+pub const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+pub const SAFE_RESTORE_ATTRIBUTE_MASK: u32 = FILE_ATTRIBUTE_READONLY
+    | FILE_ATTRIBUTE_HIDDEN
+    | FILE_ATTRIBUTE_SYSTEM
+    | FILE_ATTRIBUTE_ARCHIVE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsAttributeRestore {
+    pub requested: Option<u32>,
+    pub applied_mask: u32,
+    pub degraded_mask: u32,
+    pub available: bool,
+}
 
 pub fn read_windows_metadata(path: &Path) -> std::io::Result<WindowsMetadata> {
     let metadata = fs::symlink_metadata(path)?;
@@ -143,6 +111,13 @@ pub fn capture_ntfs_native_sidecar(
     })
 }
 
+pub fn restore_safe_windows_attributes(
+    path: &Path,
+    attributes: Option<u32>,
+) -> std::io::Result<WindowsAttributeRestore> {
+    platform_restore_safe_windows_attributes(path, attributes)
+}
+
 #[cfg(windows)]
 fn platform_creation_time(metadata: &fs::Metadata) -> Option<SystemTime> {
     use std::os::windows::fs::MetadataExt;
@@ -165,6 +140,63 @@ fn platform_file_attributes(metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(not(windows))]
 fn platform_file_attributes(_metadata: &fs::Metadata) -> Option<u32> {
     None
+}
+
+#[cfg(windows)]
+fn platform_restore_safe_windows_attributes(
+    path: &Path,
+    attributes: Option<u32>,
+) -> std::io::Result<WindowsAttributeRestore> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, SetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+    };
+
+    let requested = attributes;
+    let Some(attributes) = attributes else {
+        return Ok(WindowsAttributeRestore {
+            requested,
+            applied_mask: 0,
+            degraded_mask: 0,
+            available: true,
+        });
+    };
+    let path = crate::path::to_long_path_safe(path);
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let current = unsafe { GetFileAttributesW(wide_path.as_ptr()) };
+    if current == INVALID_FILE_ATTRIBUTES {
+        return Err(std::io::Error::last_os_error());
+    }
+    let safe_bits = attributes & SAFE_RESTORE_ATTRIBUTE_MASK;
+    let next = (current & !SAFE_RESTORE_ATTRIBUTE_MASK) | safe_bits;
+    if unsafe { SetFileAttributesW(wide_path.as_ptr(), next) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(WindowsAttributeRestore {
+        requested,
+        applied_mask: safe_bits,
+        degraded_mask: attributes & !SAFE_RESTORE_ATTRIBUTE_MASK,
+        available: true,
+    })
+}
+
+#[cfg(not(windows))]
+fn platform_restore_safe_windows_attributes(
+    path: &Path,
+    attributes: Option<u32>,
+) -> std::io::Result<WindowsAttributeRestore> {
+    let _ = fs::metadata(path)?;
+    Ok(WindowsAttributeRestore {
+        requested: attributes,
+        applied_mask: 0,
+        degraded_mask: attributes.unwrap_or(0) & SAFE_RESTORE_ATTRIBUTE_MASK,
+        available: false,
+    })
 }
 
 #[cfg(windows)]
@@ -330,6 +362,34 @@ mod tests {
         assert!(sidecar.vss.requested);
         assert!(!sidecar.vss.available);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_attributes_restores_safe_attribute_subset() {
+        let root = unique_temp_dir("rsync-winfs-windows-attributes");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file.txt");
+        fs::write(&file, b"abc").unwrap();
+
+        let report = restore_safe_windows_attributes(
+            &file,
+            Some(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_SPARSE_FILE),
+        )
+        .unwrap();
+        let metadata = read_windows_metadata(&file).unwrap();
+
+        assert_eq!(
+            report.applied_mask,
+            FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE
+        );
+        assert_eq!(report.degraded_mask, FILE_ATTRIBUTE_SPARSE_FILE);
+        assert!(metadata
+            .attributes
+            .is_some_and(|attrs| attrs & FILE_ATTRIBUTE_READONLY != 0));
+
+        restore_safe_windows_attributes(&file, Some(FILE_ATTRIBUTE_ARCHIVE)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

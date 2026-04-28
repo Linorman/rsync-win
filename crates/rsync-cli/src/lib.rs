@@ -42,7 +42,10 @@ use rsync_transport::remote_shell::{
     spawn_ssh_remote_command, SshRemoteCommand,
 };
 use rsync_transport::tcp::TcpTransport;
-use rsync_winfs::{capture_ntfs_native_sidecar, to_long_path_safe, WindowsDriveKind};
+use rsync_winfs::{
+    capture_ntfs_native_sidecar, copy_alternate_data_streams, restore_safe_windows_attributes,
+    to_long_path_safe, WindowsDriveKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliMetadataPolicy {
@@ -1597,6 +1600,14 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
             "ntfs sidecars: planned {}, written {}\n",
             sidecars.planned, sidecars.written
         ));
+        output.push_str(&format!(
+            "ntfs attributes: applied {}, degraded {}\n",
+            sidecars.attributes_applied, sidecars.attributes_degraded
+        ));
+        output.push_str(&format!(
+            "ntfs streams: copied {}, degraded {}\n",
+            sidecars.streams_copied, sidecars.streams_degraded
+        ));
         output.push_str(&format!("ntfs sidecar root: {}\n", sidecars.root.display()));
     }
 
@@ -1615,6 +1626,10 @@ struct NtfsSidecarExecution {
     root: PathBuf,
     planned: usize,
     written: usize,
+    attributes_applied: usize,
+    attributes_degraded: usize,
+    streams_copied: usize,
+    streams_degraded: usize,
 }
 
 fn handle_ntfs_native_sidecars(
@@ -1634,14 +1649,52 @@ fn handle_ntfs_native_sidecars(
             root: sidecar_root,
             planned: capture_paths.len(),
             written: 0,
+            attributes_applied: 0,
+            attributes_degraded: 0,
+            streams_copied: 0,
+            streams_degraded: 0,
         }));
     }
 
     fs::create_dir_all(&sidecar_root)?;
     let mut written = 0;
+    let mut attributes_applied = 0;
+    let mut attributes_degraded = 0;
+    let mut streams_copied = 0;
+    let mut streams_degraded = 0;
     for source_path in &capture_paths {
         let sidecar = capture_ntfs_native_sidecar(source_path, plan.vss)
             .with_context(|| format!("capture NTFS metadata for {}", source_path.display()))?;
+        if let Some(target_path) = ntfs_destination_for_source(sources, dest, source_path) {
+            if target_path.exists() {
+                if sidecar.file_type == FileType::File {
+                    let report = copy_alternate_data_streams(source_path, &target_path)
+                        .with_context(|| {
+                            format!("copy alternate data streams to {}", target_path.display())
+                        })?;
+                    streams_copied += report.copied;
+                    if report.unavailable && !sidecar.streams.is_empty() {
+                        streams_degraded += sidecar.streams.len();
+                    }
+                }
+                let restore = restore_safe_windows_attributes(&target_path, sidecar.attributes)
+                    .with_context(|| {
+                        format!(
+                            "restore safe Windows attributes for {}",
+                            target_path.display()
+                        )
+                    })?;
+                if restore.applied_mask != 0 {
+                    attributes_applied += 1;
+                }
+                if restore.degraded_mask != 0 || !restore.available {
+                    attributes_degraded += 1;
+                }
+            } else if sidecar.attributes.is_some() {
+                attributes_degraded += 1;
+                streams_degraded += sidecar.streams.len();
+            }
+        }
         let relative = ntfs_sidecar_relative_name(sources, source_path);
         let manifest_path = sidecar_root.join(format!("{relative}.ntfs.meta"));
         fs::write(&manifest_path, sidecar.manifest())?;
@@ -1652,7 +1705,48 @@ fn handle_ntfs_native_sidecars(
         root: sidecar_root,
         planned: capture_paths.len(),
         written,
+        attributes_applied,
+        attributes_degraded,
+        streams_copied,
+        streams_degraded,
     }))
+}
+
+fn ntfs_destination_for_source(
+    sources: &[PathBuf],
+    dest: &Path,
+    source_path: &Path,
+) -> Option<PathBuf> {
+    if sources.len() == 1 {
+        let source = &sources[0];
+        let source_metadata = fs::metadata(source).ok()?;
+        if source_path == source {
+            if source_metadata.is_file()
+                && fs::metadata(dest)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false)
+            {
+                return source.file_name().map(|name| dest.join(name));
+            }
+            return Some(dest.to_path_buf());
+        }
+        return source_path
+            .strip_prefix(source)
+            .ok()
+            .map(|relative| dest.join(relative));
+    }
+
+    for source in sources {
+        if source_path == source {
+            return source.file_name().map(|name| dest.join(name));
+        }
+        if let Ok(relative) = source_path.strip_prefix(source) {
+            return source
+                .file_name()
+                .map(|name| dest.join(name).join(relative));
+        }
+    }
+    None
 }
 
 fn collect_ntfs_sidecar_paths(
@@ -6161,6 +6255,87 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn local_ntfs_native_sync_restores_safe_windows_attributes() {
+        let root = unique_temp_dir("rsync-cli-ntfs-attributes");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        fs::create_dir_all(&source).unwrap();
+        let source_file = source.join("file.txt");
+        fs::write(&source_file, b"hello").unwrap();
+        rsync_winfs::restore_safe_windows_attributes(
+            &source_file,
+            Some(rsync_winfs::FILE_ATTRIBUTE_READONLY | rsync_winfs::FILE_ATTRIBUTE_ARCHIVE),
+        )
+        .unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--metadata-policy".to_string(),
+            "ntfs-native".to_string(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let dest_file = dest.join("file.txt");
+        let dest_metadata = rsync_winfs::read_windows_metadata(&dest_file).unwrap();
+        assert!(dest_metadata
+            .attributes
+            .is_some_and(|attrs| { attrs & rsync_winfs::FILE_ATTRIBUTE_READONLY != 0 }));
+        assert!(output.contains("ntfs attributes: applied"));
+
+        rsync_winfs::restore_safe_windows_attributes(
+            &source_file,
+            Some(rsync_winfs::FILE_ATTRIBUTE_ARCHIVE),
+        )
+        .unwrap();
+        rsync_winfs::restore_safe_windows_attributes(
+            &dest_file,
+            Some(rsync_winfs::FILE_ATTRIBUTE_ARCHIVE),
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_ntfs_native_sync_copies_alternate_stream_payloads() {
+        let root = unique_temp_dir("rsync-cli-ntfs-streams");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        fs::create_dir_all(&source).unwrap();
+        let source_file = source.join("file.txt");
+        fs::write(&source_file, b"default").unwrap();
+        fs::write(
+            test_stream_data_path(&source_file, "Zone.Identifier"),
+            b"zone",
+        )
+        .unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--metadata-policy".to_string(),
+            "ntfs-native".to_string(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let dest_file = dest.join("file.txt");
+        assert_eq!(fs::read(&dest_file).unwrap(), b"default");
+        assert_eq!(
+            fs::read(test_stream_data_path(&dest_file, "Zone.Identifier")).unwrap(),
+            b"zone"
+        );
+        assert!(output.contains("ntfs streams: copied 1, degraded 0"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn local_executor_honors_files_from_records() {
         let root = unique_temp_dir("rsync-cli-files-from");
@@ -6407,6 +6582,13 @@ mod tests {
             },
             checksum: None,
         }
+    }
+
+    #[cfg(windows)]
+    fn test_stream_data_path(path: &Path, stream_name: &str) -> PathBuf {
+        let mut stream_path = to_long_path_safe(path).into_os_string();
+        stream_path.push(format!(":{stream_name}"));
+        PathBuf::from(stream_path)
     }
 
     fn remote_push_dry_run_input() -> Vec<u8> {

@@ -360,7 +360,7 @@ impl NtfsNativeMetadataRequest {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::AlternateDataStream,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native enumerates alternate data streams for sidecar reporting but does not copy stream payloads yet",
+                "metadata-policy=ntfs-native copies named alternate data stream payloads for local Windows syncs; default data streams remain ordinary file content and unsupported platforms report this as unavailable",
             ));
         }
         if self.creation_time {
@@ -374,7 +374,7 @@ impl NtfsNativeMetadataRequest {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::WindowsAttributes,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native captures Windows file attributes in sidecar metadata but does not restore all attributes yet",
+                "metadata-policy=ntfs-native restores the tested readonly/hidden/archive/system attribute subset and degrades unsupported attribute bits",
             ));
         }
         if self.sparse_files {
@@ -476,7 +476,7 @@ pub fn metadata_policy_degradations(policy: MetadataPolicy) -> Vec<MetadataDegra
             MetadataDegradation::new(
                 MetadataFeature::AlternateDataStream,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native requests alternate data stream preservation; stream enumeration is available but ADS payload copy is not wired into the local executor yet",
+                "metadata-policy=ntfs-native requests alternate data stream preservation; named ADS payload copy is available for local Windows syncs and unavailable elsewhere",
             ),
             MetadataDegradation::new(
                 MetadataFeature::CreationTime,
@@ -486,7 +486,7 @@ pub fn metadata_policy_degradations(policy: MetadataPolicy) -> Vec<MetadataDegra
             MetadataDegradation::new(
                 MetadataFeature::WindowsAttributes,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native requests Windows file attribute preservation; sidecar capture is available but restore is not wired into the local executor yet",
+                "metadata-policy=ntfs-native requests Windows file attribute preservation; the tested readonly/hidden/archive/system subset is restored while unsupported bits are degraded",
             ),
             MetadataDegradation::new(
                 MetadataFeature::SparseFile,

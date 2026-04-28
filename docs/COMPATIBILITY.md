@@ -19,8 +19,8 @@ This matrix describes the current development build behavior. It is intentionall
 | --- | --- | --- |
 | `portable` | Default | Copies ordinary files/directories, compares size, applies mtime where requested, and applies explicit delete/filter behavior in tested paths. |
 | `posix` | Reporting prototype with narrow remote mode mapping | POSIX permissions/executability requests are represented. `--chmod` accepts numeric `600`/`0644` and scoped `F600`/`D755` forms for remote upload mode bits only. `--executability` infers peer execute bits from Windows script/executable extensions; it does not enforce NTFS execute permissions. Owner, group, ACL, xattr, fake-super, and symlink mtime limitations are reported. POSIX ACL/xattr/fake-super storage is not implemented unless a future sidecar says so explicitly. |
-| `ntfs-native` | Capture-only sidecar prototype | Captures security descriptor summary, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Restore and stream payload copying are not implemented. |
-| VSS snapshot mode | Rejected with diagnostics | `--vss` is parsed and reported, but snapshot reads are not implemented. |
+| `ntfs-native` | Narrow local restore path | Writes a parseable sidecar with security descriptor summary, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Local Windows syncs restore the tested readonly/hidden/archive/system attribute subset and copy named alternate data stream payloads. Security descriptor restore, sparse range preservation, arbitrary reparse restore, and cross-platform NTFS restore are degraded. |
+| VSS snapshot mode | Rejected with diagnostics | `--vss` is parsed and reported, but snapshot reads are not implemented. See `docs/VSS-DESIGN.md` for the required source abstraction before any VSS calls are added. |
 
 ## Hardening Status
 
@@ -42,8 +42,8 @@ This matrix describes the current development build behavior. It is intentionall
 - Daemon push is not implemented.
 - Daemon auth is not transport encryption; `--password-file` only answers the rsync daemon challenge-response prompt.
 - VSS snapshot reads are not implemented.
-- NTFS metadata restore is not implemented.
-- Alternate data stream payload copying is not implemented.
+- NTFS security descriptor restore, sparse range preservation, and arbitrary reparse restore are not implemented.
+- Alternate data stream payload copying is implemented only for named streams in explicit `ntfs-native` local Windows syncs.
 - Full memory-bounded incremental recursion is not implemented.
 
 ## Recommended Smoke Tests
