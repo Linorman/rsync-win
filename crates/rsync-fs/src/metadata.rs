@@ -7,7 +7,15 @@ pub enum FileType {
     Directory,
     Symlink,
     Hardlink,
+    Device,
+    Special,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HardlinkId {
+    pub volume: u64,
+    pub file: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +25,8 @@ pub struct PortableMetadata {
     pub modified: Option<SystemTime>,
     pub mode: Option<u32>,
     pub symlink_target: Option<PathBuf>,
+    pub hardlink_id: Option<HardlinkId>,
+    pub hardlink_count: Option<u64>,
 }
 
 pub const POSIX_TYPE_REGULAR: u32 = 0o100000;
@@ -35,6 +45,8 @@ impl PortableMetadata {
             modified: None,
             mode: None,
             symlink_target: None,
+            hardlink_id: None,
+            hardlink_count: None,
         }
     }
 
@@ -45,6 +57,8 @@ impl PortableMetadata {
             modified: None,
             mode: None,
             symlink_target: None,
+            hardlink_id: None,
+            hardlink_count: None,
         }
     }
 
@@ -55,6 +69,32 @@ impl PortableMetadata {
             modified: None,
             mode: None,
             symlink_target: Some(target.into()),
+            hardlink_id: None,
+            hardlink_count: None,
+        }
+    }
+
+    pub fn device() -> Self {
+        Self {
+            file_type: FileType::Device,
+            len: 0,
+            modified: None,
+            mode: None,
+            symlink_target: None,
+            hardlink_id: None,
+            hardlink_count: None,
+        }
+    }
+
+    pub fn special() -> Self {
+        Self {
+            file_type: FileType::Special,
+            len: 0,
+            modified: None,
+            mode: None,
+            symlink_target: None,
+            hardlink_id: None,
+            hardlink_count: None,
         }
     }
 
@@ -90,7 +130,11 @@ pub fn posix_file_type_bits(file_type: FileType) -> u32 {
     match file_type {
         FileType::Directory => POSIX_TYPE_DIRECTORY,
         FileType::Symlink => POSIX_TYPE_SYMLINK,
-        FileType::File | FileType::Hardlink | FileType::Other => POSIX_TYPE_REGULAR,
+        FileType::File
+        | FileType::Hardlink
+        | FileType::Device
+        | FileType::Special
+        | FileType::Other => POSIX_TYPE_REGULAR,
     }
 }
 
@@ -98,7 +142,11 @@ pub fn default_permissions(file_type: FileType) -> u32 {
     match file_type {
         FileType::Directory => POSIX_DIRECTORY_DEFAULT_PERMS,
         FileType::Symlink => POSIX_SYMLINK_DEFAULT_PERMS,
-        FileType::File | FileType::Hardlink | FileType::Other => POSIX_FILE_DEFAULT_PERMS,
+        FileType::File
+        | FileType::Hardlink
+        | FileType::Device
+        | FileType::Special
+        | FileType::Other => POSIX_FILE_DEFAULT_PERMS,
     }
 }
 

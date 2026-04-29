@@ -30,3 +30,7 @@ path = "../../tests/interop/rsync_discovery.rs"
 [[test]]
 name = "daemon"
 path = "../../tests/interop/daemon.rs"
+
+[[test]]
+name = "options"
+path = "../../tests/compat/options.rs"

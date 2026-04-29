@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rsync_fs::{default_permissions, FileType, PortableMetadata};
+use rsync_fs::{default_permissions, FileType, HardlinkId, PortableMetadata};
 
 use crate::security::capture_security_descriptor_summary;
 use crate::sidecar::NtfsNativeSidecar;
@@ -71,6 +71,11 @@ pub fn read_windows_metadata(path: &Path) -> std::io::Result<WindowsMetadata> {
         } else {
             None
         },
+        hardlink_id: identity.map(|identity| HardlinkId {
+            volume: u64::from(identity.volume_serial),
+            file: identity.file_id,
+        }),
+        hardlink_count: identity.map(|identity| identity.link_count),
     };
 
     Ok(WindowsMetadata {

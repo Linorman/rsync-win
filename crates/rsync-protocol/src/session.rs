@@ -25,12 +25,21 @@ pub enum TransferDirection {
     Pull,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteDeleteMode {
+    None,
+    Before,
+    During,
+    Delay,
+    After,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteShellOptions {
     pub direction: TransferDirection,
     pub recursive: bool,
     pub preserve_times: bool,
-    pub delete: bool,
+    pub delete_mode: RemoteDeleteMode,
     pub dry_run: bool,
     pub whole_file: bool,
     pub verbosity: u8,
@@ -46,9 +55,18 @@ pub struct RemoteShellOptions {
     pub numeric_ids: bool,
     pub chmod: Option<String>,
     pub omit_link_times: bool,
+    pub preserve_links: bool,
     pub copy_links: bool,
+    pub copy_dirlinks: bool,
+    pub keep_dirlinks: bool,
     pub safe_links: bool,
     pub copy_unsafe_links: bool,
+    pub munge_links: bool,
+    pub hard_links: bool,
+    pub preserve_devices: bool,
+    pub preserve_specials: bool,
+    pub copy_devices: bool,
+    pub write_devices: bool,
     pub includes: Vec<String>,
     pub excludes: Vec<String>,
     pub filters: Vec<String>,
@@ -60,7 +78,7 @@ impl Default for RemoteShellOptions {
             direction: TransferDirection::Push,
             recursive: false,
             preserve_times: false,
-            delete: false,
+            delete_mode: RemoteDeleteMode::None,
             dry_run: true,
             whole_file: true,
             verbosity: 0,
@@ -76,9 +94,18 @@ impl Default for RemoteShellOptions {
             numeric_ids: false,
             chmod: None,
             omit_link_times: false,
+            preserve_links: false,
             copy_links: false,
+            copy_dirlinks: false,
+            keep_dirlinks: false,
             safe_links: false,
             copy_unsafe_links: false,
+            munge_links: false,
+            hard_links: false,
+            preserve_devices: false,
+            preserve_specials: false,
+            copy_devices: false,
+            write_devices: false,
             includes: Vec::new(),
             excludes: Vec::new(),
             filters: Vec::new(),
@@ -243,9 +270,7 @@ pub fn build_remote_shell_argv_for_paths(
     if options.preserve_times {
         argv.push("--times".to_string());
     }
-    if options.delete {
-        argv.push("--delete-before".to_string());
-    }
+    append_remote_delete_option(&mut argv, options.delete_mode);
     if matches!(options.direction, TransferDirection::Pull) && options.recursive {
         argv.push("--no-inc-recursive".to_string());
     }
@@ -280,9 +305,7 @@ pub fn build_remote_shell_protocol31_argv_for_paths(
     if matches!(options.direction, TransferDirection::Pull) {
         argv.push("--sender".to_string());
     }
-    if options.delete {
-        argv.push("--delete-before".to_string());
-    }
+    append_remote_delete_option(&mut argv, options.delete_mode);
     if matches!(options.direction, TransferDirection::Pull) && options.recursive {
         argv.push("--no-inc-recursive".to_string());
     }
@@ -328,6 +351,16 @@ fn append_remote_paths(argv: &mut Vec<String>, paths: &[&Path]) -> Result<(), Se
     Ok(())
 }
 
+fn append_remote_delete_option(argv: &mut Vec<String>, mode: RemoteDeleteMode) {
+    match mode {
+        RemoteDeleteMode::None => {}
+        RemoteDeleteMode::Before => argv.push("--delete-before".to_string()),
+        RemoteDeleteMode::During => argv.push("--delete-during".to_string()),
+        RemoteDeleteMode::Delay => argv.push("--delete-delay".to_string()),
+        RemoteDeleteMode::After => argv.push("--delete-after".to_string()),
+    }
+}
+
 fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShellOptions) {
     if options.checksum {
         argv.push("--checksum".to_string());
@@ -365,14 +398,41 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     if options.omit_link_times {
         argv.push("--omit-link-times".to_string());
     }
+    if options.preserve_links {
+        argv.push("--links".to_string());
+    }
     if options.copy_links {
         argv.push("--copy-links".to_string());
+    }
+    if options.copy_dirlinks {
+        argv.push("--copy-dirlinks".to_string());
+    }
+    if options.keep_dirlinks {
+        argv.push("--keep-dirlinks".to_string());
     }
     if options.safe_links {
         argv.push("--safe-links".to_string());
     }
     if options.copy_unsafe_links {
         argv.push("--copy-unsafe-links".to_string());
+    }
+    if options.munge_links {
+        argv.push("--munge-links".to_string());
+    }
+    if options.hard_links {
+        argv.push("--hard-links".to_string());
+    }
+    if options.preserve_devices {
+        argv.push("--devices".to_string());
+    }
+    if options.preserve_specials {
+        argv.push("--specials".to_string());
+    }
+    if options.copy_devices {
+        argv.push("--copy-devices".to_string());
+    }
+    if options.write_devices {
+        argv.push("--write-devices".to_string());
     }
     for pattern in &options.includes {
         argv.push(format!("--include={pattern}"));
@@ -784,7 +844,7 @@ mod tests {
             &RemoteShellOptions {
                 recursive: true,
                 preserve_times: true,
-                delete: true,
+                delete_mode: RemoteDeleteMode::Before,
                 dry_run: true,
                 whole_file: true,
                 verbosity: 2,
@@ -832,7 +892,7 @@ mod tests {
             &RemoteShellOptions {
                 recursive: true,
                 preserve_times: true,
-                delete: true,
+                delete_mode: RemoteDeleteMode::Before,
                 dry_run: true,
                 whole_file: true,
                 verbosity: 1,
@@ -859,7 +919,7 @@ mod tests {
     fn builds_push_server_argv_with_receiver_filter_args() {
         let options = RemoteShellOptions {
             recursive: true,
-            delete: true,
+            delete_mode: RemoteDeleteMode::Before,
             includes: vec!["src/**".to_string()],
             excludes: vec!["*.tmp".to_string()],
             filters: vec!["protect *.bak".to_string()],
@@ -874,6 +934,39 @@ mod tests {
             assert!(argv.contains(&"--include=src/**".to_string()));
             assert!(argv.contains(&"--exclude=*.tmp".to_string()));
             assert!(argv.contains(&"--filter=protect *.bak".to_string()));
+        }
+    }
+
+    #[test]
+    fn builds_server_argv_with_link_and_special_file_options() {
+        let options = RemoteShellOptions {
+            recursive: true,
+            preserve_links: true,
+            copy_dirlinks: true,
+            keep_dirlinks: true,
+            munge_links: true,
+            hard_links: true,
+            preserve_devices: true,
+            preserve_specials: true,
+            copy_devices: true,
+            write_devices: true,
+            ..RemoteShellOptions::default()
+        };
+
+        let argv = build_remote_shell_protocol31_argv(&options, Path::new("dest")).unwrap();
+
+        for expected in [
+            "--links",
+            "--copy-dirlinks",
+            "--keep-dirlinks",
+            "--munge-links",
+            "--hard-links",
+            "--devices",
+            "--specials",
+            "--copy-devices",
+            "--write-devices",
+        ] {
+            assert!(argv.contains(&expected.to_string()), "{expected}");
         }
     }
 

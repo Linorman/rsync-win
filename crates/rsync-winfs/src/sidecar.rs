@@ -208,6 +208,8 @@ fn file_type_label(file_type: FileType) -> &'static str {
         FileType::Directory => "Directory",
         FileType::Symlink => "Symlink",
         FileType::Hardlink => "Hardlink",
+        FileType::Device => "Device",
+        FileType::Special => "Special",
         FileType::Other => "Other",
     }
 }
@@ -218,6 +220,8 @@ fn parse_file_type(value: &str) -> Result<FileType, SidecarParseError> {
         "Directory" => Ok(FileType::Directory),
         "Symlink" => Ok(FileType::Symlink),
         "Hardlink" => Ok(FileType::Hardlink),
+        "Device" => Ok(FileType::Device),
+        "Special" => Ok(FileType::Special),
         "Other" => Ok(FileType::Other),
         _ => Err(invalid("file_type", value)),
     }

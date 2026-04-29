@@ -6,14 +6,28 @@ use crate::matcher::{glob_matches, normalize_filter_path, EntryKind};
 pub enum RuleAction {
     Include,
     Exclude,
+    Hide,
+    Show,
     Protect,
     Risk,
+    ClearList,
+    Merge,
+    DirMerge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleSide {
+    Sender,
+    Receiver,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     action: RuleAction,
-    pattern: Pattern,
+    pattern: Option<Pattern>,
+    sender_side: bool,
+    receiver_side: bool,
+    perishable: bool,
 }
 
 impl Rule {
@@ -34,9 +48,13 @@ impl Rule {
     }
 
     pub fn new(action: RuleAction, pattern: impl Into<String>) -> Result<Self, ParseRuleError> {
+        let (sender_side, receiver_side) = default_sides(action);
         Ok(Self {
             action,
-            pattern: Pattern::parse(pattern.into())?,
+            pattern: Some(Pattern::parse(pattern.into())?),
+            sender_side,
+            receiver_side,
+            perishable: false,
         })
     }
 
@@ -46,32 +64,40 @@ impl Rule {
             return Err(ParseRuleError::EmptyRule);
         }
 
-        if let Some(pattern) = strip_long_rule(trimmed, "include") {
-            return Self::include(pattern);
+        if trimmed == "!" {
+            return Ok(Self::without_pattern(
+                RuleAction::ClearList,
+                ModifierState::default(),
+            ));
         }
 
-        if let Some(pattern) = strip_long_rule(trimmed, "exclude") {
-            return Self::exclude(pattern);
+        let (head, pattern) = split_rule_head(trimmed)?;
+        let (action, modifiers) = parse_rule_head(head)?;
+        if action == RuleAction::ClearList {
+            return Ok(Self::without_pattern(action, modifiers));
         }
+        Self::with_modifiers(action, pattern, modifiers)
+    }
 
-        if let Some(pattern) = strip_long_rule(trimmed, "protect") {
-            return Self::protect(pattern);
+    pub fn parse_filter_file(
+        input: &[u8],
+        from0: bool,
+        default_action: RuleAction,
+    ) -> Result<Vec<Self>, ParseRuleError> {
+        let records = parse_filter_records(input, from0)?;
+        let mut rules = Vec::new();
+        for record in records {
+            let Some(record) = normalize_filter_record(&record) else {
+                continue;
+            };
+            let rule = if starts_with_explicit_rule(&record) {
+                Self::parse_filter(&record)?
+            } else {
+                Self::new(default_action, record)?
+            };
+            rules.push(rule);
         }
-
-        if let Some(pattern) = strip_long_rule(trimmed, "risk") {
-            return Self::risk(pattern);
-        }
-
-        let mut chars = trimmed.chars();
-        let marker = chars.next().ok_or(ParseRuleError::EmptyRule)?;
-        let pattern = chars.as_str().trim();
-        match marker {
-            '+' => Self::include(pattern),
-            '-' => Self::exclude(pattern),
-            'P' => Self::protect(pattern),
-            'R' => Self::risk(pattern),
-            _ => Err(ParseRuleError::UnknownRule(trimmed.to_owned())),
-        }
+        Ok(rules)
     }
 
     pub fn action(&self) -> RuleAction {
@@ -79,11 +105,68 @@ impl Rule {
     }
 
     pub fn pattern(&self) -> &Pattern {
-        &self.pattern
+        self.pattern
+            .as_ref()
+            .expect("filter rule action does not carry a pattern")
+    }
+
+    pub fn is_sender_side(&self) -> bool {
+        self.sender_side
+    }
+
+    pub fn is_receiver_side(&self) -> bool {
+        self.receiver_side
+    }
+
+    pub fn is_perishable(&self) -> bool {
+        self.perishable
+    }
+
+    pub fn applies_to(&self, side: RuleSide) -> bool {
+        match side {
+            RuleSide::Sender => self.sender_side,
+            RuleSide::Receiver => self.receiver_side,
+        }
     }
 
     pub fn matches(&self, path: &str, kind: EntryKind) -> bool {
-        self.pattern.matches(path, kind)
+        self.pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.matches(path, kind))
+    }
+
+    fn with_modifiers(
+        action: RuleAction,
+        pattern: &str,
+        modifiers: ModifierState,
+    ) -> Result<Self, ParseRuleError> {
+        let (mut sender_side, mut receiver_side) = default_sides(action);
+        if modifiers.sender_side || modifiers.receiver_side {
+            sender_side = modifiers.sender_side;
+            receiver_side = modifiers.receiver_side;
+        }
+        Ok(Self {
+            action,
+            pattern: Some(Pattern::parse(pattern.to_owned())?),
+            sender_side,
+            receiver_side,
+            perishable: modifiers.perishable,
+        })
+    }
+
+    fn without_pattern(action: RuleAction, modifiers: ModifierState) -> Self {
+        let (mut sender_side, mut receiver_side) = default_sides(action);
+        if modifiers.sender_side || modifiers.receiver_side {
+            sender_side = modifiers.sender_side;
+            receiver_side = modifiers.receiver_side;
+        }
+        Self {
+            action,
+            pattern: None,
+            sender_side,
+            receiver_side,
+            perishable: modifiers.perishable,
+        }
     }
 }
 
@@ -94,6 +177,7 @@ pub struct Pattern {
     anchored: bool,
     directory_only: bool,
     has_path_separator: bool,
+    match_directory_prefix: Option<String>,
 }
 
 impl Pattern {
@@ -122,12 +206,14 @@ impl Pattern {
             return Err(ParseRuleError::EmptyPattern);
         }
 
+        let match_directory_prefix = body.strip_suffix("/***").map(str::to_owned);
         Ok(Self {
             raw,
             has_path_separator: body.contains('/'),
             body,
             anchored,
             directory_only,
+            match_directory_prefix,
         })
     }
 
@@ -161,6 +247,15 @@ impl Pattern {
             return false;
         }
 
+        if kind == EntryKind::Directory
+            && self
+                .match_directory_prefix
+                .as_ref()
+                .is_some_and(|prefix| path == *prefix)
+        {
+            return true;
+        }
+
         if self.anchored {
             return glob_matches(&self.body, &path);
         }
@@ -181,6 +276,9 @@ pub enum ParseRuleError {
     MissingPattern,
     EmptyPattern,
     UnknownRule(String),
+    InvalidModifier(char),
+    InvalidUtf8 { offset: usize },
+    UnexpectedNul { offset: usize },
 }
 
 impl fmt::Display for ParseRuleError {
@@ -192,22 +290,170 @@ impl fmt::Display for ParseRuleError {
             ParseRuleError::UnknownRule(rule) => {
                 write!(f, "unknown filter rule syntax `{rule}`")
             }
+            ParseRuleError::InvalidModifier(modifier) => {
+                write!(f, "invalid filter rule modifier `{modifier}`")
+            }
+            ParseRuleError::InvalidUtf8 { offset } => {
+                write!(f, "filter file input is not valid UTF-8 at byte {offset}")
+            }
+            ParseRuleError::UnexpectedNul { offset } => {
+                write!(
+                    f,
+                    "filter file input contains NUL at byte {offset}; use --from0"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for ParseRuleError {}
 
-fn strip_long_rule<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
-    let rest = input.strip_prefix(keyword)?;
-    if rest.is_empty() {
-        return Some("");
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ModifierState {
+    sender_side: bool,
+    receiver_side: bool,
+    perishable: bool,
+}
+
+fn default_sides(action: RuleAction) -> (bool, bool) {
+    match action {
+        RuleAction::Hide | RuleAction::Show => (true, false),
+        RuleAction::Protect | RuleAction::Risk => (false, true),
+        RuleAction::Include
+        | RuleAction::Exclude
+        | RuleAction::ClearList
+        | RuleAction::Merge
+        | RuleAction::DirMerge => (true, true),
+    }
+}
+
+fn split_rule_head(input: &str) -> Result<(&str, &str), ParseRuleError> {
+    let Some((head, pattern)) = input.split_once(char::is_whitespace) else {
+        return Err(ParseRuleError::MissingPattern);
+    };
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return Err(ParseRuleError::MissingPattern);
+    }
+    Ok((head, pattern))
+}
+
+fn parse_rule_head(head: &str) -> Result<(RuleAction, ModifierState), ParseRuleError> {
+    let mut chars = head.chars();
+    let first = chars.next().ok_or(ParseRuleError::EmptyRule)?;
+    if let Some(action) = short_action(first) {
+        let modifiers = chars.as_str().trim_start_matches(',');
+        return Ok((action, parse_modifiers(modifiers)?));
     }
 
-    rest.chars()
-        .next()
-        .filter(|ch| ch.is_ascii_whitespace())
-        .map(|_| rest.trim())
+    let (keyword, modifiers) = head.split_once(',').unwrap_or((head, ""));
+    let action =
+        long_action(keyword).ok_or_else(|| ParseRuleError::UnknownRule(head.to_owned()))?;
+    Ok((action, parse_modifiers(modifiers)?))
+}
+
+fn short_action(marker: char) -> Option<RuleAction> {
+    match marker {
+        '+' => Some(RuleAction::Include),
+        '-' => Some(RuleAction::Exclude),
+        'H' => Some(RuleAction::Hide),
+        'S' => Some(RuleAction::Show),
+        'P' => Some(RuleAction::Protect),
+        'R' => Some(RuleAction::Risk),
+        '!' => Some(RuleAction::ClearList),
+        '.' => Some(RuleAction::Merge),
+        ':' => Some(RuleAction::DirMerge),
+        _ => None,
+    }
+}
+
+fn long_action(keyword: &str) -> Option<RuleAction> {
+    match keyword {
+        "include" => Some(RuleAction::Include),
+        "exclude" => Some(RuleAction::Exclude),
+        "hide" => Some(RuleAction::Hide),
+        "show" => Some(RuleAction::Show),
+        "protect" => Some(RuleAction::Protect),
+        "risk" => Some(RuleAction::Risk),
+        "clear" | "clear-list" => Some(RuleAction::ClearList),
+        "merge" => Some(RuleAction::Merge),
+        "dir-merge" => Some(RuleAction::DirMerge),
+        _ => None,
+    }
+}
+
+fn parse_modifiers(input: &str) -> Result<ModifierState, ParseRuleError> {
+    let mut modifiers = ModifierState::default();
+    for ch in input.chars().filter(|ch| *ch != ',') {
+        match ch {
+            's' => modifiers.sender_side = true,
+            'r' => modifiers.receiver_side = true,
+            'p' => modifiers.perishable = true,
+            'e' | 'n' | 'w' | 'x' | '-' | '+' | '!' => {}
+            other => return Err(ParseRuleError::InvalidModifier(other)),
+        }
+    }
+    Ok(modifiers)
+}
+
+fn parse_filter_records(input: &[u8], from0: bool) -> Result<Vec<String>, ParseRuleError> {
+    if from0 {
+        let mut records = Vec::new();
+        let mut offset = 0;
+        for record in input.split(|byte| *byte == 0) {
+            if !record.is_empty() {
+                let text =
+                    std::str::from_utf8(record).map_err(|source| ParseRuleError::InvalidUtf8 {
+                        offset: offset + source.valid_up_to(),
+                    })?;
+                records.push(text.to_owned());
+            }
+            offset += record.len() + 1;
+        }
+        return Ok(records);
+    }
+
+    if let Some(offset) = input.iter().position(|byte| *byte == 0) {
+        return Err(ParseRuleError::UnexpectedNul { offset });
+    }
+    let text = std::str::from_utf8(input).map_err(|source| ParseRuleError::InvalidUtf8 {
+        offset: source.valid_up_to(),
+    })?;
+    Ok(text
+        .split('\n')
+        .map(|record| record.strip_suffix('\r').unwrap_or(record).to_owned())
+        .collect())
+}
+
+fn normalize_filter_record(record: &str) -> Option<String> {
+    let trimmed = record.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix("\\#") {
+        return Some(format!("#{stripped}"));
+    }
+    if let Some(stripped) = trimmed.strip_prefix("\\ ") {
+        return Some(format!(" {stripped}"));
+    }
+    Some(trimmed.to_owned())
+}
+
+fn starts_with_explicit_rule(record: &str) -> bool {
+    let Some(first) = record.chars().next() else {
+        return false;
+    };
+    short_action(first).is_some()
+        || record
+            .split_once(char::is_whitespace)
+            .and_then(|(head, _)| {
+                head.split_once(',')
+                    .map(|(keyword, _)| keyword)
+                    .or(Some(head))
+            })
+            .and_then(long_action)
+            .is_some()
 }
 
 fn normalize_candidate_path(path: &str) -> String {
@@ -307,5 +553,57 @@ mod tests {
         assert!(rule.matches("foo/bar/lib.rs", EntryKind::File));
         assert!(rule.matches("nested/foo/bar/lib.rs", EntryKind::File));
         assert!(!rule.matches("foo/bar/baz/lib.rs", EntryKind::File));
+    }
+
+    #[test]
+    fn parses_full_filter_rule_actions_and_modifiers() {
+        let hide = Rule::parse_filter("hide,s *.obj").unwrap();
+        let show = Rule::parse_filter("show,r public/***").unwrap();
+        let protect = Rule::parse_filter("Pp *.bak").unwrap();
+        let risk = Rule::parse_filter("Rr scratch/**").unwrap();
+        let clear = Rule::parse_filter("!").unwrap();
+        let merge = Rule::parse_filter(". .rsync-filter").unwrap();
+        let dir_merge = Rule::parse_filter(":e .rules").unwrap();
+
+        assert_eq!(hide.action(), RuleAction::Hide);
+        assert!(hide.is_sender_side());
+        assert!(!hide.is_receiver_side());
+        assert_eq!(show.action(), RuleAction::Show);
+        assert!(!show.is_sender_side());
+        assert!(show.is_receiver_side());
+        assert_eq!(protect.action(), RuleAction::Protect);
+        assert!(protect.is_perishable());
+        assert_eq!(risk.action(), RuleAction::Risk);
+        assert_eq!(clear.action(), RuleAction::ClearList);
+        assert_eq!(merge.action(), RuleAction::Merge);
+        assert_eq!(merge.pattern().body(), ".rsync-filter");
+        assert_eq!(dir_merge.action(), RuleAction::DirMerge);
+        assert!(dir_merge.matches("nested/.rules", EntryKind::File));
+    }
+
+    #[test]
+    fn parses_filter_file_records_with_comments_escaping_and_from0() {
+        let newline = Rule::parse_filter_file(
+            b"
+# comment
++ keep/**
+- *.tmp
+\\#literal
+",
+            false,
+            RuleAction::Exclude,
+        )
+        .unwrap();
+
+        assert_eq!(newline.len(), 3);
+        assert_eq!(newline[0].action(), RuleAction::Include);
+        assert_eq!(newline[1].action(), RuleAction::Exclude);
+        assert_eq!(newline[2].pattern().raw(), "#literal");
+
+        let nul =
+            Rule::parse_filter_file(b"*.obj\0\\#hash\0\0", true, RuleAction::Include).unwrap();
+        assert_eq!(nul.len(), 2);
+        assert!(nul.iter().all(|rule| rule.action() == RuleAction::Include));
+        assert_eq!(nul[1].pattern().raw(), "#hash");
     }
 }

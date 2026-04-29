@@ -15,11 +15,12 @@ use rsync_core::{
 };
 use rsync_filter::{
     normalize_files_from_records, parse_files_from_bytes, EntryKind, Rule, RuleAction, RuleSet,
+    RuleSide,
 };
 use rsync_fs::{
-    selected_source_paths, sync_sources, walk_tree, FileType, FileWriteMode, FileWriteOptions,
-    FsError, LocalFileSystem, PortableFileSystem, SourceSelectionOptions, SymlinkMode, SyncAction,
-    SyncOptions, UpdateMode,
+    selected_source_paths, sync_sources, walk_tree, DeleteMode, FileType, FileWriteMode,
+    FileWriteOptions, FsError, LocalFileSystem, PortableFileSystem, SourceSelectionOptions,
+    SymlinkMode, SyncAction, SyncOptions, UpdateMode,
 };
 use rsync_protocol::{
     authenticate_daemon_module, build_remote_shell_argv_for_paths,
@@ -32,12 +33,12 @@ use rsync_protocol::{
     rsync_whole_file_checksum_reader, select_daemon_module, write_daemon_args, write_i32_le,
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_options, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
-    DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter, RemoteSessionError,
-    RemoteShellOperand, RemoteShellOptions, RsyncFileListEntry, RsyncIndexState, RsyncMd4Checksum,
-    SessionError, TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
-    DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
-    REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
-    RSYNC_INDEX_DONE,
+    DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter, RemoteDeleteMode,
+    RemoteSessionError, RemoteShellOperand, RemoteShellOptions, RsyncFileListEntry,
+    RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection, WireFileType,
+    DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION,
+    MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL,
+    RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
@@ -48,6 +49,8 @@ use rsync_winfs::{
     capture_ntfs_native_sidecar, copy_alternate_data_streams, restore_safe_windows_attributes,
     to_long_path_safe, WindowsDriveKind,
 };
+
+pub mod options;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliMetadataPolicy {
@@ -86,8 +89,14 @@ pub struct Cli {
     #[arg(short = 'r', long, action = ArgAction::SetTrue, help = "Recurse into directories")]
     recursive: bool,
 
+    #[arg(skip)]
+    no_recursive: bool,
+
     #[arg(short = 't', long = "times", action = ArgAction::SetTrue, help = "Preserve modification times")]
     preserve_times: bool,
+
+    #[arg(skip)]
+    no_times: bool,
 
     #[arg(short = 'a', long = "archive", action = ArgAction::SetTrue, help = "Enable archive mode as -rlptgoD, with unsupported metadata reported")]
     archive: bool,
@@ -98,11 +107,41 @@ pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue, help = "Delete receiver files that are not present on sender")]
     delete: bool,
 
+    #[arg(skip)]
+    delete_mode: DeleteMode,
+
     #[arg(long = "whole-file", action = ArgAction::SetTrue, help = "Use whole-file transfer planning")]
     whole_file: bool,
 
     #[arg(short = 'z', long = "compress", action = ArgAction::SetTrue, help = "Accept rsync compression syntax; compression is not applied yet")]
     compress: bool,
+
+    #[arg(skip)]
+    quiet: u8,
+
+    #[arg(skip)]
+    human_readable: u8,
+
+    #[arg(skip)]
+    help: bool,
+
+    #[arg(skip)]
+    progress: bool,
+
+    #[arg(skip)]
+    relative: bool,
+
+    #[arg(skip)]
+    implied_dirs: bool,
+
+    #[arg(skip)]
+    transfer_dirs: bool,
+
+    #[arg(skip)]
+    mkpath: bool,
+
+    #[arg(skip)]
+    one_file_system: bool,
 
     #[arg(short = 'v', action = ArgAction::Count, help = "Increase verbosity")]
     verbosity: u8,
@@ -124,6 +163,9 @@ pub struct Cli {
 
     #[arg(short = 'p', long = "perms", action = ArgAction::SetTrue, help = "Request POSIX permission preservation")]
     preserve_permissions: bool,
+
+    #[arg(skip)]
+    no_permissions: bool,
 
     #[arg(short = 'o', long = "owner", action = ArgAction::SetTrue, help = "Request POSIX owner preservation")]
     preserve_owner: bool,
@@ -158,6 +200,15 @@ pub struct Cli {
     #[arg(long = "filter", help = "Add an rsync-style filter rule")]
     filters: Vec<String>,
 
+    #[arg(skip)]
+    exclude_from: Vec<PathBuf>,
+
+    #[arg(skip)]
+    include_from: Vec<PathBuf>,
+
+    #[arg(skip)]
+    cvs_exclude: bool,
+
     #[arg(
         long = "files-from",
         help = "Read the source file list from a newline-delimited or --from0 file"
@@ -190,6 +241,63 @@ pub struct Cli {
 
     #[arg(long = "append-verify", action = ArgAction::SetTrue, help = "Plan append-verify updates")]
     append_verify: bool,
+
+    #[arg(skip)]
+    append: bool,
+
+    #[arg(skip)]
+    update: bool,
+
+    #[arg(skip)]
+    existing: bool,
+
+    #[arg(skip)]
+    ignore_existing: bool,
+
+    #[arg(skip)]
+    max_size: Option<u64>,
+
+    #[arg(skip)]
+    min_size: Option<u64>,
+
+    #[arg(skip)]
+    modify_window: i64,
+
+    #[arg(skip)]
+    ignore_missing_args: bool,
+
+    #[arg(skip)]
+    delete_missing_args: bool,
+
+    #[arg(skip)]
+    delete_excluded: bool,
+
+    #[arg(skip)]
+    ignore_errors: bool,
+
+    #[arg(skip)]
+    force: bool,
+
+    #[arg(skip)]
+    max_delete: Option<usize>,
+
+    #[arg(skip)]
+    backup: bool,
+
+    #[arg(skip)]
+    backup_dir: Option<String>,
+
+    #[arg(skip)]
+    suffix: Option<String>,
+
+    #[arg(skip)]
+    temp_dir: Option<String>,
+
+    #[arg(skip)]
+    delay_updates: bool,
+
+    #[arg(skip)]
+    fsync: bool,
 
     #[arg(long = "numeric-ids", action = ArgAction::SetTrue, help = "Use numeric owner/group ids when supported")]
     numeric_ids: bool,
@@ -229,14 +337,68 @@ pub struct Cli {
     #[arg(long = "copy-unsafe-links", action = ArgAction::SetTrue, help = "Copy unsafe symlink referents")]
     copy_unsafe_links: bool,
 
+    #[arg(skip)]
+    copy_dirlinks: bool,
+
+    #[arg(skip)]
+    keep_dirlinks: bool,
+
+    #[arg(skip)]
+    munge_links: bool,
+
+    #[arg(skip)]
+    links: bool,
+
+    #[arg(skip)]
+    no_links: bool,
+
+    #[arg(skip)]
+    hard_links: bool,
+
+    #[arg(skip)]
+    devices: bool,
+
+    #[arg(skip)]
+    specials: bool,
+
+    #[arg(skip)]
+    no_devices: bool,
+
+    #[arg(skip)]
+    no_specials: bool,
+
+    #[arg(skip)]
+    copy_devices: bool,
+
+    #[arg(skip)]
+    write_devices: bool,
+
+    #[arg(skip)]
+    block_size: Option<u64>,
+
+    #[arg(skip)]
+    remote_options: Vec<String>,
+
+    #[arg(skip)]
+    accepted_unsupported_options: Vec<String>,
+
     #[arg(help = "Source and destination operands")]
     paths: Vec<String>,
 }
 
 pub fn run_from_env() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = options::parse_cli(std::env::args_os())?;
     print!("{}", execute_or_render(&cli)?);
     Ok(())
+}
+
+pub fn parse_and_render_result<I, T>(args: I) -> Result<String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = options::parse_cli(args)?;
+    Ok(render_output(&cli))
 }
 
 pub fn parse_and_render<I, T>(args: I) -> String
@@ -244,8 +406,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let cli = Cli::parse_from(args);
-    render_output(&cli)
+    parse_and_render_result(args).unwrap_or_else(|err| format!("rsync-win: {err}\n"))
 }
 
 pub fn parse_and_execute<I, T>(args: I) -> Result<String>
@@ -253,7 +414,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let cli = Cli::parse_from(args);
+    let cli = options::parse_cli(args)?;
     execute_or_render(&cli)
 }
 
@@ -276,6 +437,10 @@ pub fn version_output() -> String {
 }
 
 fn render_output(cli: &Cli) -> String {
+    if cli.help {
+        return help_output();
+    }
+
     if cli.version {
         return version_output();
     }
@@ -285,6 +450,22 @@ fn render_output(cli: &Cli) -> String {
     }
 
     render_transfer_plan(cli)
+}
+
+fn help_output() -> String {
+    let mut output = String::new();
+    output.push_str("rsync-win\n\n");
+    output.push_str("Usage: rsync-win [OPTION...] SRC... [DEST]\n\n");
+    output.push_str("Common rsync-compatible options:\n");
+    for spec in options::upstream_client_option_specs() {
+        output.push_str("  --");
+        output.push_str(spec.long);
+        if let Some(short) = spec.short {
+            output.push_str(&format!(", -{short}"));
+        }
+        output.push('\n');
+    }
+    output
 }
 
 fn render_transfer_plan(cli: &Cli) -> String {
@@ -302,12 +483,30 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
     ));
     output.push_str(&format!("metadata policy: {}\n", plan.metadata_policy));
     output.push_str(&format!("recursive: {}\n", plan.recursive));
+    output.push_str(&format!("relative: {}\n", plan.relative));
+    output.push_str(&format!("implied dirs: {}\n", plan.implied_dirs));
+    output.push_str(&format!("dirs: {}\n", plan.transfer_dirs));
+    output.push_str(&format!("mkpath: {}\n", plan.mkpath));
+    output.push_str(&format!("one file system: {}\n", plan.one_file_system));
     output.push_str(&format!("preserve times: {}\n", plan.preserve_times));
     output.push_str(&format!("delete: {}\n", plan.delete));
+    output.push_str(&format!(
+        "delete mode: {}\n",
+        delete_mode_label(plan.delete_mode)
+    ));
+    output.push_str(&format!("delete excluded: {}\n", plan.delete_excluded));
+    output.push_str(&format!("ignore errors: {}\n", plan.ignore_errors));
+    output.push_str(&format!("force delete: {}\n", plan.force_delete));
+    if let Some(max_delete) = plan.max_delete {
+        output.push_str(&format!("max delete: {max_delete}\n"));
+    }
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     output.push_str(&format!("whole file: {}\n", plan.whole_file));
     output.push_str(&format!("compress: {}\n", cli.compress));
     output.push_str(&format!("verbosity: {}\n", plan.verbosity));
+    output.push_str(&format!("quiet: {}\n", cli.quiet));
+    output.push_str(&format!("human readable: {}\n", plan.human_readable));
+    output.push_str(&format!("progress: {}\n", plan.progress));
     output.push_str(&format!("itemize changes: {}\n", cli.itemize_changes));
     output.push_str(&format!("stats: {}\n", cli.stats));
     output.push_str(&format!(
@@ -324,11 +523,58 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
     if let Some(partial_dir) = &plan.partial_dir {
         output.push_str(&format!("partial-dir: {}\n", partial_dir.display()));
     }
+    if let Some(temp_dir) = &plan.temp_dir {
+        output.push_str(&format!("temp-dir: {}\n", temp_dir.display()));
+    }
+    output.push_str(&format!("delay updates: {}\n", plan.delay_updates));
+    output.push_str(&format!("fsync: {}\n", plan.fsync));
     output.push_str(&format!("append verify: {}\n", plan.append_verify));
+    output.push_str(&format!("append: {}\n", plan.append));
+    if let Some(block_size) = plan.block_size {
+        output.push_str(&format!("block size: {block_size}\n"));
+    }
     output.push_str(&format!(
         "symlink mode: {}\n",
         symlink_mode_label(plan.symlink_mode)
     ));
+    output.push_str(&format!("keep dirlinks: {}\n", plan.keep_dirlinks));
+    output.push_str(&format!("hard links: {}\n", plan.hard_links));
+    output.push_str(&format!("devices: {}\n", plan.preserve_devices));
+    output.push_str(&format!("special files: {}\n", plan.preserve_specials));
+    output.push_str(&format!(
+        "update newer only: {}\n",
+        plan.skip_newer_receiver
+    ));
+    output.push_str(&format!("existing only: {}\n", plan.existing_only));
+    output.push_str(&format!("ignore existing: {}\n", plan.ignore_existing));
+    if let Some(max_size) = plan.max_size {
+        output.push_str(&format!("max size: {max_size}\n"));
+    }
+    if let Some(min_size) = plan.min_size {
+        output.push_str(&format!("min size: {min_size}\n"));
+    }
+    output.push_str(&format!("modify window: {}\n", plan.modify_window));
+    output.push_str(&format!(
+        "ignore missing args: {}\n",
+        plan.ignore_missing_args
+    ));
+    output.push_str(&format!(
+        "delete missing args: {}\n",
+        plan.delete_missing_args
+    ));
+    output.push_str(&format!("backup: {}\n", plan.backup));
+    if let Some(backup_dir) = &plan.backup_dir {
+        output.push_str(&format!("backup-dir: {}\n", backup_dir.display()));
+    }
+    output.push_str(&format!("backup suffix: {}\n", plan.backup_suffix));
+    if !plan.remote_options.is_empty() {
+        output.push_str("remote options:");
+        for option in &plan.remote_options {
+            output.push(' ');
+            output.push_str(option);
+        }
+        output.push('\n');
+    }
     output.push_str(&format!(
         "posix metadata: {}\n",
         posix_metadata_summary(plan)
@@ -1048,7 +1294,7 @@ fn build_protocol27_fallback_command(
             direction,
             recursive: plan.recursive,
             preserve_times: plan.preserve_times,
-            delete: plan.delete,
+            delete_mode: remote_delete_mode(plan.delete, plan.delete_mode),
             dry_run: plan.dry_run,
             whole_file: plan.whole_file
                 && !(direction == TransferDirection::Push && plan.append_verify),
@@ -1078,12 +1324,23 @@ fn build_protocol27_fallback_command(
                 None
             },
             omit_link_times: plan.omit_link_times,
+            preserve_links: direction == TransferDirection::Push
+                && plan.symlink_mode == SymlinkMode::Preserve
+                && (cli.links || cli.archive),
             copy_links: direction == TransferDirection::Pull
                 && plan.symlink_mode == SymlinkMode::CopyAll,
+            copy_dirlinks: plan.symlink_mode == SymlinkMode::CopyDirLinks,
+            keep_dirlinks: plan.keep_dirlinks,
             safe_links: direction == TransferDirection::Push
                 && plan.symlink_mode == SymlinkMode::SafeOnly,
             copy_unsafe_links: direction == TransferDirection::Pull
                 && plan.symlink_mode == SymlinkMode::CopyUnsafe,
+            munge_links: plan.symlink_mode == SymlinkMode::Munge,
+            hard_links: plan.hard_links,
+            preserve_devices: plan.preserve_devices,
+            preserve_specials: plan.preserve_specials,
+            copy_devices: cli.copy_devices,
+            write_devices: cli.write_devices,
             includes,
             excludes,
             filters,
@@ -1663,6 +1920,7 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         SyncOptions {
             recursive: plan.recursive,
             delete: plan.delete,
+            delete_mode: plan.delete_mode,
             preserve_mtime: plan.preserve_times,
             dry_run: plan.dry_run,
             filter_rules: plan.filter_rules.clone(),
@@ -1672,8 +1930,36 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
             file_write_mode: plan.file_write_mode,
             keep_partial: plan.keep_partial,
             partial_dir: plan.partial_dir.clone(),
+            temp_dir: plan.temp_dir.clone(),
+            delay_updates: plan.delay_updates,
+            fsync: plan.fsync,
             append_verify: plan.append_verify,
             symlink_mode: plan.symlink_mode,
+            transfer_dirs: plan.transfer_dirs,
+            mkpath: plan.mkpath,
+            relative_paths: plan.relative,
+            implied_dirs: plan.implied_dirs,
+            one_file_system: plan.one_file_system,
+            skip_newer_receiver: plan.skip_newer_receiver,
+            existing_only: plan.existing_only,
+            ignore_existing: plan.ignore_existing,
+            max_size: plan.max_size,
+            min_size: plan.min_size,
+            modify_window: plan.modify_window,
+            ignore_missing_args: plan.ignore_missing_args,
+            delete_missing_args: plan.delete_missing_args,
+            delete_excluded: plan.delete_excluded,
+            ignore_errors: plan.ignore_errors,
+            force_delete: plan.force_delete,
+            max_delete: plan.max_delete,
+            backup: plan.backup,
+            backup_dir: plan.backup_dir.clone(),
+            backup_suffix: plan.backup_suffix.clone(),
+            preserve_hard_links: plan.hard_links,
+            keep_dirlinks: plan.keep_dirlinks,
+            preserve_devices: plan.preserve_devices,
+            preserve_specials: plan.preserve_specials,
+            fail_on_metadata_loss: cli.fail_on_metadata_loss,
         },
     )?;
     log_sync_actions(progress, sync_report.actions());
@@ -1869,6 +2155,7 @@ fn collect_ntfs_sidecar_paths(
             filter_rules: &plan.filter_rules,
             files_from,
             symlink_mode: plan.symlink_mode,
+            one_file_system: plan.one_file_system,
         },
     )?)
 }
@@ -2446,6 +2733,7 @@ fn remote_sender_metadata(
     }
 
     match symlink_mode {
+        SymlinkMode::Skip => Ok(None),
         SymlinkMode::Preserve => bail!(
             "remote-shell sender cannot preserve symlink metadata yet; use --copy-links for {}",
             path.display()
@@ -2465,6 +2753,17 @@ fn remote_sender_metadata(
             }
         }
         SymlinkMode::CopyAll => Ok(Some(followed_remote_sender_metadata(fs, path)?)),
+        SymlinkMode::CopyDirLinks => {
+            let copied = followed_remote_sender_metadata(fs, path)?;
+            if copied.file_type == FileType::Directory {
+                Ok(Some(copied))
+            } else {
+                bail!(
+                    "remote-shell sender cannot preserve non-directory symlink metadata yet: {}",
+                    path.display()
+                )
+            }
+        }
         SymlinkMode::CopyUnsafe => {
             if metadata
                 .symlink_target
@@ -2479,6 +2778,10 @@ fn remote_sender_metadata(
                 )
             }
         }
+        SymlinkMode::Munge => bail!(
+            "remote-shell sender cannot munge symlink metadata yet: {}",
+            path.display()
+        ),
     }
 }
 
@@ -2509,9 +2812,11 @@ fn remote_followed_directory_path(
     }
     let target = original_metadata.symlink_target.as_deref()?;
     let should_follow = match symlink_mode {
-        SymlinkMode::CopyAll => true,
+        SymlinkMode::CopyAll | SymlinkMode::CopyDirLinks => true,
         SymlinkMode::CopyUnsafe => is_unsafe_symlink_target(target),
-        SymlinkMode::Preserve | SymlinkMode::SafeOnly => false,
+        SymlinkMode::Skip | SymlinkMode::Preserve | SymlinkMode::SafeOnly | SymlinkMode::Munge => {
+            false
+        }
     };
     should_follow.then(|| resolve_symlink_target(link_path, target))
 }
@@ -3329,8 +3634,10 @@ fn remote_source_path_is_filtered(
             entry_kind_from_wire(file_type)
         };
         if matches!(
-            rules.decide(&filter_path(&current), kind).action(),
-            RuleAction::Exclude
+            rules
+                .decide_for_side(&filter_path(&current), kind, RuleSide::Sender)
+                .action(),
+            RuleAction::Exclude | RuleAction::Hide
         ) {
             return true;
         }
@@ -3354,7 +3661,9 @@ fn delete_is_protected(rules: &RuleSet, relative: &Path, file_type: FileType) ->
             entry_kind_from_fs(file_type)
         };
         if matches!(
-            rules.decide(&filter_path(&current), kind).action(),
+            rules
+                .decide_for_side(&filter_path(&current), kind, RuleSide::Receiver)
+                .action(),
             RuleAction::Exclude | RuleAction::Protect
         ) {
             return true;
@@ -3852,17 +4161,46 @@ fn validate_remote_file_list_paths(entries: &[RsyncFileListEntry]) -> Result<()>
 #[derive(Debug)]
 struct TransferPlan {
     recursive: bool,
+    relative: bool,
+    implied_dirs: bool,
+    transfer_dirs: bool,
+    mkpath: bool,
+    one_file_system: bool,
     preserve_times: bool,
     delete: bool,
+    delete_mode: DeleteMode,
+    delete_excluded: bool,
+    ignore_errors: bool,
+    force_delete: bool,
+    max_delete: Option<usize>,
     dry_run: bool,
     whole_file: bool,
     verbosity: u8,
+    progress: bool,
+    human_readable: u8,
     update_mode: UpdateMode,
+    skip_newer_receiver: bool,
+    existing_only: bool,
+    ignore_existing: bool,
+    max_size: Option<u64>,
+    min_size: Option<u64>,
+    modify_window: i64,
+    ignore_missing_args: bool,
+    delete_missing_args: bool,
     file_write_mode: FileWriteMode,
     keep_partial: bool,
     partial_dir: Option<PathBuf>,
+    temp_dir: Option<PathBuf>,
+    delay_updates: bool,
+    fsync: bool,
     append_verify: bool,
+    append: bool,
+    block_size: Option<u64>,
     symlink_mode: SymlinkMode,
+    keep_dirlinks: bool,
+    hard_links: bool,
+    preserve_devices: bool,
+    preserve_specials: bool,
     preserve_permissions: bool,
     preserve_owner: bool,
     preserve_group: bool,
@@ -3877,6 +4215,10 @@ struct TransferPlan {
     chmod_rules: Option<ChmodRules>,
     metadata_policy: MetadataPolicy,
     filter_rules: RuleSet,
+    backup: bool,
+    backup_dir: Option<PathBuf>,
+    backup_suffix: String,
+    remote_options: Vec<String>,
     remote_server_argv: Option<Vec<String>>,
     remote_ssh_argv: Option<Vec<String>>,
     remote_ssh_command: Option<SshRemoteCommand>,
@@ -3915,7 +4257,12 @@ impl TransferPlan {
                 cli.fail_on_metadata_loss,
             );
         }
-
+        if cli.no_recursive {
+            recursive = false;
+        }
+        if cli.no_times {
+            preserve_times = false;
+        }
         add_metadata_degradations(
             &mut report,
             metadata_policy_degradations(metadata_policy),
@@ -3933,6 +4280,7 @@ impl TransferPlan {
             );
         }
         add_explicit_option_diagnostics(cli, &mut report);
+        add_option_conflict_diagnostics(cli, &mut report);
 
         let filter_rules = build_filter_rules(cli, &mut report);
         let chmod_rules = parse_chmod_rules(cli, &mut report);
@@ -4111,20 +4459,58 @@ impl TransferPlan {
 
         Self {
             recursive,
+            relative: cli.relative,
+            implied_dirs: cli.implied_dirs,
+            transfer_dirs: cli.transfer_dirs,
+            mkpath: cli.mkpath,
+            one_file_system: cli.one_file_system,
             preserve_times,
-            delete: cli.delete,
+            delete: cli.delete || cli.delete_mode != DeleteMode::None,
+            delete_mode: if cli.delete || cli.delete_mode != DeleteMode::None {
+                if cli.delete_mode == DeleteMode::None {
+                    DeleteMode::During
+                } else {
+                    cli.delete_mode
+                }
+            } else {
+                DeleteMode::None
+            },
+            delete_excluded: cli.delete_excluded,
+            ignore_errors: cli.ignore_errors,
+            force_delete: cli.force,
+            max_delete: cli.max_delete,
             dry_run: cli.dry_run,
             whole_file: cli.whole_file,
             verbosity: cli.verbosity,
+            progress: cli.progress,
+            human_readable: cli.human_readable,
             update_mode,
+            skip_newer_receiver: cli.update,
+            existing_only: cli.existing,
+            ignore_existing: cli.ignore_existing,
+            max_size: cli.max_size,
+            min_size: cli.min_size,
+            modify_window: cli.modify_window,
+            ignore_missing_args: cli.ignore_missing_args,
+            delete_missing_args: cli.delete_missing_args,
             file_write_mode,
             keep_partial: cli.partial,
             partial_dir: cli.partial_dir.clone().map(PathBuf::from),
+            temp_dir: cli.temp_dir.clone().map(PathBuf::from),
+            delay_updates: cli.delay_updates,
+            fsync: cli.fsync,
             append_verify: cli.append_verify,
+            append: cli.append,
+            block_size: cli.block_size,
             symlink_mode,
-            preserve_permissions: cli.preserve_permissions || cli.archive,
-            preserve_owner: cli.preserve_owner || (cli.archive && !cli.no_owner),
-            preserve_group: cli.preserve_group || (cli.archive && !cli.no_group),
+            keep_dirlinks: cli.keep_dirlinks,
+            hard_links: cli.hard_links,
+            preserve_devices: (cli.devices || cli.archive || cli.copy_devices || cli.write_devices)
+                && !cli.no_devices,
+            preserve_specials: (cli.specials || cli.archive) && !cli.no_specials,
+            preserve_permissions: cli_preserve_permissions(cli),
+            preserve_owner: cli_preserve_owner(cli),
+            preserve_group: cli_preserve_group(cli),
             preserve_executability: cli.executability,
             preserve_acls: cli.acls,
             preserve_xattrs: cli.xattrs,
@@ -4136,6 +4522,16 @@ impl TransferPlan {
             chmod_rules,
             metadata_policy,
             filter_rules,
+            backup: cli.backup,
+            backup_dir: cli.backup_dir.clone().map(PathBuf::from),
+            backup_suffix: cli.suffix.clone().unwrap_or_else(|| {
+                if cli.backup_dir.is_some() {
+                    String::new()
+                } else {
+                    "~".to_string()
+                }
+            }),
+            remote_options: cli.remote_options.clone(),
             remote_server_argv,
             remote_ssh_argv,
             remote_ssh_command,
@@ -4231,11 +4627,11 @@ fn remote_shell_options_from_cli(
         direction,
         recursive,
         preserve_times,
-        delete: cli.delete,
+        delete_mode: remote_delete_mode_from_cli(cli),
         dry_run: cli.dry_run,
         whole_file: cli.whole_file && !(direction == TransferDirection::Push && cli.append_verify),
         verbosity: cli.verbosity,
-        preserve_permissions: cli.preserve_permissions || cli.archive,
+        preserve_permissions: cli_preserve_permissions(cli),
         checksum: cli.checksum,
         size_only: direction == TransferDirection::Push && cli.size_only,
         ignore_times: direction == TransferDirection::Push && cli.ignore_times,
@@ -4251,29 +4647,169 @@ fn remote_shell_options_from_cli(
             .then(|| cli.chmod.clone())
             .flatten(),
         omit_link_times: cli.omit_link_times,
+        preserve_links: direction == TransferDirection::Push
+            && symlink_mode == SymlinkMode::Preserve
+            && (cli.links || cli.archive),
         copy_links: direction == TransferDirection::Pull && symlink_mode == SymlinkMode::CopyAll,
+        copy_dirlinks: symlink_mode == SymlinkMode::CopyDirLinks,
+        keep_dirlinks: cli.keep_dirlinks,
         safe_links: direction == TransferDirection::Push && symlink_mode == SymlinkMode::SafeOnly,
         copy_unsafe_links: direction == TransferDirection::Pull
             && symlink_mode == SymlinkMode::CopyUnsafe,
+        munge_links: symlink_mode == SymlinkMode::Munge,
+        hard_links: cli.hard_links,
+        preserve_devices: (cli.devices || cli.archive || cli.copy_devices || cli.write_devices)
+            && !cli.no_devices,
+        preserve_specials: (cli.specials || cli.archive) && !cli.no_specials,
+        copy_devices: cli.copy_devices,
+        write_devices: cli.write_devices,
         includes,
         excludes,
         filters,
     }
 }
 
+fn remote_delete_mode_from_cli(cli: &Cli) -> RemoteDeleteMode {
+    remote_delete_mode(cli.delete, cli.delete_mode)
+}
+
+fn remote_delete_mode(delete: bool, delete_mode: DeleteMode) -> RemoteDeleteMode {
+    match if delete_mode != DeleteMode::None {
+        delete_mode
+    } else if delete {
+        DeleteMode::During
+    } else {
+        DeleteMode::None
+    } {
+        DeleteMode::None => RemoteDeleteMode::None,
+        DeleteMode::Before => RemoteDeleteMode::Before,
+        DeleteMode::During => RemoteDeleteMode::During,
+        DeleteMode::Delay => RemoteDeleteMode::Delay,
+        DeleteMode::After => RemoteDeleteMode::After,
+    }
+}
+
+fn cli_preserve_permissions(cli: &Cli) -> bool {
+    (cli.preserve_permissions || cli.archive) && !cli.no_permissions
+}
+
+fn cli_preserve_owner(cli: &Cli) -> bool {
+    cli.preserve_owner || (cli.archive && !cli.no_owner)
+}
+
+fn cli_preserve_group(cli: &Cli) -> bool {
+    cli.preserve_group || (cli.archive && !cli.no_group)
+}
+
 fn remote_receiver_filter_args_from_cli(
     cli: &Cli,
-    direction: TransferDirection,
+    _direction: TransferDirection,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
-    if direction == TransferDirection::Push {
-        (
-            cli.includes.clone(),
-            cli.excludes.clone(),
-            cli.filters.clone(),
-        )
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
+    let mut includes = cli.includes.clone();
+    let mut excludes = cli.excludes.clone();
+    let mut filters = cli.filters.clone();
+
+    if cli.cvs_exclude {
+        excludes.extend(
+            CVS_EXCLUDE_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_string()),
+        );
     }
+    for path in &cli.include_from {
+        add_remote_filter_file_args(
+            &mut includes,
+            &mut excludes,
+            &mut filters,
+            path,
+            cli.from0,
+            RuleAction::Include,
+        );
+    }
+    for path in &cli.exclude_from {
+        add_remote_filter_file_args(
+            &mut includes,
+            &mut excludes,
+            &mut filters,
+            path,
+            cli.from0,
+            RuleAction::Exclude,
+        );
+    }
+
+    (includes, excludes, filters)
+}
+
+fn add_remote_filter_file_args(
+    includes: &mut Vec<String>,
+    excludes: &mut Vec<String>,
+    filters: &mut Vec<String>,
+    path: &Path,
+    from0: bool,
+    default_action: RuleAction,
+) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let Ok(rules) = Rule::parse_filter_file(&bytes, from0, default_action) else {
+        return;
+    };
+    for rule in rules {
+        add_remote_filter_rule_arg(includes, excludes, filters, &rule);
+    }
+}
+
+fn add_remote_filter_rule_arg(
+    includes: &mut Vec<String>,
+    excludes: &mut Vec<String>,
+    filters: &mut Vec<String>,
+    rule: &Rule,
+) {
+    match rule.action() {
+        RuleAction::Include if filter_rule_can_use_short_arg(rule) => {
+            includes.push(rule.pattern().raw().to_string());
+        }
+        RuleAction::Exclude if filter_rule_can_use_short_arg(rule) => {
+            excludes.push(rule.pattern().raw().to_string());
+        }
+        _ => filters.push(format_remote_filter_rule(rule)),
+    }
+}
+
+fn filter_rule_can_use_short_arg(rule: &Rule) -> bool {
+    rule.is_sender_side() && rule.is_receiver_side() && !rule.is_perishable()
+}
+
+fn format_remote_filter_rule(rule: &Rule) -> String {
+    if rule.action() == RuleAction::ClearList {
+        return "!".to_string();
+    }
+
+    let mut head = match rule.action() {
+        RuleAction::Include => "+".to_string(),
+        RuleAction::Exclude => "-".to_string(),
+        RuleAction::Hide => "H".to_string(),
+        RuleAction::Show => "S".to_string(),
+        RuleAction::Protect => "P".to_string(),
+        RuleAction::Risk => "R".to_string(),
+        RuleAction::ClearList => unreachable!("handled above"),
+        RuleAction::Merge => ".".to_string(),
+        RuleAction::DirMerge => ":".to_string(),
+    };
+    let mut modifiers = String::new();
+    if rule.is_sender_side() && !rule.is_receiver_side() {
+        modifiers.push('s');
+    } else if rule.is_receiver_side() && !rule.is_sender_side() {
+        modifiers.push('r');
+    }
+    if rule.is_perishable() {
+        modifiers.push('p');
+    }
+    if !modifiers.is_empty() {
+        head.push(',');
+        head.push_str(&modifiers);
+    }
+    format!("{head} {}", rule.pattern().raw())
 }
 
 fn update_mode_from_cli(cli: &Cli) -> UpdateMode {
@@ -4289,14 +4825,22 @@ fn update_mode_from_cli(cli: &Cli) -> UpdateMode {
 }
 
 fn symlink_mode_from_cli(cli: &Cli) -> SymlinkMode {
-    if cli.copy_links {
+    if cli.no_links {
+        SymlinkMode::Skip
+    } else if cli.copy_links {
         SymlinkMode::CopyAll
+    } else if cli.copy_dirlinks {
+        SymlinkMode::CopyDirLinks
     } else if cli.copy_unsafe_links {
         SymlinkMode::CopyUnsafe
     } else if cli.safe_links {
         SymlinkMode::SafeOnly
-    } else {
+    } else if cli.munge_links {
+        SymlinkMode::Munge
+    } else if cli.links || cli.archive {
         SymlinkMode::Preserve
+    } else {
+        SymlinkMode::Skip
     }
 }
 
@@ -4305,6 +4849,8 @@ fn file_write_options_from_plan(plan: &TransferPlan) -> FileWriteOptions {
         mode: plan.file_write_mode,
         keep_partial: plan.keep_partial,
         partial_dir: plan.partial_dir.clone(),
+        temp_dir: plan.temp_dir.clone(),
+        fsync: plan.fsync,
     }
 }
 
@@ -4328,17 +4874,31 @@ fn parse_remote_shell_operand(operand: &str, report: &mut Report) -> Option<Remo
 fn build_filter_rules(cli: &Cli, report: &mut Report) -> RuleSet {
     let mut rules = RuleSet::empty();
 
+    if cli.cvs_exclude {
+        for pattern in CVS_EXCLUDE_PATTERNS {
+            match Rule::exclude(*pattern) {
+                Ok(rule) => rules.push(rule),
+                Err(err) => report.error("E_FILTER", format!("invalid CVS exclude pattern: {err}")),
+            }
+        }
+    }
     for pattern in &cli.includes {
         match Rule::include(pattern) {
             Ok(rule) => rules.push(rule),
             Err(err) => report.error("E_FILTER", format!("invalid include pattern: {err}")),
         }
     }
+    for path in &cli.include_from {
+        add_filter_file_rules(&mut rules, path, cli.from0, RuleAction::Include, report);
+    }
     for pattern in &cli.excludes {
         match Rule::exclude(pattern) {
             Ok(rule) => rules.push(rule),
             Err(err) => report.error("E_FILTER", format!("invalid exclude pattern: {err}")),
         }
+    }
+    for path in &cli.exclude_from {
+        add_filter_file_rules(&mut rules, path, cli.from0, RuleAction::Exclude, report);
     }
     for filter in &cli.filters {
         match Rule::parse_filter(filter) {
@@ -4348,6 +4908,71 @@ fn build_filter_rules(cli: &Cli, report: &mut Report) -> RuleSet {
     }
 
     rules
+}
+
+const CVS_EXCLUDE_PATTERNS: &[&str] = &[
+    "RCS",
+    "SCCS",
+    "CVS",
+    "CVS.adm",
+    "RCSLOG",
+    "cvslog.*",
+    "tags",
+    "TAGS",
+    ".make.state",
+    ".nse_depinfo",
+    "*~",
+    "#*",
+    ".#*",
+    ",*",
+    "_$*",
+    "*$",
+    "*.old",
+    "*.bak",
+    "*.BAK",
+    "*.orig",
+    "*.rej",
+    ".del-*",
+    "*.a",
+    "*.olb",
+    "*.o",
+    "*.obj",
+    "*.so",
+    "*.exe",
+    "*.Z",
+    "*.elc",
+    "*.ln",
+    "core",
+    ".svn",
+    ".git",
+    ".hg",
+    ".bzr",
+];
+
+fn add_filter_file_rules(
+    rules: &mut RuleSet,
+    path: &Path,
+    from0: bool,
+    default_action: RuleAction,
+    report: &mut Report,
+) {
+    match fs::read(path) {
+        Ok(bytes) => match Rule::parse_filter_file(&bytes, from0, default_action) {
+            Ok(parsed) => {
+                for rule in parsed {
+                    rules.push(rule);
+                }
+            }
+            Err(err) => report.error(
+                "E_FILTER",
+                format!("invalid filter file {}: {err}", path.display()),
+            ),
+        },
+        Err(err) => report.error(
+            "E_FILTER",
+            format!("could not read filter file {}: {err}", path.display()),
+        ),
+    }
 }
 
 fn parse_chmod_rules(cli: &Cli, report: &mut Report) -> Option<ChmodRules> {
@@ -4392,17 +5017,20 @@ fn archive_mode_degradations_for_cli(
     archive_mode_degradations(metadata_policy)
         .into_iter()
         .filter(|degradation| {
-            !(cli.no_owner && degradation.feature == MetadataFeature::Owner
-                || cli.no_group && degradation.feature == MetadataFeature::Group)
+            !(cli.no_permissions && degradation.feature == MetadataFeature::Permissions
+                || cli.no_owner && degradation.feature == MetadataFeature::Owner
+                || cli.no_group && degradation.feature == MetadataFeature::Group
+                || cli.no_devices && degradation.feature == MetadataFeature::Device
+                || cli.no_specials && degradation.feature == MetadataFeature::SpecialFile)
         })
         .collect()
 }
 
 fn posix_metadata_request_from_cli(cli: &Cli) -> PosixMetadataRequest {
     PosixMetadataRequest {
-        permissions: cli.preserve_permissions,
-        owner: cli.preserve_owner,
-        group: cli.preserve_group,
+        permissions: cli_preserve_permissions(cli),
+        owner: cli_preserve_owner(cli),
+        group: cli_preserve_group(cli),
         numeric_ids: cli.numeric_ids,
         chmod: cli.chmod.is_some(),
         executability: cli.executability,
@@ -4449,6 +5077,9 @@ fn posix_metadata_summary(plan: &TransferPlan) -> String {
     if plan.preserve_xattrs {
         parts.push("xattrs");
     }
+    if plan.hard_links {
+        parts.push("hard-links");
+    }
     if plan.fake_super {
         parts.push("fake-super");
     }
@@ -4491,8 +5122,16 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
         (cli.inplace, "--inplace"),
         (cli.append_verify, "--append-verify"),
         (cli.copy_links, "--copy-links"),
+        (cli.copy_dirlinks, "--copy-dirlinks"),
+        (cli.keep_dirlinks, "--keep-dirlinks"),
         (cli.safe_links, "--safe-links"),
         (cli.copy_unsafe_links, "--copy-unsafe-links"),
+        (cli.munge_links, "--munge-links"),
+        (cli.hard_links, "--hard-links"),
+        (cli.devices, "--devices"),
+        (cli.specials, "--specials"),
+        (cli.copy_devices, "--copy-devices"),
+        (cli.write_devices, "--write-devices"),
         (cli.preserve_permissions, "--perms"),
         (cli.preserve_owner, "--owner"),
         (cli.preserve_group, "--group"),
@@ -4531,6 +5170,33 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
         report.info(
             "I_OPTION_PARSED",
             format!("--partial-dir={partial_dir} is represented in the execution plan"),
+        );
+    }
+    for option in &cli.accepted_unsupported_options {
+        report.warn(
+            "W_UNIMPLEMENTED_OPTION",
+            format!("{option} is accepted for rsync option compatibility but has no behavior in this build yet"),
+        );
+    }
+}
+
+fn add_option_conflict_diagnostics(cli: &Cli, report: &mut Report) {
+    if cli.inplace && cli.delay_updates {
+        report.error(
+            "E_OPTION_CONFLICT",
+            "--inplace cannot be combined with --delay-updates",
+        );
+    }
+    if cli.inplace && cli.partial_dir.is_some() {
+        report.error(
+            "E_OPTION_CONFLICT",
+            "--inplace and --partial-dir cannot both control the same write path",
+        );
+    }
+    if cli.existing && cli.ignore_existing {
+        report.warn(
+            "W_OPTION_OVERLAP",
+            "--existing and --ignore-existing together leave only receiver-missing files eligible",
         );
     }
 }
@@ -4738,6 +5404,13 @@ fn append_sync_action(output: &mut String, action: &SyncAction) {
         SyncAction::AppendFile { path, len } => {
             output.push_str(&format!("- append-file {} {len} bytes\n", path.display()));
         }
+        SyncAction::BackupFile { from, to } => {
+            output.push_str(&format!(
+                "- backup-file {} -> {}\n",
+                from.display(),
+                to.display()
+            ));
+        }
         SyncAction::PreserveMtime(path) => {
             output.push_str(&format!("- preserve-mtime {}\n", path.display()));
         }
@@ -4749,6 +5422,20 @@ fn append_sync_action(output: &mut String, action: &SyncAction) {
         }
         SyncAction::ProtectDelete(path) => {
             output.push_str(&format!("- protect-delete {}\n", path.display()));
+        }
+        SyncAction::CreateSymlink { path, target } => {
+            output.push_str(&format!(
+                "- create-symlink {} -> {}\n",
+                path.display(),
+                target.display()
+            ));
+        }
+        SyncAction::CreateHardLink { from, to } => {
+            output.push_str(&format!(
+                "- create-hardlink {} -> {}\n",
+                from.display(),
+                to.display()
+            ));
         }
         SyncAction::Warn { path, message } => {
             output.push_str(&format!("- warning {}: {message}\n", path.display()));
@@ -4781,6 +5468,9 @@ fn log_sync_actions(progress: ProgressLog, actions: &[SyncAction]) {
                 path.display(),
                 format_bytes(*len as u64)
             )),
+            SyncAction::BackupFile { from, to } => {
+                progress.detail(format!("backup: {} -> {}", from.display(), to.display()))
+            }
             SyncAction::PreserveMtime(path) => {
                 progress.detail(format!("preserve mtime: {}", path.display()));
             }
@@ -4790,6 +5480,16 @@ fn log_sync_actions(progress: ProgressLog, actions: &[SyncAction]) {
             SyncAction::DeleteDir(path) => progress.info(format!("delete dir: {}", path.display())),
             SyncAction::ProtectDelete(path) => {
                 progress.detail(format!("protect delete: {}", path.display()));
+            }
+            SyncAction::CreateSymlink { path, target } => {
+                progress.info(format!(
+                    "symlink: {} -> {}",
+                    path.display(),
+                    target.display()
+                ));
+            }
+            SyncAction::CreateHardLink { from, to } => {
+                progress.info(format!("hardlink: {} -> {}", from.display(), to.display()));
             }
             SyncAction::Warn { path, message } => {
                 progress.info(format!("warning: {}: {message}", path.display()));
@@ -4827,6 +5527,9 @@ fn append_itemized_action(output: &mut String, action: &SyncAction) {
         SyncAction::AppendFile { path, .. } => {
             output.push_str(&format!(">f+++++a+++ {}\n", path.display()));
         }
+        SyncAction::BackupFile { from, .. } => {
+            output.push_str(&format!("bf+++++++++ {}\n", from.display()));
+        }
         SyncAction::PreserveMtime(path) => {
             output.push_str(&format!(".f..t...... {}\n", path.display()));
         }
@@ -4835,6 +5538,12 @@ fn append_itemized_action(output: &mut String, action: &SyncAction) {
         }
         SyncAction::ProtectDelete(path) => {
             output.push_str(&format!(".protect... {}\n", path.display()));
+        }
+        SyncAction::CreateSymlink { path, .. } => {
+            output.push_str(&format!("cL+++++++++ {}\n", path.display()));
+        }
+        SyncAction::CreateHardLink { to, .. } => {
+            output.push_str(&format!("hf+++++++++ {}\n", to.display()));
         }
         SyncAction::Warn { path, .. } => {
             output.push_str(&format!(".warning... {}\n", path.display()));
@@ -4899,10 +5608,12 @@ impl ActionStats {
                 self.appended_files += 1;
                 self.file_write_bytes += *len;
             }
+            SyncAction::BackupFile { .. } => {}
             SyncAction::PreserveMtime(_) => self.preserved_mtimes += 1,
             SyncAction::DeleteFile(_) => self.deleted_files += 1,
             SyncAction::DeleteDir(_) => self.deleted_dirs += 1,
             SyncAction::ProtectDelete(_) => self.protected_deletes += 1,
+            SyncAction::CreateSymlink { .. } | SyncAction::CreateHardLink { .. } => {}
             SyncAction::Warn { .. } => self.warnings += 1,
         }
     }
@@ -4944,6 +5655,16 @@ fn update_mode_label(mode: UpdateMode) -> &'static str {
     }
 }
 
+fn delete_mode_label(mode: DeleteMode) -> &'static str {
+    match mode {
+        DeleteMode::None => "none",
+        DeleteMode::Before => "before",
+        DeleteMode::During => "during",
+        DeleteMode::Delay => "delay",
+        DeleteMode::After => "after",
+    }
+}
+
 fn file_write_mode_label(mode: FileWriteMode) -> &'static str {
     match mode {
         FileWriteMode::Atomic => "atomic",
@@ -4953,10 +5674,13 @@ fn file_write_mode_label(mode: FileWriteMode) -> &'static str {
 
 fn symlink_mode_label(mode: SymlinkMode) -> &'static str {
     match mode {
+        SymlinkMode::Skip => "skip",
         SymlinkMode::Preserve => "preserve",
         SymlinkMode::CopyAll => "copy-links",
+        SymlinkMode::CopyDirLinks => "copy-dirlinks",
         SymlinkMode::CopyUnsafe => "copy-unsafe-links",
         SymlinkMode::SafeOnly => "safe-links",
+        SymlinkMode::Munge => "munge-links",
     }
 }
 
@@ -5023,7 +5747,7 @@ mod tests {
         assert!(output.contains("[warning] W_METADATA_GROUP"));
         assert!(output.contains("[warning] W_METADATA_DEVICE"));
         assert!(output.contains(
-            "remote --server argv: rsync --server --delete-before --perms -ntre.LsfxCIvu"
+            "remote --server argv: rsync --server --delete-during --perms --links --devices --specials -ntre.LsfxCIvu"
         ));
         assert!(output.contains("[info] I_REMOTE_PROTOCOL31_MVP"));
         assert!(output.contains("wire protocol: experimental protocol 31"));
@@ -5275,7 +5999,7 @@ mod tests {
 
         ensure_remote_execution_options_supported(&cli, &plan).unwrap();
         let argv = plan.remote_server_argv.as_ref().unwrap();
-        assert!(argv.contains(&"--delete-before".to_string()));
+        assert!(argv.contains(&"--delete-during".to_string()));
         assert!(argv.contains(&"--exclude=*.tmp".to_string()));
     }
 
@@ -5318,6 +6042,25 @@ mod tests {
         assert!(output.contains("--partial-dir=.rsync-partial"));
         assert!(output.contains("update mode: size-only"));
         assert!(output.contains("partial: true"));
+    }
+
+    #[test]
+    fn remote_shell_plan_routes_delete_timing_options() {
+        let output = parse_and_render([
+            "rsync-win",
+            "-r",
+            "--delete-after",
+            "--plan",
+            "src",
+            "user@example.test:/tmp/dest",
+        ]);
+        let server_line = output
+            .lines()
+            .find(|line| line.starts_with("remote --server argv:"))
+            .unwrap();
+
+        assert!(server_line.contains("--delete-after"));
+        assert!(!server_line.contains("--delete-before"));
     }
 
     #[test]
@@ -6914,18 +7657,19 @@ mod tests {
             chmod_rules: None,
         };
 
-        let entries = collect_local_source_entries(&[source.clone()], &options).unwrap();
+        let entries =
+            collect_local_source_entries(std::slice::from_ref(&source), &options).unwrap();
 
         for path in ["app.exe", "run.bat", "run.cmd", "script.ps1"] {
             let entry = entries
                 .iter()
-                .find(|entry| entry.wire.path == PathBuf::from(path))
+                .find(|entry| entry.wire.path.as_path() == Path::new(path))
                 .unwrap();
             assert_eq!(entry.wire.mode & 0o111, 0o111, "{path}");
         }
         let notes = entries
             .iter()
-            .find(|entry| entry.wire.path == PathBuf::from("notes.txt"))
+            .find(|entry| entry.wire.path.as_path() == Path::new("notes.txt"))
             .unwrap();
 
         assert_eq!(notes.wire.mode & 0o111, 0);
@@ -6951,15 +7695,16 @@ mod tests {
             chmod_rules: Some(&chmod_rules),
         };
 
-        let entries = collect_local_source_entries(&[source.clone()], &options).unwrap();
+        let entries =
+            collect_local_source_entries(std::slice::from_ref(&source), &options).unwrap();
 
         let dir = entries
             .iter()
-            .find(|entry| entry.wire.path == PathBuf::from("dir"))
+            .find(|entry| entry.wire.path.as_path() == Path::new("dir"))
             .unwrap();
         let file = entries
             .iter()
-            .find(|entry| entry.wire.path == PathBuf::from("dir/file.txt"))
+            .find(|entry| entry.wire.path.as_path() == Path::new("dir/file.txt"))
             .unwrap();
 
         assert_eq!(dir.wire.mode & 0o7777, 0o700);
@@ -6985,11 +7730,12 @@ mod tests {
             chmod_rules: None,
         };
 
-        let entries = collect_local_source_entries(&[source.clone()], &options).unwrap();
+        let entries =
+            collect_local_source_entries(std::slice::from_ref(&source), &options).unwrap();
 
         assert!(entries
             .iter()
-            .any(|entry| entry.wire.path == PathBuf::from("keep.bak")));
+            .any(|entry| entry.wire.path.as_path() == Path::new("keep.bak")));
         fs::remove_dir_all(root).unwrap();
     }
 
