@@ -31,7 +31,7 @@ impl MatchDecision {
     }
 
     pub fn is_included(&self) -> bool {
-        matches!(self.action, RuleAction::Include | RuleAction::Risk)
+        !matches!(self.action, RuleAction::Exclude)
     }
 }
 
@@ -307,6 +307,7 @@ mod tests {
             rules.decide("archive/old.bak", EntryKind::File).action(),
             RuleAction::Protect
         );
+        assert!(rules.is_included("archive/old.bak", EntryKind::File));
         assert_eq!(
             rules.decide("scratch/tmp.bin", EntryKind::File).action(),
             RuleAction::Risk

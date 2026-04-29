@@ -429,6 +429,13 @@ pub fn exchange_remote_shell_protocol31_handshake<T: Read + Write>(
     let mut prefix = [0_u8; 4];
     transport.read_exact(&mut prefix)?;
     let peer_protocol = validate_protocol_stream_prefix(&prefix)?;
+    exchange_protocol31_setup(transport, peer_protocol)
+}
+
+pub fn exchange_protocol31_setup<T: Read + Write>(
+    transport: &mut T,
+    peer_protocol: u32,
+) -> Result<RemoteShellHandshake, RemoteSessionError> {
     let selected_protocol =
         negotiate_protocol_version_with_local(peer_protocol, REMOTE_SHELL_MODERN_PROTOCOL)?;
     if selected_protocol.value() != REMOTE_SHELL_MODERN_PROTOCOL {

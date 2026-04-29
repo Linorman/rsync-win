@@ -785,7 +785,7 @@ fn sender_path_is_filtered(rules: &RuleSet, relative: &Path, file_type: FileType
         };
         if matches!(
             rules.decide(&filter_path(&current), kind).action(),
-            RuleAction::Exclude | RuleAction::Protect
+            RuleAction::Exclude
         ) {
             return true;
         }
@@ -1275,6 +1275,7 @@ mod tests {
         let mut fs = MemoryFileSystem::new();
         fs.add_file("src/keep.txt", b"keep").unwrap();
         fs.add_file("src/cache.tmp", b"cache").unwrap();
+        fs.add_file("src/sent.bak", b"new-backup").unwrap();
         fs.add_file("dst/cache.tmp", b"old-cache").unwrap();
         fs.add_file("dst/protected.bak", b"backup").unwrap();
         fs.add_file("dst/delete.me", b"delete").unwrap();
@@ -1301,6 +1302,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs.read_file(Path::new("dst/keep.txt")).unwrap(), b"keep");
+        assert_eq!(
+            fs.read_file(Path::new("dst/sent.bak")).unwrap(),
+            b"new-backup"
+        );
         assert!(!fs.exists(Path::new("dst/delete.me")));
         assert_eq!(
             fs.read_file(Path::new("dst/cache.tmp")).unwrap(),

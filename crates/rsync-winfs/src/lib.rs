@@ -21,7 +21,9 @@ pub use path::{
     preflight_destination_paths, to_long_path_safe, validate_portable_component,
     validate_portable_relative_path, WindowsPathError,
 };
-pub use security::{capture_security_descriptor_summary, SecurityDescriptorSummary};
+pub use security::{
+    capture_security_descriptor_summary, password_file_has_broad_access, SecurityDescriptorSummary,
+};
 pub use sidecar::{
     parse_ntfs_native_sidecar_manifest, NtfsNativeSidecar, NtfsNativeSidecarManifest,
     SidecarParseError, NTFS_SIDECAR_HEADER,

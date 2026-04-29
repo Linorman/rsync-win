@@ -24,7 +24,7 @@ use rsync_fs::{
 use rsync_protocol::{
     authenticate_daemon_module, build_remote_shell_argv_for_paths,
     build_remote_shell_protocol31_argv, build_remote_shell_protocol31_argv_for_paths,
-    exchange_daemon_greeting, exchange_remote_shell_mvp_handshake,
+    exchange_daemon_greeting, exchange_protocol31_setup, exchange_remote_shell_mvp_handshake,
     exchange_remote_shell_protocol31_handshake, read_i32_le, read_multiplexed_i32,
     read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
@@ -753,10 +753,10 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
                 .as_ref()
                 .context("daemon module requires auth; pass --password-file")?;
             let password = read_password_file(password_file)?;
-            let user = daemon.user.as_deref().unwrap_or("nobody");
+            let user = daemon_auth_user(daemon)?;
             authenticate_daemon_module(
                 &mut transport,
-                user,
+                &user,
                 &password,
                 &challenge,
                 greeting.auth_checksum,
@@ -771,7 +771,9 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
         .context("failed to send daemon server args")?;
 
     if greeting.peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL {
-        execute_remote_pull_protocol31(cli, plan, transport)
+        let handshake = exchange_protocol31_setup(transport, greeting.peer_protocol)
+            .context("daemon protocol 31 setup failed")?;
+        execute_remote_pull_protocol31_with_handshake(cli, plan, transport, handshake)
     } else {
         execute_remote_pull_protocol27(cli, plan, transport)
     }
@@ -800,23 +802,108 @@ fn daemon_server_args_for_pull(
 }
 
 fn daemon_module_path_arg(daemon: &DaemonOperand) -> Result<String> {
-    let module = daemon
+    daemon
         .module
         .as_ref()
         .context("daemon pull requires a module")?;
     Ok(match &daemon.path {
-        Some(path) => format!("{module}/{path}"),
-        None => format!("{module}/"),
+        Some(path) => path.clone(),
+        None => ".".to_string(),
     })
 }
 
+fn daemon_auth_user(daemon: &DaemonOperand) -> Result<String> {
+    if let Some(user) = daemon.user.as_deref() {
+        return normalize_daemon_auth_user(user)
+            .context("daemon auth username is empty or contains a NUL byte");
+    }
+
+    local_daemon_auth_user().context(
+        "daemon module requires auth but no username was supplied; use user@host::module or set USER, LOGNAME, or USERNAME",
+    )
+}
+
+fn local_daemon_auth_user() -> Option<String> {
+    daemon_auth_user_from_vars([
+        ("USER", std::env::var("USER").ok()),
+        ("LOGNAME", std::env::var("LOGNAME").ok()),
+        ("USERNAME", std::env::var("USERNAME").ok()),
+    ])
+}
+
+fn daemon_auth_user_from_vars<I, K>(vars: I) -> Option<String>
+where
+    I: IntoIterator<Item = (K, Option<String>)>,
+{
+    vars.into_iter()
+        .filter_map(|(_, value)| value)
+        .find_map(|value| normalize_daemon_auth_user(&value))
+}
+
+fn normalize_daemon_auth_user(value: &str) -> Option<String> {
+    let user = value.trim();
+    if user.is_empty() || user.as_bytes().contains(&0) {
+        None
+    } else {
+        Some(user.to_string())
+    }
+}
+
 fn read_password_file(path: &Path) -> Result<String> {
+    validate_password_file(path)?;
     let mut password = fs::read_to_string(path)
         .with_context(|| format!("failed to read daemon password file {}", path.display()))?;
     while password.ends_with('\n') || password.ends_with('\r') {
         password.pop();
     }
     Ok(password)
+}
+
+fn validate_password_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect daemon password file {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "daemon password file must be a regular file: {}",
+            path.display()
+        );
+    }
+    validate_password_file_permissions(path, &metadata)
+}
+
+#[cfg(unix)]
+fn validate_password_file_permissions(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        bail!(
+            "daemon password file must not be accessible by group or other users: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_password_file_permissions(path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    if rsync_winfs::password_file_has_broad_access(path).with_context(|| {
+        format!(
+            "failed to inspect daemon password file ACL {}",
+            path.display()
+        )
+    })? {
+        bail!(
+            "daemon password file must not grant read access to broad Windows principals: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_password_file_permissions(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
 }
 
 fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
@@ -1406,9 +1493,18 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
-    let dest = Path::new(cli.paths.last().expect("checked operand count"));
     let handshake =
         exchange_remote_shell_protocol31_handshake(transport).map_err(protocol31_setup_error)?;
+    execute_remote_pull_protocol31_with_handshake(cli, plan, transport, handshake)
+}
+
+fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
+    cli: &Cli,
+    plan: &TransferPlan,
+    transport: &mut T,
+    handshake: rsync_protocol::RemoteShellHandshake,
+) -> Result<String> {
+    let dest = Path::new(cli.paths.last().expect("checked operand count"));
     let mut mux = MultiplexReadState::default();
 
     {
@@ -3234,7 +3330,7 @@ fn remote_source_path_is_filtered(
         };
         if matches!(
             rules.decide(&filter_path(&current), kind).action(),
-            RuleAction::Exclude | RuleAction::Protect
+            RuleAction::Exclude
         ) {
             return true;
         }
@@ -3825,11 +3921,6 @@ impl TransferPlan {
             metadata_policy_degradations(metadata_policy),
             cli.fail_on_metadata_loss,
         );
-        add_metadata_degradations(
-            &mut report,
-            posix_metadata_request_from_cli(cli).degradations(metadata_policy),
-            cli.fail_on_metadata_loss,
-        );
         if cli.vss {
             add_metadata_degradations(
                 &mut report,
@@ -4006,6 +4097,17 @@ impl TransferPlan {
         } else {
             (None, None, None, None, Vec::new(), None, None)
         };
+
+        add_metadata_degradations(
+            &mut report,
+            posix_metadata_degradations_for_plan(
+                cli,
+                metadata_policy,
+                remote_direction,
+                daemon_direction,
+            ),
+            cli.fail_on_metadata_loss,
+        );
 
         Self {
             recursive,
@@ -4311,6 +4413,22 @@ fn posix_metadata_request_from_cli(cli: &Cli) -> PosixMetadataRequest {
     }
 }
 
+fn posix_metadata_degradations_for_plan(
+    cli: &Cli,
+    metadata_policy: MetadataPolicy,
+    remote_direction: Option<TransferDirection>,
+    daemon_direction: Option<TransferDirection>,
+) -> Vec<MetadataDegradation> {
+    let mut request = posix_metadata_request_from_cli(cli);
+
+    if daemon_direction.is_none() && remote_direction == Some(TransferDirection::Push) {
+        request.chmod = false;
+        request.executability = false;
+    }
+
+    request.degradations(metadata_policy)
+}
+
 fn posix_metadata_summary(plan: &TransferPlan) -> String {
     let mut parts = Vec::new();
     if plan.preserve_permissions {
@@ -4365,10 +4483,6 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
                 "--chmod is applied to POSIX mode bits for remote uploads; local Windows destinations do not chmod files",
             );
         }
-        report.warn(
-            metadata_code(MetadataFeature::Permissions, Severity::Warning),
-            "permissions metadata would be degraded",
-        );
     }
 
     for (enabled, flag) in [
@@ -5231,6 +5345,49 @@ mod tests {
     }
 
     #[test]
+    fn remote_push_chmod_with_fail_on_metadata_loss_keeps_supported_mapping() {
+        let output = parse_and_render([
+            "rsync-win",
+            "-r",
+            "--chmod",
+            "F600",
+            "--fail-on-metadata-loss",
+            "--plan",
+            "src",
+            "user@example.test:/tmp/dest",
+        ]);
+        let server_line = output
+            .lines()
+            .find(|line| line.starts_with("remote --server argv:"))
+            .unwrap();
+
+        assert!(output.contains("remote direction: upload (local -> remote)"));
+        assert!(server_line.contains("--chmod=F600"));
+        assert!(!output.contains("[error] E_METADATA_PERMISSIONS"));
+    }
+
+    #[test]
+    fn remote_push_executability_with_fail_on_metadata_loss_keeps_supported_mapping() {
+        let output = parse_and_render([
+            "rsync-win",
+            "-r",
+            "--executability",
+            "--fail-on-metadata-loss",
+            "--plan",
+            "src",
+            "user@example.test:/tmp/dest",
+        ]);
+        let server_line = output
+            .lines()
+            .find(|line| line.starts_with("remote --server argv:"))
+            .unwrap();
+
+        assert!(output.contains("remote direction: upload (local -> remote)"));
+        assert!(server_line.contains("--executability"));
+        assert!(!output.contains("[error] E_METADATA_LOSS"));
+    }
+
+    #[test]
     fn remote_pull_routes_sender_link_options_to_remote_server() {
         let copy_links_output = parse_and_render([
             "rsync-win",
@@ -6057,6 +6214,59 @@ mod tests {
     }
 
     #[test]
+    fn daemon_auth_user_prefers_operand_and_uses_local_env_fallback_order() {
+        let daemon = DaemonOperand::parse("alice@host::module").unwrap().unwrap();
+
+        assert_eq!(daemon_auth_user(&daemon).unwrap(), "alice");
+        assert_eq!(
+            daemon_auth_user_from_vars([
+                ("USER", Some(String::new())),
+                ("LOGNAME", Some(" logname ".to_string())),
+                ("USERNAME", Some("winuser".to_string())),
+            ]),
+            Some("logname".to_string())
+        );
+        assert_eq!(
+            daemon_auth_user_from_vars([
+                ("USER", Some("bad\0user".to_string())),
+                ("LOGNAME", None),
+                ("USERNAME", Some("winuser".to_string())),
+            ]),
+            Some("winuser".to_string())
+        );
+    }
+
+    #[test]
+    fn daemon_password_file_rejects_non_regular_paths() {
+        let root = unique_temp_dir("rsync-cli-password-file-dir");
+        fs::create_dir_all(&root).unwrap();
+
+        let err = read_password_file(&root).unwrap_err();
+
+        assert!(err.to_string().contains("must be a regular file"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_password_file_rejects_group_or_other_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("rsync-cli-password-file-perms");
+        fs::create_dir_all(&root).unwrap();
+        let password_file = root.join("pw.txt");
+        fs::write(&password_file, "secret\n").unwrap();
+        fs::set_permissions(&password_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = read_password_file(&password_file).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("must not be accessible by group or other users"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn daemon_module_listing_executes_over_in_memory_transport() {
         let cli = Cli::parse_from(["rsync-win", "--list-only", "host::"]);
         let plan = TransferPlan::from_cli(&cli);
@@ -6085,7 +6295,8 @@ mod tests {
         ]);
         let plan = TransferPlan::from_cli(&cli);
         let mut input = b"@RSYNCD: 31.0\n@RSYNCD: OK\n".to_vec();
-        input.extend_from_slice(&remote_pull_dry_run_input());
+        input.extend_from_slice(&daemon_protocol31_setup_input());
+        input.extend_from_slice(&daemon_pull_dry_run_input());
         let mut transport = TestTransport::with_input(input);
 
         let output = execute_daemon_sync_with_transport(&cli, &plan, &mut transport).unwrap();
@@ -6098,8 +6309,8 @@ mod tests {
             .starts_with(b"@RSYNCD: 31.0 md5 md4\nmodule\n--server\0--sender\0"));
         assert!(transport
             .written
-            .windows(b"module/file.txt\0".len())
-            .any(|window| window == b"module/file.txt\0"));
+            .windows(b"file.txt\0".len())
+            .any(|window| window == b"file.txt\0"));
         if root.exists() {
             fs::remove_dir_all(root).unwrap();
         }
@@ -6111,7 +6322,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let password_file = root.join("pw.txt");
         let dest = root.join("dest");
-        fs::write(&password_file, "secret\n").unwrap();
+        write_test_password_file(&password_file, "secret\n");
         let cli = Cli::parse_from([
             "rsync-win",
             "--dry-run",
@@ -6122,7 +6333,8 @@ mod tests {
         ]);
         let plan = TransferPlan::from_cli(&cli);
         let mut input = b"@RSYNCD: 31.0\n@RSYNCD: AUTHREQD challenge\n@RSYNCD: OK\n".to_vec();
-        input.extend_from_slice(&remote_pull_dry_run_input());
+        input.extend_from_slice(&daemon_protocol31_setup_input());
+        input.extend_from_slice(&daemon_pull_dry_run_input());
         let mut transport = TestTransport::with_input(input);
 
         let output = execute_daemon_sync_with_transport(&cli, &plan, &mut transport).unwrap();
@@ -6757,6 +6969,31 @@ mod tests {
     }
 
     #[test]
+    fn remote_sender_protect_filter_keeps_source_entries() {
+        let root = unique_temp_dir("rsync-cli-protect-sender");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("keep.bak"), b"backup").unwrap();
+        let filter_rules = RuleSet::new(vec![Rule::protect("*.bak").unwrap()]);
+        let options = LocalSourceCollectOptions {
+            recursive: true,
+            filter_rules: &filter_rules,
+            files_from: None,
+            symlink_mode: SymlinkMode::Preserve,
+            include_checksums: false,
+            preserve_executability: false,
+            chmod_rules: None,
+        };
+
+        let entries = collect_local_source_entries(&[source.clone()], &options).unwrap();
+
+        assert!(entries
+            .iter()
+            .any(|entry| entry.wire.path == PathBuf::from("keep.bak")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn chmod_rejects_complex_symbolic_forms_in_cli_plan() {
         let output = parse_and_render([
             "rsync-win",
@@ -6779,6 +7016,15 @@ mod tests {
             .unwrap_or_default();
         path.push(format!("{prefix}-{}-{nanos}", std::process::id()));
         path
+    }
+
+    fn write_test_password_file(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     fn test_remote_entry(path: &str, file_type: WireFileType) -> RsyncFileListEntry {
@@ -6921,6 +7167,39 @@ mod tests {
         )
     }
 
+    fn daemon_pull_dry_run_input() -> Vec<u8> {
+        remote_pull_dry_run_mux_input_with_entries(
+            &[
+                RsyncFileListEntry {
+                    path: PathBuf::from("."),
+                    file_type: WireFileType::Directory,
+                    len: 0,
+                    mtime_unix: 0,
+                    mode: RSYNC_DIRECTORY_MODE,
+                    checksum: None,
+                },
+                RsyncFileListEntry {
+                    path: PathBuf::from("file.txt"),
+                    file_type: WireFileType::File,
+                    len: 5,
+                    mtime_unix: 0,
+                    mode: RSYNC_REGULAR_FILE_MODE,
+                    checksum: None,
+                },
+            ],
+            1,
+        )
+    }
+
+    fn daemon_protocol31_setup_input() -> Vec<u8> {
+        let mut input = Vec::new();
+        input.extend_from_slice(&[0x81, 0xff]);
+        input.push(35);
+        input.extend_from_slice(b"xxh128 xxh3 xxh64 md5 md4 sha1 none");
+        input.extend_from_slice(&0_i32.to_le_bytes());
+        input
+    }
+
     fn remote_pull_file_list_only_input(entries: &[RsyncFileListEntry]) -> Vec<u8> {
         let mut input = remote_handshake_input();
         let mut flist = Vec::new();
@@ -7033,6 +7312,18 @@ mod tests {
         response_wire_index: i32,
     ) -> Vec<u8> {
         let mut input = remote_handshake_input();
+        input.extend(remote_pull_dry_run_mux_input_with_entries(
+            entries,
+            response_wire_index,
+        ));
+        input
+    }
+
+    fn remote_pull_dry_run_mux_input_with_entries(
+        entries: &[RsyncFileListEntry],
+        response_wire_index: i32,
+    ) -> Vec<u8> {
+        let mut input = Vec::new();
         let mut flist = Vec::new();
         write_rsync31_file_list_with_options(&mut flist, entries, false).unwrap();
         append_mux_payload(&mut input, &flist);
