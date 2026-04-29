@@ -24,6 +24,7 @@ pub enum RepeatBehavior {
 pub enum OptionScope {
     Client,
     Daemon,
+    Internal,
     Project,
 }
 
@@ -433,6 +434,27 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
     ),
 ];
 
+static INTERNAL_SERVER_OPTIONS: &[OptionSpec] = &[
+    spec(
+        "server",
+        None,
+        ValueKind::None,
+        RepeatBehavior::Forbid,
+        false,
+        OptionScope::Internal,
+        P,
+    ),
+    spec(
+        "sender",
+        None,
+        ValueKind::None,
+        RepeatBehavior::Forbid,
+        false,
+        OptionScope::Internal,
+        P,
+    ),
+];
+
 static PROJECT_OPTIONS: &[OptionSpec] = &[
     spec(
         "plan",
@@ -489,11 +511,78 @@ pub fn daemon_option_specs() -> &'static [OptionSpec] {
     DAEMON_OPTIONS
 }
 
+pub fn internal_server_option_specs() -> &'static [OptionSpec] {
+    INTERNAL_SERVER_OPTIONS
+}
+
 pub fn project_option_specs() -> &'static [OptionSpec] {
     PROJECT_OPTIONS
 }
 
+#[derive(Debug)]
+pub struct ParsedOptions {
+    cli: Cli,
+}
+
+impl ParsedOptions {
+    pub fn as_cli(&self) -> &Cli {
+        &self.cli
+    }
+
+    pub fn into_cli(self) -> Cli {
+        self.cli
+    }
+
+    pub fn is_plan(&self) -> bool {
+        self.cli.plan
+    }
+
+    pub fn is_help(&self) -> bool {
+        self.cli.help
+    }
+
+    pub fn is_version(&self) -> bool {
+        self.cli.version
+    }
+
+    pub fn verbosity(&self) -> u8 {
+        self.cli.verbosity
+    }
+
+    pub fn quiet(&self) -> u8 {
+        self.cli.quiet
+    }
+
+    pub fn human_readable(&self) -> u8 {
+        self.cli.human_readable
+    }
+
+    pub fn operands(&self) -> &[String] {
+        &self.cli.paths
+    }
+
+    pub fn remote_options(&self) -> &[String] {
+        &self.cli.remote_options
+    }
+}
+
+pub fn parse_options<I, T>(args: I) -> Result<ParsedOptions>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    parse_cli_impl(args).map(|cli| ParsedOptions { cli })
+}
+
 pub fn parse_cli<I, T>(args: I) -> Result<Cli>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    parse_options(args).map(ParsedOptions::into_cli)
+}
+
+fn parse_cli_impl<I, T>(args: I) -> Result<Cli>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -503,8 +592,17 @@ where
         .map(|arg| arg.into().to_string_lossy().into_owned())
         .collect();
     let mut cli = Cli::default();
-    let mut index = 1;
-    let help_only = raw.len() == 2 && matches!(raw[1].as_str(), "-h" | "--help");
+    let mut index = argument_start_index(&raw);
+    let help_only = raw.len() == index + 1
+        && raw
+            .get(index)
+            .is_some_and(|arg| matches!(arg.as_str(), "-h" | "--help"));
+
+    let option_scan_end = raw.iter().position(|arg| arg == "--").unwrap_or(raw.len());
+    if help_only || raw.iter().take(option_scan_end).any(|arg| arg == "--help") {
+        cli.help = true;
+        return Ok(cli);
+    }
 
     while index < raw.len() {
         let arg = &raw[index];
@@ -541,6 +639,24 @@ where
     }
 
     Ok(cli)
+}
+
+fn argument_start_index(raw: &[String]) -> usize {
+    if raw.first().is_some_and(|arg| is_program_name(arg)) {
+        1
+    } else {
+        0
+    }
+}
+
+fn is_program_name(arg: &str) -> bool {
+    let normalized = arg.replace('\\', "/");
+    let name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(arg)
+        .to_ascii_lowercase();
+    matches!(name.as_str(), "rsync-win" | "rsync-win.exe")
 }
 
 impl Default for Cli {
@@ -584,6 +700,9 @@ impl Default for Cli {
             fake_super: false,
             omit_link_times: false,
             vss: false,
+            daemon_server: false,
+            internal_server: false,
+            internal_sender: false,
             includes: Vec::new(),
             excludes: Vec::new(),
             filters: Vec::new(),
@@ -716,6 +835,7 @@ fn find_long_spec(name: &str) -> Option<&'static OptionSpec> {
         .iter()
         .chain(PROJECT_OPTIONS.iter())
         .chain(DAEMON_OPTIONS.iter())
+        .chain(INTERNAL_SERVER_OPTIONS.iter())
         .find(|spec| spec.long == name || spec.aliases.contains(&name))
 }
 
@@ -1030,6 +1150,18 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         "list-only" => cli.list_only = true,
         "stats" => cli.stats = true,
         "fsync" => cli.fsync = true,
+        "daemon" => {
+            cli.daemon_server = true;
+            remember_unsupported(cli, "--daemon");
+        }
+        "server" => {
+            cli.internal_server = true;
+            remember_unsupported(cli, "--server");
+        }
+        "sender" => {
+            cli.internal_sender = true;
+            remember_unsupported(cli, "--sender");
+        }
         "version" => cli.version = true,
         "plan" => cli.plan = true,
         "protocol-range" => cli.protocol_range = true,

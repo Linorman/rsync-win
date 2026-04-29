@@ -6,6 +6,7 @@
 //! helpers cover the non-incremental-recursion ordinary-file subset of the
 //! upstream protocol-31 flist format.
 
+use std::collections::BTreeMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -30,8 +31,10 @@ const XMIT31_SAME_GID: u32 = 1 << 4;
 const XMIT31_SAME_NAME: u32 = 1 << 5;
 const XMIT31_LONG_NAME: u32 = 1 << 6;
 const XMIT31_SAME_TIME: u32 = 1 << 7;
+const XMIT31_HLINKED: u32 = 1 << 9;
 const XMIT31_USER_NAME_FOLLOWS: u32 = 1 << 10;
 const XMIT31_GROUP_NAME_FOLLOWS: u32 = 1 << 11;
+const XMIT31_HLINK_FIRST: u32 = 1 << 12;
 const XMIT31_MOD_NSEC: u32 = 1 << 13;
 
 const S_IFMT: u32 = 0o170000;
@@ -71,6 +74,12 @@ pub struct FileListEntry {
     pub mtime_unix: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RsyncHardLinkGroup {
+    pub device: u64,
+    pub inode: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsyncFileListEntry {
     pub path: PathBuf,
@@ -79,6 +88,7 @@ pub struct RsyncFileListEntry {
     pub mtime_unix: i64,
     pub mode: u32,
     pub checksum: Option<[u8; 16]>,
+    pub hardlink_group: Option<RsyncHardLinkGroup>,
 }
 
 #[derive(Debug, Error)]
@@ -91,6 +101,8 @@ pub enum FileListError {
     InvalidUtf8,
     #[error("wire file path `{0}` contains a backslash; this transfer subset requires slash-separated rsync paths")]
     BackslashInPath(String),
+    #[error("wire file path `{0}` is not a portable relative rsync path")]
+    UnsafePath(String),
     #[error("file length {0} cannot be represented on the wire")]
     LengthTooLarge(u64),
     #[error("file path length {0} cannot be represented in protocol 27")]
@@ -258,7 +270,7 @@ pub fn read_rsync27_file_list_with_options<R: Read>(
     max_path_len: usize,
     expect_checksums: bool,
 ) -> Result<Vec<RsyncFileListEntry>, FileListError> {
-    let mut entries = Vec::new();
+    let mut entries = Vec::<RsyncFileListEntry>::new();
     let mut last_path = Vec::<u8>::new();
     let mut last_mode = None::<u32>;
     let mut last_mtime = None::<i64>;
@@ -352,6 +364,7 @@ pub fn read_rsync27_file_list_with_options<R: Read>(
             mtime_unix: mtime,
             mode,
             checksum,
+            hardlink_group: None,
         });
         last_path = path_bytes;
         last_mtime = Some(mtime);
@@ -376,15 +389,28 @@ pub fn write_rsync31_file_list_with_options<W: Write>(
     let mut last_path = Vec::<u8>::new();
     let mut last_mode = None::<u32>;
     let mut last_mtime = None::<i64>;
+    let mut hardlink_groups = BTreeMap::<RsyncHardLinkGroup, usize>::new();
 
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         let path = wire_path_bytes(&entry.path);
         let inherited = common_prefix_len(&last_path, &path);
         let suffix = &path[inherited..];
         let mut flags = XMIT31_SAME_UID | XMIT31_SAME_GID;
+        let mut hardlink_reference = None;
 
         if entry.file_type == WireFileType::Directory && entry.path == Path::new(".") {
             flags |= XMIT31_TOP_DIR;
+        }
+        if entry.file_type == WireFileType::File {
+            if let Some(group) = entry.hardlink_group {
+                flags |= XMIT31_HLINKED;
+                if let Some(first_index) = hardlink_groups.get(&group) {
+                    hardlink_reference = Some(*first_index);
+                } else {
+                    hardlink_groups.insert(group, index);
+                    flags |= XMIT31_HLINK_FIRST;
+                }
+            }
         }
         if last_mode == Some(entry.mode) {
             flags |= XMIT31_SAME_MODE;
@@ -414,6 +440,19 @@ pub fn write_rsync31_file_list_with_options<W: Write>(
             write_u8(writer, suffix.len() as u8)?;
         }
         writer.write_all(suffix)?;
+        if let Some(first_index) = hardlink_reference {
+            let first_index = u32::try_from(first_index).map_err(|_| {
+                FileListError::Io(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "hardlink file-list index exceeds protocol 31 varint range",
+                ))
+            })?;
+            write_varint(writer, first_index)?;
+            last_path = path;
+            last_mode = Some(entry.mode);
+            last_mtime = Some(entry.mtime_unix);
+            continue;
+        }
         write_varlong(writer, entry.len, 3)?;
         if flags & XMIT31_SAME_TIME == 0 {
             let mtime = u64::try_from(entry.mtime_unix).map_err(|_| {
@@ -460,7 +499,7 @@ pub fn read_rsync31_file_list_with_options<R: Read>(
     max_path_len: usize,
     expect_checksums: bool,
 ) -> Result<Vec<RsyncFileListEntry>, FileListError> {
-    let mut entries = Vec::new();
+    let mut entries = Vec::<RsyncFileListEntry>::new();
     let mut last_path = Vec::<u8>::new();
     let mut last_mode = None::<u32>;
     let mut last_mtime = None::<i64>;
@@ -518,56 +557,96 @@ pub fn read_rsync31_file_list_with_options<R: Read>(
         path_bytes.resize(total_len, 0);
         reader.read_exact(&mut path_bytes[inherited..])?;
 
-        let len = read_varlong(reader, 3)?;
-        let mtime = if flags & XMIT31_SAME_TIME != 0 {
-            last_mtime.ok_or_else(|| {
-                FileListError::Io(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "file list repeated mtime without previous value",
-                ))
-            })?
-        } else {
-            let value = read_varlong(reader, 4)?;
-            i64::try_from(value).map_err(|_| {
-                FileListError::Io(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "protocol 31 mtime is outside i64 range",
-                ))
-            })?
-        };
-        if flags & XMIT31_MOD_NSEC != 0 {
-            let _mtime_nsec = read_varint(reader)?;
-        }
-        let mode = if flags & XMIT31_SAME_MODE != 0 {
-            last_mode.ok_or_else(|| {
-                FileListError::Io(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "file list repeated mode without previous value",
-                ))
-            })?
-        } else {
-            read_i32_le(reader)? as u32
-        };
-
-        if flags & XMIT31_SAME_UID == 0 {
-            let _uid = read_varint(reader)?;
-            if flags & XMIT31_USER_NAME_FOLLOWS != 0 {
-                read_ignored_name(reader)?;
-            }
-        }
-        if flags & XMIT31_SAME_GID == 0 {
-            let _gid = read_varint(reader)?;
-            if flags & XMIT31_GROUP_NAME_FOLLOWS != 0 {
-                read_ignored_name(reader)?;
-            }
-        }
         let path = wire_path_from_bytes(&path_bytes)?;
-        let file_type = file_type_from_mode(mode)?;
-        let checksum = if expect_checksums && file_type == WireFileType::File {
-            Some(read_checksum(reader)?)
+        let hardlink_reference = if flags & XMIT31_HLINKED != 0 && flags & XMIT31_HLINK_FIRST == 0 {
+            let first_index = read_varint(reader)? as usize;
+            if first_index >= entries.len() {
+                return Err(FileListError::Io(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "hardlink reference {first_index} exceeds file-list entries read so far"
+                    ),
+                )));
+            }
+            Some(first_index)
         } else {
             None
         };
+        let (file_type, len, mtime, mode, checksum, hardlink_group) =
+            if let Some(first_index) = hardlink_reference {
+                let first = &entries[first_index];
+                let group = first.hardlink_group.unwrap_or(RsyncHardLinkGroup {
+                    device: 0,
+                    inode: first_index as u64,
+                });
+                (
+                    first.file_type,
+                    first.len,
+                    first.mtime_unix,
+                    first.mode,
+                    first.checksum,
+                    Some(group),
+                )
+            } else {
+                let len = read_varlong(reader, 3)?;
+                let mtime = if flags & XMIT31_SAME_TIME != 0 {
+                    last_mtime.ok_or_else(|| {
+                        FileListError::Io(io::Error::new(
+                            ErrorKind::InvalidData,
+                            "file list repeated mtime without previous value",
+                        ))
+                    })?
+                } else {
+                    let value = read_varlong(reader, 4)?;
+                    i64::try_from(value).map_err(|_| {
+                        FileListError::Io(io::Error::new(
+                            ErrorKind::InvalidData,
+                            "protocol 31 mtime is outside i64 range",
+                        ))
+                    })?
+                };
+                if flags & XMIT31_MOD_NSEC != 0 {
+                    let _mtime_nsec = read_varint(reader)?;
+                }
+                let mode = if flags & XMIT31_SAME_MODE != 0 {
+                    last_mode.ok_or_else(|| {
+                        FileListError::Io(io::Error::new(
+                            ErrorKind::InvalidData,
+                            "file list repeated mode without previous value",
+                        ))
+                    })?
+                } else {
+                    read_i32_le(reader)? as u32
+                };
+
+                if flags & XMIT31_SAME_UID == 0 {
+                    let _uid = read_varint(reader)?;
+                    if flags & XMIT31_USER_NAME_FOLLOWS != 0 {
+                        read_ignored_name(reader)?;
+                    }
+                }
+                if flags & XMIT31_SAME_GID == 0 {
+                    let _gid = read_varint(reader)?;
+                    if flags & XMIT31_GROUP_NAME_FOLLOWS != 0 {
+                        read_ignored_name(reader)?;
+                    }
+                }
+                let file_type = file_type_from_mode(mode)?;
+                let checksum = if expect_checksums && file_type == WireFileType::File {
+                    Some(read_checksum(reader)?)
+                } else {
+                    None
+                };
+                let hardlink_group = if flags & XMIT31_HLINKED != 0 {
+                    Some(RsyncHardLinkGroup {
+                        device: 0,
+                        inode: entries.len() as u64,
+                    })
+                } else {
+                    None
+                };
+                (file_type, len, mtime, mode, checksum, hardlink_group)
+            };
         entries.push(RsyncFileListEntry {
             path,
             file_type,
@@ -575,6 +654,7 @@ pub fn read_rsync31_file_list_with_options<R: Read>(
             mtime_unix: mtime,
             mode,
             checksum,
+            hardlink_group,
         });
         last_path = path_bytes;
         last_mtime = Some(mtime);
@@ -625,7 +705,57 @@ fn wire_path_from_bytes(path_bytes: &[u8]) -> Result<PathBuf, FileListError> {
     if path.contains('\\') {
         return Err(FileListError::BackslashInPath(path.to_owned()));
     }
+    validate_wire_path(path)?;
     Ok(PathBuf::from(path))
+}
+
+fn validate_wire_path(path: &str) -> Result<(), FileListError> {
+    if path == "." {
+        return Ok(());
+    }
+    if path.is_empty() || path.starts_with('/') {
+        return Err(FileListError::UnsafePath(path.to_owned()));
+    }
+
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(FileListError::UnsafePath(path.to_owned()));
+        }
+        if component.ends_with(' ') || component.ends_with('.') {
+            return Err(FileListError::UnsafePath(path.to_owned()));
+        }
+        if component
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            return Err(FileListError::UnsafePath(path.to_owned()));
+        }
+        if is_reserved_windows_name(component) {
+            return Err(FileListError::UnsafePath(path.to_owned()));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_reserved_windows_name(component: &str) -> bool {
+    let stem = component
+        .split_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(component)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || is_numbered_reserved_name(&stem, "COM")
+        || is_numbered_reserved_name(&stem, "LPT")
+}
+
+fn is_numbered_reserved_name(stem: &str, prefix: &str) -> bool {
+    let Some(number) = stem.strip_prefix(prefix) else {
+        return false;
+    };
+    matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
 }
 
 fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
@@ -795,6 +925,7 @@ mod tests {
                 mtime_unix: 1_700_000_000,
                 mode: RSYNC_DIRECTORY_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
             RsyncFileListEntry {
                 path: PathBuf::from("dir/file.txt"),
@@ -803,6 +934,7 @@ mod tests {
                 mtime_unix: 1_700_000_001,
                 mode: RSYNC_REGULAR_FILE_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
         ];
 
@@ -872,6 +1004,7 @@ mod tests {
                 mtime_unix: 1_700_000_000,
                 mode: RSYNC_DIRECTORY_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
             RsyncFileListEntry {
                 path: PathBuf::from("dir"),
@@ -880,6 +1013,7 @@ mod tests {
                 mtime_unix: 1_700_000_000,
                 mode: RSYNC_DIRECTORY_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
             RsyncFileListEntry {
                 path: PathBuf::from("dir/file.txt"),
@@ -888,6 +1022,7 @@ mod tests {
                 mtime_unix: 1_700_000_000,
                 mode: RSYNC_REGULAR_FILE_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
         ];
 
@@ -909,6 +1044,7 @@ mod tests {
             mtime_unix: 1_700_000_000,
             mode: RSYNC_DIRECTORY_MODE,
             checksum: None,
+            hardlink_group: None,
         }];
 
         let mut protocol27 = Vec::new();
@@ -933,6 +1069,7 @@ mod tests {
                 mtime_unix: 1_700_000_000,
                 mode: RSYNC_DIRECTORY_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
             RsyncFileListEntry {
                 path: PathBuf::from("file.txt"),
@@ -941,6 +1078,7 @@ mod tests {
                 mtime_unix: 1_700_000_000,
                 mode: RSYNC_REGULAR_FILE_MODE,
                 checksum: Some(checksum),
+                hardlink_group: None,
             },
         ];
 
@@ -951,5 +1089,43 @@ mod tests {
             read_rsync31_file_list_with_options(&mut bytes.as_slice(), 16, 256, true).unwrap(),
             entries
         );
+    }
+
+    #[test]
+    fn writes_and_reads_protocol31_hardlink_groups() {
+        let group = RsyncHardLinkGroup {
+            device: 7,
+            inode: 11,
+        };
+        let entries = vec![
+            RsyncFileListEntry {
+                path: PathBuf::from("original.txt"),
+                file_type: WireFileType::File,
+                len: 5,
+                mtime_unix: 1_700_000_000,
+                mode: RSYNC_REGULAR_FILE_MODE,
+                checksum: Some([3_u8; 16]),
+                hardlink_group: Some(group),
+            },
+            RsyncFileListEntry {
+                path: PathBuf::from("alias.txt"),
+                file_type: WireFileType::File,
+                len: 5,
+                mtime_unix: 1_700_000_000,
+                mode: RSYNC_REGULAR_FILE_MODE,
+                checksum: Some([3_u8; 16]),
+                hardlink_group: Some(group),
+            },
+        ];
+
+        let mut bytes = Vec::new();
+        write_rsync31_file_list_with_options(&mut bytes, &entries, true).unwrap();
+        let decoded =
+            read_rsync31_file_list_with_options(&mut bytes.as_slice(), 16, 256, true).unwrap();
+
+        assert_eq!(decoded[0].hardlink_group, decoded[1].hardlink_group);
+        assert!(decoded[0].hardlink_group.is_some());
+        assert_eq!(decoded[1].len, decoded[0].len);
+        assert_eq!(decoded[1].checksum, decoded[0].checksum);
     }
 }

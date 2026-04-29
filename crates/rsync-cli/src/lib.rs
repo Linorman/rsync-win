@@ -35,10 +35,10 @@ use rsync_protocol::{
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
     DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter, RemoteDeleteMode,
     RemoteSessionError, RemoteShellOperand, RemoteShellOptions, RsyncFileListEntry,
-    RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection, WireFileType,
-    DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION,
-    MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL,
-    RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
+    RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection,
+    WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
+    MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
+    REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
@@ -190,6 +190,15 @@ pub struct Cli {
 
     #[arg(long = "vss", action = ArgAction::SetTrue, help = "Request VSS snapshot source mode for ntfs-native transfers")]
     vss: bool,
+
+    #[arg(skip)]
+    daemon_server: bool,
+
+    #[arg(skip)]
+    internal_server: bool,
+
+    #[arg(skip)]
+    internal_sender: bool,
 
     #[arg(long = "include", help = "Add an include filter pattern")]
     includes: Vec<String>,
@@ -481,6 +490,7 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
         "protocol primitives range: {}\n",
         supported_protocol_range()
     ));
+    output.push_str(&format!("transfer mode: {}\n", plan.transfer_mode.label()));
     output.push_str(&format!("metadata policy: {}\n", plan.metadata_policy));
     output.push_str(&format!("recursive: {}\n", plan.recursive));
     output.push_str(&format!("relative: {}\n", plan.relative));
@@ -632,6 +642,12 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
             output.push_str("daemon auth: password-file configured\n");
         }
     }
+    if plan.transfer_mode == TransferMode::DaemonServer {
+        output.push_str("daemon mode: server\n");
+    }
+    if plan.transfer_mode == TransferMode::InternalServer {
+        output.push_str("internal server mode: remote peer\n");
+    }
 
     if let Some(argv) = &plan.remote_server_argv {
         output.push_str("remote --server argv:");
@@ -676,7 +692,7 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
 }
 
 fn execute_or_render(cli: &Cli) -> Result<String> {
-    if cli.version || cli.protocol_range || cli.plan {
+    if cli.help || cli.version || cli.protocol_range || cli.plan {
         return Ok(render_output(cli));
     }
 
@@ -719,6 +735,7 @@ struct LocalSourceCollectOptions<'a> {
     symlink_mode: SymlinkMode,
     include_checksums: bool,
     preserve_executability: bool,
+    preserve_hard_links: bool,
     chmod_rules: Option<&'a ChmodRules>,
 }
 
@@ -888,6 +905,27 @@ impl RemoteWireProtocol {
         match self {
             Self::Compat27 => "protocol 27 compatibility mode",
             Self::Modern31 => "protocol 31 ordinary-file MVP",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferMode {
+    Local,
+    RemoteShell,
+    DaemonClient,
+    DaemonServer,
+    InternalServer,
+}
+
+impl TransferMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::RemoteShell => "remote-shell",
+            Self::DaemonClient => "daemon-client",
+            Self::DaemonServer => "daemon-server",
+            Self::InternalServer => "internal-server",
         }
     }
 }
@@ -2425,6 +2463,7 @@ fn local_source_collect_options<'a>(
         symlink_mode: plan.symlink_mode,
         include_checksums: plan.update_mode == UpdateMode::Checksum,
         preserve_executability: plan.preserve_executability,
+        preserve_hard_links: plan.hard_links,
         chmod_rules: plan.chmod_rules.as_ref(),
     }
 }
@@ -2479,6 +2518,10 @@ fn collect_single_local_source_entries(
                     .include_checksums
                     .then(|| checksum_local_path(source))
                     .transpose()?,
+                hardlink_group: remote_hardlink_group(
+                    &source_metadata,
+                    options.preserve_hard_links,
+                ),
             },
             local_path: source.to_path_buf(),
         });
@@ -2497,6 +2540,7 @@ fn collect_single_local_source_entries(
             mtime_unix: system_time_to_unix(source_metadata.modified),
             mode: RSYNC_DIRECTORY_MODE,
             checksum: None,
+            hardlink_group: None,
         },
         local_path: source.to_path_buf(),
     });
@@ -2582,6 +2626,7 @@ fn collect_batch_local_source_entries(
                 checksum: (options.include_checksums && file_type == WireFileType::File)
                     .then(|| checksum_local_path(source))
                     .transpose()?,
+                hardlink_group: remote_hardlink_group(&metadata, options.preserve_hard_links),
             },
             local_path: source.clone(),
         });
@@ -2685,6 +2730,7 @@ fn collect_local_directory_source_entries(
                 checksum: (ctx.options.include_checksums && file_type == WireFileType::File)
                     .then(|| checksum_local_path(&original_path))
                     .transpose()?,
+                hardlink_group: remote_hardlink_group(&metadata, ctx.options.preserve_hard_links),
             },
             local_path: original_path.clone(),
         });
@@ -2720,6 +2766,22 @@ fn remote_wire_mode(
         (Some(rules), WireFileType::Directory) => rules.apply(mode, ChmodFileKind::Directory),
         _ => mode,
     }
+}
+
+fn remote_hardlink_group(
+    metadata: &rsync_fs::PortableMetadata,
+    preserve_hard_links: bool,
+) -> Option<RsyncHardLinkGroup> {
+    if !preserve_hard_links || metadata.file_type != FileType::File {
+        return None;
+    }
+    if metadata.hardlink_count.unwrap_or(1) <= 1 {
+        return None;
+    }
+    metadata.hardlink_id.map(|id| RsyncHardLinkGroup {
+        device: id.volume,
+        inode: id.file,
+    })
 }
 
 fn remote_sender_metadata(
@@ -4160,6 +4222,7 @@ fn validate_remote_file_list_paths(entries: &[RsyncFileListEntry]) -> Result<()>
 
 #[derive(Debug)]
 struct TransferPlan {
+    transfer_mode: TransferMode,
     recursive: bool,
     relative: bool,
     implied_dirs: bool,
@@ -4291,8 +4354,12 @@ impl TransferPlan {
             FileWriteMode::Atomic
         };
         let symlink_mode = symlink_mode_from_cli(cli);
-        let (daemon_operand, daemon_direction, has_daemon_operand) =
-            plan_daemon_operands(cli, &mut report);
+        let explicit_server_mode = cli.daemon_server || cli.internal_server;
+        let (daemon_operand, daemon_direction, has_daemon_operand) = if explicit_server_mode {
+            (None, None, false)
+        } else {
+            plan_daemon_operands(cli, &mut report)
+        };
         let (
             remote_server_argv,
             remote_ssh_argv,
@@ -4301,7 +4368,7 @@ impl TransferPlan {
             remote_operands,
             remote_direction,
             remote_wire_protocol,
-        ) = if has_daemon_operand {
+        ) = if explicit_server_mode || has_daemon_operand {
             (None, None, None, None, Vec::new(), None, None)
         } else if cli.paths.len() >= 2 {
             let sources = &cli.paths[..cli.paths.len() - 1];
@@ -4456,8 +4523,11 @@ impl TransferPlan {
             ),
             cli.fail_on_metadata_loss,
         );
+        let transfer_mode = transfer_mode_from_cli(cli, has_daemon_operand, remote_direction);
+        add_mode_gating_diagnostics(cli, transfer_mode, has_daemon_operand, &mut report);
 
         Self {
+            transfer_mode,
             recursive,
             relative: cli.relative,
             implied_dirs: cli.implied_dirs,
@@ -4542,6 +4612,105 @@ impl TransferPlan {
             daemon_operand,
             daemon_direction,
             report,
+        }
+    }
+}
+
+fn transfer_mode_from_cli(
+    cli: &Cli,
+    has_daemon_operand: bool,
+    remote_direction: Option<TransferDirection>,
+) -> TransferMode {
+    if cli.daemon_server {
+        TransferMode::DaemonServer
+    } else if cli.internal_server {
+        TransferMode::InternalServer
+    } else if has_daemon_operand {
+        TransferMode::DaemonClient
+    } else if remote_direction.is_some() {
+        TransferMode::RemoteShell
+    } else {
+        TransferMode::Local
+    }
+}
+
+fn add_mode_gating_diagnostics(
+    cli: &Cli,
+    transfer_mode: TransferMode,
+    has_daemon_operand: bool,
+    report: &mut Report,
+) {
+    let has_daemon_syntax =
+        has_daemon_operand || cli.paths.iter().any(|path| is_daemon_operand_syntax(path));
+    let has_remote_shell_syntax = cli.paths.iter().any(|path| is_remote_shell_operand(path));
+
+    if cli.daemon_server && cli.internal_server {
+        report.error(
+            "E_MODE_CONFLICT",
+            "--daemon and --server select different rsync execution modes",
+        );
+    }
+    if cli.internal_sender && !cli.internal_server {
+        report.warn(
+            "W_MODE_SCOPED_OPTION",
+            "--sender is an internal --server modifier and has no standalone client behavior",
+        );
+    }
+    if has_daemon_syntax && has_remote_shell_syntax {
+        report.error(
+            "E_MODE_CONFLICT",
+            "daemon operands cannot be mixed with remote-shell operands",
+        );
+    }
+
+    match transfer_mode {
+        TransferMode::DaemonServer => {
+            report.error(
+                "E_UNSUPPORTED_MODE",
+                "daemon server mode is parsed and gated but not implemented by this build",
+            );
+            if has_remote_shell_syntax || has_daemon_syntax || !cli.paths.is_empty() {
+                report.error(
+                    "E_MODE_CONFLICT",
+                    "--daemon server mode does not accept transfer operands",
+                );
+            }
+        }
+        TransferMode::InternalServer => {
+            report.error(
+                "E_UNSUPPORTED_MODE",
+                "internal --server mode is reserved for rsync peer execution and is not a public entrypoint in this build",
+            );
+            if cli.daemon_server {
+                report.error(
+                    "E_MODE_CONFLICT",
+                    "internal --server mode cannot be combined with daemon server mode",
+                );
+            }
+        }
+        TransferMode::DaemonClient => {
+            if cli.remote_shell.is_some() {
+                report.error(
+                    "E_MODE_CONFLICT",
+                    "daemon client mode does not use --rsh/-e",
+                );
+            }
+        }
+        TransferMode::RemoteShell => {
+            if cli.password_file.is_some() {
+                report.warn(
+                    "W_MODE_SCOPED_OPTION",
+                    "--password-file applies to rsync daemon authentication, not remote-shell mode",
+                );
+            }
+        }
+        TransferMode::Local => {
+            if cli.password_file.is_some() {
+                report.warn(
+                    "W_MODE_SCOPED_OPTION",
+                    "--password-file applies to rsync daemon authentication, not local mode",
+                );
+            }
         }
     }
 }
@@ -5181,6 +5350,20 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
 }
 
 fn add_option_conflict_diagnostics(cli: &Cli, report: &mut Report) {
+    if let (Some(min_size), Some(max_size)) = (cli.min_size, cli.max_size) {
+        if min_size > max_size {
+            report.error(
+                "E_OPTION_CONFLICT",
+                "--min-size cannot be greater than --max-size",
+            );
+        }
+    }
+    if cli.ignore_missing_args && cli.delete_missing_args {
+        report.error(
+            "E_OPTION_CONFLICT",
+            "--ignore-missing-args cannot be combined with --delete-missing-args",
+        );
+    }
     if cli.inplace && cli.delay_updates {
         report.error(
             "E_OPTION_CONFLICT",
@@ -5191,6 +5374,35 @@ fn add_option_conflict_diagnostics(cli: &Cli, report: &mut Report) {
         report.error(
             "E_OPTION_CONFLICT",
             "--inplace and --partial-dir cannot both control the same write path",
+        );
+    }
+    if cli.inplace && cli.temp_dir.is_some() {
+        report.error(
+            "E_OPTION_CONFLICT",
+            "--inplace and --temp-dir cannot both control the same write path",
+        );
+    }
+    if cli.fake_super && cli.metadata_policy == CliMetadataPolicy::NtfsNative {
+        report.error(
+            "E_OPTION_CONFLICT",
+            "--fake-super cannot be combined with --metadata-policy=ntfs-native",
+        );
+    }
+    let link_modes = [
+        cli.links,
+        cli.copy_links,
+        cli.copy_dirlinks,
+        cli.copy_unsafe_links,
+        cli.safe_links,
+        cli.munge_links,
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count();
+    if !cli.no_links && link_modes > 1 {
+        report.warn(
+            "W_OPTION_OVERLAP",
+            "multiple symlink transfer modes were requested; rsync-win applies its current precedence while preserving the diagnostic",
         );
     }
     if cli.existing && cli.ignore_existing {
@@ -6593,6 +6805,7 @@ mod tests {
                 mtime_unix: 0,
                 mode: RSYNC_REGULAR_FILE_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
         ]));
 
@@ -6631,6 +6844,7 @@ mod tests {
                     mtime_unix: 0,
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
+                    hardlink_group: None,
                 },
             ]));
 
@@ -6638,7 +6852,7 @@ mod tests {
 
             assert!(
                 err.to_string()
-                    .contains("destination path preflight failed"),
+                    .contains("not a portable relative rsync path"),
                 "{wire_path}: {err:#}"
             );
             assert!(
@@ -6657,9 +6871,17 @@ mod tests {
     #[test]
     fn remote_pull_rejects_security_reserved_trailing_and_unicode_paths_before_writes() {
         for (label, wire_path, expected) in [
-            ("reserved", "CON.txt", "reserved Windows device name"),
-            ("trailing-dot", "dir/bad.", "ends with a space or dot"),
-            ("trailing-space", "dir/bad ", "ends with a space or dot"),
+            ("reserved", "CON.txt", "not a portable relative rsync path"),
+            (
+                "trailing-dot",
+                "dir/bad.",
+                "not a portable relative rsync path",
+            ),
+            (
+                "trailing-space",
+                "dir/bad ",
+                "not a portable relative rsync path",
+            ),
         ] {
             let root = unique_temp_dir(&format!("rsync-cli-remote-pull-{label}"));
             let dest = root.join("dest");
@@ -6680,6 +6902,7 @@ mod tests {
                     mtime_unix: 0,
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
+                    hardlink_group: None,
                 },
             ]));
 
@@ -7654,6 +7877,7 @@ mod tests {
             symlink_mode: SymlinkMode::Preserve,
             include_checksums: false,
             preserve_executability: true,
+            preserve_hard_links: false,
             chmod_rules: None,
         };
 
@@ -7692,6 +7916,7 @@ mod tests {
             symlink_mode: SymlinkMode::Preserve,
             include_checksums: false,
             preserve_executability: false,
+            preserve_hard_links: false,
             chmod_rules: Some(&chmod_rules),
         };
 
@@ -7727,6 +7952,7 @@ mod tests {
             symlink_mode: SymlinkMode::Preserve,
             include_checksums: false,
             preserve_executability: false,
+            preserve_hard_links: false,
             chmod_rules: None,
         };
 
@@ -7736,6 +7962,50 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.wire.path.as_path() == Path::new("keep.bak")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_sender_marks_hardlink_groups_in_file_list() {
+        let root = unique_temp_dir("rsync-cli-remote-hardlink-groups");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let original = source.join("original.txt");
+        let alias = source.join("alias.txt");
+        fs::write(&original, b"same").unwrap();
+        if fs::hard_link(&original, &alias).is_err() {
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let filter_rules = RuleSet::empty();
+        let options = LocalSourceCollectOptions {
+            recursive: true,
+            filter_rules: &filter_rules,
+            files_from: None,
+            symlink_mode: SymlinkMode::Preserve,
+            include_checksums: false,
+            preserve_executability: false,
+            preserve_hard_links: true,
+            chmod_rules: None,
+        };
+
+        let entries =
+            collect_local_source_entries(std::slice::from_ref(&source), &options).unwrap();
+        let original_entry = entries
+            .iter()
+            .find(|entry| entry.wire.path.as_path() == Path::new("original.txt"))
+            .unwrap();
+        let alias_entry = entries
+            .iter()
+            .find(|entry| entry.wire.path.as_path() == Path::new("alias.txt"))
+            .unwrap();
+
+        assert!(original_entry.wire.hardlink_group.is_some());
+        assert_eq!(
+            original_entry.wire.hardlink_group,
+            alias_entry.wire.hardlink_group
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7784,6 +8054,7 @@ mod tests {
                 _ => RSYNC_REGULAR_FILE_MODE,
             },
             checksum: None,
+            hardlink_group: None,
         }
     }
 
@@ -7899,6 +8170,7 @@ mod tests {
                     mtime_unix: 0,
                     mode: RSYNC_DIRECTORY_MODE,
                     checksum: None,
+                    hardlink_group: None,
                 },
                 RsyncFileListEntry {
                     path: PathBuf::from("file.txt"),
@@ -7907,6 +8179,7 @@ mod tests {
                     mtime_unix: 0,
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
+                    hardlink_group: None,
                 },
             ],
             1,
@@ -7923,6 +8196,7 @@ mod tests {
                     mtime_unix: 0,
                     mode: RSYNC_DIRECTORY_MODE,
                     checksum: None,
+                    hardlink_group: None,
                 },
                 RsyncFileListEntry {
                     path: PathBuf::from("file.txt"),
@@ -7931,6 +8205,7 @@ mod tests {
                     mtime_unix: 0,
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
+                    hardlink_group: None,
                 },
             ],
             1,
@@ -7985,6 +8260,7 @@ mod tests {
                 mtime_unix: 0,
                 mode: RSYNC_DIRECTORY_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
             RsyncFileListEntry {
                 path: PathBuf::from(path),
@@ -7993,6 +8269,7 @@ mod tests {
                 mtime_unix: 0,
                 mode: RSYNC_REGULAR_FILE_MODE,
                 checksum: None,
+                hardlink_group: None,
             },
         ]);
 
@@ -8039,6 +8316,7 @@ mod tests {
                     mtime_unix: 0,
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
+                    hardlink_group: None,
                 },
                 RsyncFileListEntry {
                     path: PathBuf::from("file.txt"),
@@ -8047,6 +8325,7 @@ mod tests {
                     mtime_unix: 0,
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
+                    hardlink_group: None,
                 },
             ],
             1,

@@ -32,5 +32,13 @@ name = "daemon"
 path = "../../tests/interop/daemon.rs"
 
 [[test]]
+name = "rsync_compat"
+path = "../../tests/interop/rsync_compat.rs"
+
+[[test]]
 name = "options"
 path = "../../tests/compat/options.rs"
+
+[[test]]
+name = "security_remote_peer"
+path = "../../tests/security/remote_peer.rs"

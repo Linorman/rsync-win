@@ -325,6 +325,42 @@ mod tests {
     }
 
     #[test]
+    fn upstream_include_only_c_sources_example_keeps_directories() {
+        let rules = RuleSet::new(vec![
+            Rule::parse_filter("+ */").unwrap(),
+            Rule::parse_filter("+ *.c").unwrap(),
+            Rule::parse_filter("- *").unwrap(),
+        ]);
+
+        assert!(rules.is_included("src", EntryKind::Directory));
+        assert!(rules.is_included("src/main.c", EntryKind::File));
+        assert!(!rules.is_included("src/main.o", EntryKind::File));
+        assert!(!rules.is_included("README.md", EntryKind::File));
+    }
+
+    #[test]
+    fn upstream_hide_and_protect_examples_are_side_specific() {
+        let rules = RuleSet::new(vec![
+            Rule::parse_filter("hide *.o").unwrap(),
+            Rule::parse_filter("protect *.bak").unwrap(),
+        ]);
+
+        assert_eq!(
+            rules
+                .decide_for_side("build/main.o", EntryKind::File, RuleSide::Sender)
+                .action(),
+            RuleAction::Hide
+        );
+        assert_eq!(
+            rules
+                .decide_for_side("archive/old.bak", EntryKind::File, RuleSide::Receiver)
+                .action(),
+            RuleAction::Protect
+        );
+        assert!(rules.is_included_for_side("archive/old.bak", EntryKind::File, RuleSide::Sender));
+    }
+
+    #[test]
     fn rule_set_exposes_delete_protection_actions() {
         let rules = RuleSet::new(vec![
             Rule::protect("*.bak").unwrap(),

@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use rsync_cli::options::{daemon_option_specs, project_option_specs, upstream_client_option_specs};
-use rsync_cli::{parse_and_render, parse_and_render_result};
+use rsync_cli::options::{
+    daemon_option_specs, parse_options, project_option_specs, upstream_client_option_specs,
+};
+use rsync_cli::{parse_and_execute, parse_and_render, parse_and_render_result};
 
 #[test]
 fn upstream_client_registry_contains_upstream_rsync_long_options() {
@@ -375,6 +377,60 @@ fn repeated_human_readable_and_help_match_rsync_h_behavior() {
 
     let output = parse_and_render(["rsync-win", "--plan", "-hh", "src", "dst"]);
     assert!(output.contains("human readable: 2"));
+
+    let mixed_help = parse_and_render(["rsync-win", "--help", "-h"]);
+    assert!(mixed_help.contains("Usage: rsync-win"));
+    assert!(mixed_help.contains("--archive"));
+}
+
+#[test]
+fn parser_accepts_repeated_verbosity_and_version_flags() {
+    let output = parse_and_render(["rsync-win", "--plan", "-vv", "--verbose", "src", "dst"]);
+    assert!(output.contains("verbosity: 3"));
+
+    let long_version = parse_and_render(["rsync-win", "--version", "--version"]);
+    assert!(long_version.contains("rsync-win "));
+    assert!(long_version.contains("protocol primitives range:"));
+
+    let short_version = parse_and_render(["rsync-win", "-VV"]);
+    assert!(short_version.contains("rsync-win "));
+    assert!(short_version.contains("protocol primitives range:"));
+}
+
+#[test]
+fn parser_exposes_structured_parsed_options() {
+    let parsed = parse_options([
+        "rsync-win",
+        "--plan",
+        "-vv",
+        "--remote-option=--fake-super",
+        "src",
+        "host:/dst",
+    ])
+    .unwrap();
+
+    assert!(parsed.is_plan());
+    assert_eq!(parsed.verbosity(), 2);
+    assert_eq!(parsed.operands(), ["src", "host:/dst"]);
+    assert_eq!(parsed.remote_options(), ["--fake-super"]);
+}
+
+#[test]
+fn parser_accepts_help_without_explicit_program_name() {
+    for args in [["--help"], ["-h"]] {
+        let help = parse_and_render(args);
+
+        assert!(help.contains("Usage: rsync-win"), "{help}");
+        assert!(help.contains("--archive"), "{help}");
+    }
+}
+
+#[test]
+fn executor_renders_help_without_falling_back_to_empty_plan() {
+    let help = parse_and_execute(["rsync-win", "--help"]).unwrap();
+
+    assert!(help.contains("Usage: rsync-win"), "{help}");
+    assert!(!help.contains("operands: 0"), "{help}");
 }
 
 #[test]
@@ -708,4 +764,98 @@ fn parser_routes_full_link_and_device_options() {
     assert!(output.contains("devices: true"), "{output}");
     assert!(output.contains("special files: true"), "{output}");
     assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn transfer_plan_reports_mode_gating_for_all_modes() {
+    let local = parse_and_render(["rsync-win", "--plan", "src", "dst"]);
+    assert!(local.contains("transfer mode: local"), "{local}");
+    assert!(!local.contains("E_MODE"), "{local}");
+
+    let remote_shell = parse_and_render(["rsync-win", "--plan", "src", "host:/dst"]);
+    assert!(
+        remote_shell.contains("transfer mode: remote-shell"),
+        "{remote_shell}"
+    );
+    assert!(
+        remote_shell.contains("remote direction: upload (local -> remote)"),
+        "{remote_shell}"
+    );
+
+    let daemon_client = parse_and_render(["rsync-win", "--plan", "host::module", "dst"]);
+    assert!(
+        daemon_client.contains("transfer mode: daemon-client"),
+        "{daemon_client}"
+    );
+    assert!(
+        daemon_client.contains("daemon mode: client"),
+        "{daemon_client}"
+    );
+
+    let daemon_server =
+        parse_and_render(["rsync-win", "--plan", "--daemon", "--config=rsyncd.conf"]);
+    assert!(
+        daemon_server.contains("transfer mode: daemon-server"),
+        "{daemon_server}"
+    );
+    assert!(
+        daemon_server.contains("daemon mode: server"),
+        "{daemon_server}"
+    );
+    assert!(
+        daemon_server.contains("E_UNSUPPORTED_MODE"),
+        "{daemon_server}"
+    );
+
+    let internal_server =
+        parse_and_render(["rsync-win", "--plan", "--server", "--sender", ".", "src"]);
+    assert!(
+        internal_server.contains("transfer mode: internal-server"),
+        "{internal_server}"
+    );
+    assert!(
+        internal_server.contains("internal server mode: remote peer"),
+        "{internal_server}"
+    );
+    assert!(
+        internal_server.contains("E_UNSUPPORTED_MODE"),
+        "{internal_server}"
+    );
+}
+
+#[test]
+fn conflict_engine_reports_update_delete_temp_metadata_and_link_conflicts() {
+    let output = parse_and_render([
+        "rsync-win",
+        "--plan",
+        "--min-size=10",
+        "--max-size=1",
+        "--ignore-missing-args",
+        "--delete-missing-args",
+        "--inplace",
+        "--delay-updates",
+        "--partial-dir=.rsync-partial",
+        "--temp-dir=.rsync-tmp",
+        "--fake-super",
+        "--metadata-policy=ntfs-native",
+        "--copy-links",
+        "--safe-links",
+        "src",
+        "dst",
+    ]);
+
+    for expected in [
+        "--min-size cannot be greater than --max-size",
+        "--ignore-missing-args cannot be combined with --delete-missing-args",
+        "--inplace cannot be combined with --delay-updates",
+        "--inplace and --partial-dir cannot both control the same write path",
+        "--inplace and --temp-dir cannot both control the same write path",
+        "--fake-super cannot be combined with --metadata-policy=ntfs-native",
+        "multiple symlink transfer modes were requested",
+    ] {
+        assert!(
+            output.contains(expected),
+            "missing `{expected}` in output:\n{output}"
+        );
+    }
 }

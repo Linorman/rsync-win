@@ -2122,6 +2122,30 @@ mod tests {
     }
 
     #[test]
+    fn links_mode_reports_filesystem_symlink_capability_errors() {
+        let mut fs = FailingCopyFileSystem::new(PathBuf::from("__copy_never_fails__"));
+        fs.inner.add_file("src/target.txt", b"target").unwrap();
+        fs.inner.add_symlink("src/link.txt", "target.txt").unwrap();
+
+        let err = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                dry_run: false,
+                preserve_mtime: false,
+                symlink_mode: SymlinkMode::Preserve,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("creating symlinks is unsupported by this filesystem"));
+    }
+
+    #[test]
     fn munge_links_preserves_link_as_safe_munged_target() {
         let mut fs = MemoryFileSystem::new();
         fs.add_file("secret.txt", b"secret").unwrap();
@@ -2242,6 +2266,42 @@ mod tests {
             SyncAction::CreateHardLink { from, to }
                 if (from == Path::new("dst/original.txt") && to == Path::new("dst/alias.txt"))
                     || (from == Path::new("dst/alias.txt") && to == Path::new("dst/original.txt"))
+        )));
+    }
+
+    #[test]
+    fn hard_links_mode_falls_back_to_file_copy_when_link_creation_fails() {
+        let mut fs = FailingCopyFileSystem::new(PathBuf::from("__copy_never_fails__"));
+        fs.inner.add_file("src/original.txt", b"same").unwrap();
+        fs.inner
+            .add_hardlink("src/original.txt", "src/alias.txt")
+            .unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                dry_run: false,
+                preserve_mtime: false,
+                preserve_hard_links: true,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.inner.read_file(Path::new("dst/original.txt")).unwrap(),
+            b"same"
+        );
+        assert_eq!(
+            fs.inner.read_file(Path::new("dst/alias.txt")).unwrap(),
+            b"same"
+        );
+        assert!(report.actions().iter().any(|action| matches!(
+            action,
+            SyncAction::Warn { message, .. }
+                if message.contains("hard link preservation fell back to file copy")
         )));
     }
 
