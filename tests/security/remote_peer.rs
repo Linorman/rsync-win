@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use rsync_protocol::{
     read_rsync31_file_list, read_rsync_long, write_rsync31_file_list_with_options, FileListError,
-    MultiplexReadState, MultiplexedReader, RsyncFileListEntry, WireFileType,
+    MultiplexReadState, MultiplexedReader, RsyncFileListEntry, RsyncFileListMetadata, WireFileType,
     RSYNC_REGULAR_FILE_MODE,
 };
 
@@ -103,6 +103,7 @@ fn encoded_protocol31_path(path: &str) -> Vec<u8> {
         mode: RSYNC_REGULAR_FILE_MODE,
         checksum: None,
         hardlink_group: None,
+        metadata: RsyncFileListMetadata::default(),
     };
 
     write_rsync31_file_list_with_options(&mut bytes, &[entry], false).unwrap();

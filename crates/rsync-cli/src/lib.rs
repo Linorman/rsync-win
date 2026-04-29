@@ -31,14 +31,15 @@ use rsync_protocol::{
     read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
     read_vstring, request_module_list, rsync_plain_md4_checksum_reader,
     rsync_whole_file_checksum_reader, select_daemon_module, write_daemon_args, write_i32_le,
-    write_rsync27_file_list_with_options, write_rsync31_file_list_with_options, write_rsync_i32,
+    write_rsync27_file_list_with_options, write_rsync31_file_list_with_metadata, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
     DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter, RemoteDeleteMode,
     RemoteSessionError, RemoteShellOperand, RemoteShellOptions, RsyncFileListEntry,
-    RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection,
-    WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
-    MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
-    REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
+    RsyncFileListMetadata, RsyncFileListOptions, RsyncHardLinkGroup, RsyncIndexState,
+    RsyncMd4Checksum, SessionError, TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
+    DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+    REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
+    RSYNC_INDEX_DONE,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
@@ -46,8 +47,9 @@ use rsync_transport::remote_shell::{
 };
 use rsync_transport::tcp::TcpTransport;
 use rsync_winfs::{
-    capture_ntfs_native_sidecar, copy_alternate_data_streams, restore_safe_windows_attributes,
-    to_long_path_safe, WindowsDriveKind,
+    capture_ntfs_native_sidecar, copy_alternate_data_streams, read_windows_metadata,
+    restore_safe_windows_attributes, to_long_path_safe, PosixAclRecord, PosixFakeSuperSidecar,
+    PosixXattrRecord, WindowsDriveKind,
 };
 
 pub mod options;
@@ -185,6 +187,15 @@ pub struct Cli {
     #[arg(long = "fake-super", action = ArgAction::SetTrue, help = "Request fake-super style metadata sidecar storage")]
     fake_super: bool,
 
+    #[arg(skip)]
+    atimes: bool,
+
+    #[arg(skip)]
+    crtimes: bool,
+
+    #[arg(skip)]
+    omit_dir_times: bool,
+
     #[arg(long = "omit-link-times", action = ArgAction::SetTrue, help = "Do not request symlink mtime preservation")]
     omit_link_times: bool,
 
@@ -310,6 +321,15 @@ pub struct Cli {
 
     #[arg(long = "numeric-ids", action = ArgAction::SetTrue, help = "Use numeric owner/group ids when supported")]
     numeric_ids: bool,
+
+    #[arg(skip)]
+    user_maps: Vec<String>,
+
+    #[arg(skip)]
+    group_maps: Vec<String>,
+
+    #[arg(skip)]
+    chown: Option<String>,
 
     #[arg(long = "no-o", alias = "no-owner", action = ArgAction::SetTrue, help = "Disable owner preservation requested by archive mode")]
     no_owner: bool,
@@ -1355,12 +1375,35 @@ fn build_protocol27_fallback_command(
                 && plan.file_write_mode == FileWriteMode::InPlace,
             append_verify: direction == TransferDirection::Push && plan.append_verify,
             executability: direction == TransferDirection::Push && plan.preserve_executability,
+            preserve_owner: direction == TransferDirection::Push && plan.preserve_owner,
+            preserve_group: direction == TransferDirection::Push && plan.preserve_group,
             numeric_ids: direction == TransferDirection::Push && plan.numeric_ids,
+            user_maps: if direction == TransferDirection::Push {
+                plan.user_maps.clone()
+            } else {
+                Vec::new()
+            },
+            group_maps: if direction == TransferDirection::Push {
+                plan.group_maps.clone()
+            } else {
+                Vec::new()
+            },
+            chown: if direction == TransferDirection::Push {
+                plan.chown.clone()
+            } else {
+                None
+            },
             chmod: if direction == TransferDirection::Push {
                 plan.chmod.clone()
             } else {
                 None
             },
+            acls: direction == TransferDirection::Push && plan.preserve_acls,
+            xattrs: direction == TransferDirection::Push && plan.preserve_xattrs,
+            fake_super: direction == TransferDirection::Push && plan.fake_super,
+            atimes: direction == TransferDirection::Push && plan.atimes,
+            crtimes: direction == TransferDirection::Push && plan.crtimes,
+            omit_dir_times: plan.omit_dir_times,
             omit_link_times: plan.omit_link_times,
             preserve_links: direction == TransferDirection::Push
                 && plan.symlink_mode == SymlinkMode::Preserve
@@ -1587,10 +1630,20 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     }
     {
         let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
-        write_rsync31_file_list_with_options(
+        write_rsync31_file_list_with_metadata(
             &mut writer,
             &wire_entries,
-            plan.update_mode == UpdateMode::Checksum,
+            RsyncFileListOptions {
+                include_checksums: plan.update_mode == UpdateMode::Checksum,
+                preserve_owner: plan.preserve_owner,
+                preserve_group: plan.preserve_group,
+                numeric_ids: plan.numeric_ids,
+                acls: plan.preserve_acls,
+                xattrs: plan.preserve_xattrs,
+                fake_super: plan.fake_super,
+                atimes: plan.atimes,
+                crtimes: plan.crtimes,
+            },
         )
         .map_err(protocol31_setup_error)?;
         writer.flush().map_err(protocol31_setup_error)?;
@@ -2007,6 +2060,8 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     ));
     let ntfs_sidecars =
         handle_ntfs_native_sidecars(&sources, dest, &plan, ntfs_files_from.as_deref())?;
+    let posix_sidecars =
+        handle_posix_fake_super_sidecars(&sources, dest, &plan, ntfs_files_from.as_deref())?;
 
     let mut output = String::new();
     output.push_str("rsync-win local portable sync\n");
@@ -2039,6 +2094,16 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         ));
         output.push_str(&format!("ntfs sidecar root: {}\n", sidecars.root.display()));
     }
+    if let Some(sidecars) = posix_sidecars {
+        output.push_str(&format!(
+            "posix sidecars: planned {}, written {}\n",
+            sidecars.planned, sidecars.written
+        ));
+        output.push_str(&format!(
+            "posix sidecar root: {}\n",
+            sidecars.root.display()
+        ));
+    }
 
     if !plan.report.is_empty() {
         output.push_str("diagnostics:\n");
@@ -2059,6 +2124,13 @@ struct NtfsSidecarExecution {
     attributes_degraded: usize,
     streams_copied: usize,
     streams_degraded: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PosixSidecarExecution {
+    root: PathBuf,
+    planned: usize,
+    written: usize,
 }
 
 fn handle_ntfs_native_sidecars(
@@ -2140,6 +2212,143 @@ fn handle_ntfs_native_sidecars(
         streams_copied,
         streams_degraded,
     }))
+}
+
+fn handle_posix_fake_super_sidecars(
+    sources: &[PathBuf],
+    dest: &Path,
+    plan: &TransferPlan,
+    files_from: Option<&[PathBuf]>,
+) -> Result<Option<PosixSidecarExecution>> {
+    if !plan.fake_super
+        && !plan.preserve_acls
+        && !plan.preserve_xattrs
+        && !plan.atimes
+        && !plan.crtimes
+        && plan.chown.is_none()
+        && plan.user_maps.is_empty()
+        && plan.group_maps.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let fs = LocalFileSystem;
+    let sidecar_root = posix_sidecar_root(dest);
+    let capture_paths = collect_ntfs_sidecar_paths(&fs, sources, plan, files_from)?;
+    if plan.dry_run {
+        return Ok(Some(PosixSidecarExecution {
+            root: sidecar_root,
+            planned: capture_paths.len(),
+            written: 0,
+        }));
+    }
+
+    fs::create_dir_all(&sidecar_root)?;
+    let mut written = 0;
+    for source_path in &capture_paths {
+        let sidecar = capture_posix_fake_super_sidecar(source_path, plan)
+            .with_context(|| format!("capture POSIX sidecar for {}", source_path.display()))?;
+        let relative = ntfs_sidecar_relative_name(sources, source_path);
+        let manifest_path = sidecar_root.join(format!("{relative}.posix.meta"));
+        fs::write(&manifest_path, sidecar.manifest())?;
+        written += 1;
+    }
+
+    Ok(Some(PosixSidecarExecution {
+        root: sidecar_root,
+        planned: capture_paths.len(),
+        written,
+    }))
+}
+
+fn capture_posix_fake_super_sidecar(
+    path: &Path,
+    plan: &TransferPlan,
+) -> Result<PosixFakeSuperSidecar> {
+    let metadata = read_windows_metadata(path)?;
+    let mode = posix_sidecar_mode(&metadata.portable, path, plan);
+    let std_metadata = fs::symlink_metadata(path)?;
+
+    Ok(PosixFakeSuperSidecar {
+        path: path.to_path_buf(),
+        mode: Some(mode),
+        uid: None,
+        gid: None,
+        user_name: plan.chown.as_ref().and_then(|chown| {
+            let (user, _) = chown.split_once(':').unwrap_or((chown.as_str(), ""));
+            (!user.is_empty()).then(|| user.to_string())
+        }),
+        group_name: plan.chown.as_ref().and_then(|chown| {
+            let (_, group) = chown.split_once(':').unwrap_or(("", ""));
+            (!group.is_empty()).then(|| group.to_string())
+        }),
+        access_time_unix_nanos: plan
+            .atimes
+            .then(|| {
+                std_metadata
+                    .accessed()
+                    .ok()
+                    .and_then(system_time_to_unix_nanos)
+            })
+            .flatten(),
+        creation_time_unix_nanos: plan
+            .crtimes
+            .then(|| {
+                read_windows_metadata(path)
+                    .ok()?
+                    .creation_time
+                    .and_then(system_time_to_unix_nanos)
+            })
+            .flatten(),
+        acls: if plan.preserve_acls {
+            vec![PosixAclRecord {
+                tag: "windows-security-descriptor".to_string(),
+                qualifier: None,
+                perms: "stored".to_string(),
+            }]
+        } else {
+            Vec::new()
+        },
+        xattrs: if plan.preserve_xattrs {
+            vec![PosixXattrRecord {
+                name: "rsync.%stat".to_string(),
+                value_hex: format!("{mode:08x}"),
+            }]
+        } else {
+            Vec::new()
+        },
+        fake_super: plan.fake_super,
+    })
+}
+
+fn posix_sidecar_mode(
+    metadata: &rsync_fs::PortableMetadata,
+    path: &Path,
+    plan: &TransferPlan,
+) -> u32 {
+    let mut mode = metadata.posix_mode_for_path(Some(path), plan.preserve_executability);
+    if let Some(chmod_rules) = &plan.chmod_rules {
+        let kind = if metadata.file_type == FileType::Directory {
+            ChmodFileKind::Directory
+        } else {
+            ChmodFileKind::File
+        };
+        mode = chmod_rules.apply(mode, kind);
+    }
+    mode
+}
+
+fn posix_sidecar_root(dest: &Path) -> PathBuf {
+    let dest_is_file = fs::metadata(dest)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    if dest_is_file {
+        dest.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".rsync-win.fake-super")
+    } else {
+        dest.join(".rsync-win.fake-super")
+    }
 }
 
 fn ntfs_destination_for_source(
@@ -2522,6 +2731,7 @@ fn collect_single_local_source_entries(
                     &source_metadata,
                     options.preserve_hard_links,
                 ),
+                metadata: remote_file_list_metadata(source),
             },
             local_path: source.to_path_buf(),
         });
@@ -2541,6 +2751,7 @@ fn collect_single_local_source_entries(
             mode: RSYNC_DIRECTORY_MODE,
             checksum: None,
             hardlink_group: None,
+            metadata: remote_file_list_metadata(source),
         },
         local_path: source.to_path_buf(),
     });
@@ -2627,6 +2838,7 @@ fn collect_batch_local_source_entries(
                     .then(|| checksum_local_path(source))
                     .transpose()?,
                 hardlink_group: remote_hardlink_group(&metadata, options.preserve_hard_links),
+                metadata: remote_file_list_metadata(source),
             },
             local_path: source.clone(),
         });
@@ -2731,6 +2943,7 @@ fn collect_local_directory_source_entries(
                     .then(|| checksum_local_path(&original_path))
                     .transpose()?,
                 hardlink_group: remote_hardlink_group(&metadata, ctx.options.preserve_hard_links),
+                metadata: remote_file_list_metadata(&original_path),
             },
             local_path: original_path.clone(),
         });
@@ -2782,6 +2995,49 @@ fn remote_hardlink_group(
         device: id.volume,
         inode: id.file,
     })
+}
+
+fn remote_file_list_metadata(path: &Path) -> RsyncFileListMetadata {
+    let std_metadata = fs::symlink_metadata(path).ok();
+    let (uid, gid) = remote_metadata_ids(std_metadata.as_ref());
+    let atime_unix = std_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.accessed().ok())
+        .and_then(system_time_to_unix_option);
+    let crtime_unix = read_windows_metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.creation_time)
+        .or_else(|| {
+            std_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.created().ok())
+        })
+        .and_then(system_time_to_unix_option);
+
+    RsyncFileListMetadata {
+        uid,
+        gid,
+        user_name: None,
+        group_name: None,
+        atime_unix,
+        crtime_unix,
+        xattrs: Vec::new(),
+    }
+}
+
+#[cfg(unix)]
+fn remote_metadata_ids(metadata: Option<&fs::Metadata>) -> (Option<u32>, Option<u32>) {
+    use std::os::unix::fs::MetadataExt;
+
+    (
+        metadata.map(|metadata| metadata.uid()),
+        metadata.map(|metadata| metadata.gid()),
+    )
+}
+
+#[cfg(not(unix))]
+fn remote_metadata_ids(_metadata: Option<&fs::Metadata>) -> (Option<u32>, Option<u32>) {
+    (None, None)
 }
 
 fn remote_sender_metadata(
@@ -4193,6 +4449,18 @@ fn system_time_to_unix(value: Option<SystemTime>) -> i64 {
         .unwrap_or(0)
 }
 
+fn system_time_to_unix_option(value: SystemTime) -> Option<i64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+}
+
+fn system_time_to_unix_nanos(time: SystemTime) -> Option<i128> {
+    let duration = time.duration_since(UNIX_EPOCH).ok()?;
+    Some(i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos()))
+}
+
 fn append_remote_messages(output: &mut String, mux: &MultiplexReadState) {
     if mux.messages().is_empty() {
         return;
@@ -4271,9 +4539,15 @@ struct TransferPlan {
     preserve_acls: bool,
     preserve_xattrs: bool,
     fake_super: bool,
+    atimes: bool,
+    crtimes: bool,
+    omit_dir_times: bool,
     omit_link_times: bool,
     vss: bool,
     numeric_ids: bool,
+    user_maps: Vec<String>,
+    group_maps: Vec<String>,
+    chown: Option<String>,
     chmod: Option<String>,
     chmod_rules: Option<ChmodRules>,
     metadata_policy: MetadataPolicy,
@@ -4585,9 +4859,15 @@ impl TransferPlan {
             preserve_acls: cli.acls,
             preserve_xattrs: cli.xattrs,
             fake_super: cli.fake_super,
+            atimes: cli.atimes,
+            crtimes: cli.crtimes,
+            omit_dir_times: cli.omit_dir_times,
             omit_link_times: cli.omit_link_times,
             vss: cli.vss,
             numeric_ids: cli.numeric_ids,
+            user_maps: cli.user_maps.clone(),
+            group_maps: cli.group_maps.clone(),
+            chown: cli.chown.clone(),
             chmod: cli.chmod.clone(),
             chmod_rules,
             metadata_policy,
@@ -4811,10 +5091,33 @@ fn remote_shell_options_from_cli(
         inplace: direction == TransferDirection::Push && cli.inplace,
         append_verify: direction == TransferDirection::Push && cli.append_verify,
         executability: direction == TransferDirection::Push && cli.executability,
+        preserve_owner: direction == TransferDirection::Push && cli_preserve_owner(cli),
+        preserve_group: direction == TransferDirection::Push && cli_preserve_group(cli),
         numeric_ids: direction == TransferDirection::Push && cli.numeric_ids,
+        user_maps: if direction == TransferDirection::Push {
+            cli.user_maps.clone()
+        } else {
+            Vec::new()
+        },
+        group_maps: if direction == TransferDirection::Push {
+            cli.group_maps.clone()
+        } else {
+            Vec::new()
+        },
+        chown: if direction == TransferDirection::Push {
+            cli.chown.clone()
+        } else {
+            None
+        },
         chmod: (direction == TransferDirection::Push)
             .then(|| cli.chmod.clone())
             .flatten(),
+        acls: direction == TransferDirection::Push && cli.acls,
+        xattrs: direction == TransferDirection::Push && cli.xattrs,
+        fake_super: direction == TransferDirection::Push && cli.fake_super,
+        atimes: direction == TransferDirection::Push && cli.atimes,
+        crtimes: direction == TransferDirection::Push && cli.crtimes,
+        omit_dir_times: cli.omit_dir_times,
         omit_link_times: cli.omit_link_times,
         preserve_links: direction == TransferDirection::Push
             && symlink_mode == SymlinkMode::Preserve
@@ -5207,6 +5510,12 @@ fn posix_metadata_request_from_cli(cli: &Cli) -> PosixMetadataRequest {
         acls: cli.acls,
         xattrs: cli.xattrs,
         fake_super: cli.fake_super,
+        atimes: cli.atimes,
+        crtimes: cli.crtimes,
+        omit_dir_times: cli.omit_dir_times,
+        user_map: !cli.user_maps.is_empty(),
+        group_map: !cli.group_maps.is_empty(),
+        chown: cli.chown.is_some(),
     }
 }
 
@@ -5221,6 +5530,17 @@ fn posix_metadata_degradations_for_plan(
     if daemon_direction.is_none() && remote_direction == Some(TransferDirection::Push) {
         request.chmod = false;
         request.executability = false;
+        request.owner = false;
+        request.group = false;
+        request.acls = false;
+        request.xattrs = false;
+        request.fake_super = false;
+        request.atimes = false;
+        request.crtimes = false;
+        request.omit_dir_times = false;
+        request.user_map = false;
+        request.group_map = false;
+        request.chown = false;
     }
 
     request.degradations(metadata_policy)
@@ -5252,6 +5572,15 @@ fn posix_metadata_summary(plan: &TransferPlan) -> String {
     if plan.fake_super {
         parts.push("fake-super");
     }
+    if plan.omit_dir_times {
+        parts.push("omit-dir-times");
+    }
+    if plan.atimes {
+        parts.push("atimes");
+    }
+    if plan.crtimes {
+        parts.push("crtimes");
+    }
     if plan.omit_link_times {
         parts.push("omit-link-times");
     }
@@ -5260,6 +5589,15 @@ fn posix_metadata_summary(plan: &TransferPlan) -> String {
     }
     if plan.chmod.is_some() {
         parts.push("chmod");
+    }
+    if !plan.user_maps.is_empty() {
+        parts.push("usermap");
+    }
+    if !plan.group_maps.is_empty() {
+        parts.push("groupmap");
+    }
+    if plan.chown.is_some() {
+        parts.push("chown");
     }
 
     if parts.is_empty() {
@@ -5308,6 +5646,9 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
         (cli.acls, "--acls"),
         (cli.xattrs, "--xattrs"),
         (cli.fake_super, "--fake-super"),
+        (cli.atimes, "--atimes"),
+        (cli.crtimes, "--crtimes"),
+        (cli.omit_dir_times, "--omit-dir-times"),
         (cli.omit_link_times, "--omit-link-times"),
         (cli.vss, "--vss"),
         (cli.no_owner, "--no-o"),
@@ -5319,6 +5660,25 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
                 format!("{flag} is represented in the execution plan"),
             );
         }
+    }
+
+    for map in &cli.user_maps {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--usermap={map} is represented in the execution plan"),
+        );
+    }
+    for map in &cli.group_maps {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--groupmap={map} is represented in the execution plan"),
+        );
+    }
+    if let Some(chown) = &cli.chown {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--chown={chown} is represented in the execution plan"),
+        );
     }
 
     if cli.compress {
@@ -5447,15 +5807,9 @@ fn ensure_remote_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
     if cli.metadata_policy != CliMetadataPolicy::Portable {
         bail!("remote-shell MVP currently supports only --metadata-policy=portable");
     }
-    if cli.preserve_owner
-        || cli.preserve_group
-        || cli.acls
-        || cli.xattrs
-        || cli.fake_super
-        || cli.vss
-    {
+    if cli.vss {
         bail!(
-            "remote-shell execution does not yet support owner/group, ACL, xattr, fake-super, or VSS metadata options; run with --plan for diagnostics"
+            "remote-shell execution does not yet support VSS metadata options; run with --plan for diagnostics"
         );
     }
 
@@ -5899,7 +6253,7 @@ fn symlink_mode_label(mode: SymlinkMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsync_protocol::RSYNC_REGULAR_FILE_MODE;
+    use rsync_protocol::{write_rsync31_file_list_with_options, RSYNC_REGULAR_FILE_MODE};
     use std::fs;
     use std::io::{Read, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5959,7 +6313,7 @@ mod tests {
         assert!(output.contains("[warning] W_METADATA_GROUP"));
         assert!(output.contains("[warning] W_METADATA_DEVICE"));
         assert!(output.contains(
-            "remote --server argv: rsync --server --delete-during --perms --links --devices --specials -ntre.LsfxCIvu"
+            "remote --server argv: rsync --server --delete-during --no-inc-recursive --perms --owner --group --links --devices --specials -ntre.LsfxCIvu"
         ));
         assert!(output.contains("[info] I_REMOTE_PROTOCOL31_MVP"));
         assert!(output.contains("wire protocol: experimental protocol 31"));
@@ -5976,7 +6330,8 @@ mod tests {
             "user@example.test:/tmp/path with spaces",
         ]);
 
-        assert!(output.contains("remote --server argv: rsync --server -Wtre.LsfxCIvu"));
+        assert!(output
+            .contains("remote --server argv: rsync --server --no-inc-recursive -Wtre.LsfxCIvu"));
         assert!(output.contains(
             "remote ssh argv: ssh -o BatchMode=yes -o ConnectTimeout=10 user@example.test"
         ));
@@ -6213,6 +6568,46 @@ mod tests {
         let argv = plan.remote_server_argv.as_ref().unwrap();
         assert!(argv.contains(&"--delete-during".to_string()));
         assert!(argv.contains(&"--exclude=*.tmp".to_string()));
+    }
+
+    #[test]
+    fn remote_shell_execute_allows_chunk7_posix_metadata_options_before_spawning() {
+        let cli = options::parse_cli([
+            "rsync-win",
+            "-r",
+            "--owner",
+            "--group",
+            "--acls",
+            "--xattrs",
+            "--fake-super",
+            "--atimes",
+            "--crtimes",
+            "--usermap=*:root",
+            "--groupmap=*:root",
+            "--chown=root:root",
+            "src",
+            "user@example.test:/tmp/dest",
+        ])
+        .unwrap();
+        let plan = TransferPlan::from_cli(&cli);
+
+        ensure_remote_execution_options_supported(&cli, &plan).unwrap();
+
+        let argv = plan.remote_server_argv.as_ref().unwrap();
+        for expected in [
+            "--owner",
+            "--group",
+            "--acls",
+            "--xattrs",
+            "--fake-super",
+            "--atimes",
+            "--crtimes",
+            "--usermap=*:root",
+            "--groupmap=*:root",
+            "--chown=root:root",
+        ] {
+            assert!(argv.contains(&expected.to_string()), "{expected}: {argv:?}");
+        }
     }
 
     #[test]
@@ -6806,6 +7201,7 @@ mod tests {
                 mode: RSYNC_REGULAR_FILE_MODE,
                 checksum: None,
                 hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
             },
         ]));
 
@@ -6845,6 +7241,7 @@ mod tests {
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
                     hardlink_group: None,
+                    metadata: RsyncFileListMetadata::default(),
                 },
             ]));
 
@@ -6903,6 +7300,7 @@ mod tests {
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
                     hardlink_group: None,
+                    metadata: RsyncFileListMetadata::default(),
                 },
             ]));
 
@@ -7363,13 +7761,13 @@ mod tests {
         assert!(output.contains("[error] E_METADATA_OWNER"));
         assert!(output.contains("[error] E_METADATA_GROUP"));
         assert!(output.contains("[error] E_METADATA_PERMISSIONS"));
-        assert!(output.contains("fake-super metadata degraded"));
+        assert!(output.contains("fake-super metadata stored"));
         assert!(output.contains("[error] E_METADATA_LOSS"));
-        assert!(output.contains("ACL sidecar storage is not implemented yet"));
+        assert!(output.contains("acl metadata stored"));
     }
 
     #[test]
-    fn fake_super_fail_on_metadata_loss_errors_without_storage() {
+    fn fake_super_fail_on_metadata_loss_keeps_stored_sidecar_metadata_non_error() {
         let output = parse_and_render([
             "rsync-win",
             "--fake-super",
@@ -7380,11 +7778,52 @@ mod tests {
             "dest",
         ]);
 
-        assert!(output.contains("[error] E_METADATA_LOSS"));
-        assert!(output.contains("fake-super metadata degraded"));
-        assert!(output.contains("acl metadata ignored"));
-        assert!(output.contains("xattr metadata ignored"));
-        assert!(!output.contains("metadata stored"));
+        assert!(!output.contains("[error] E_METADATA_LOSS"));
+        assert!(!output.contains("[error] E_METADATA_PERMISSIONS"));
+        assert!(output.contains("fake-super metadata stored"));
+        assert!(output.contains("acl metadata stored"));
+        assert!(output.contains("xattr metadata stored"));
+    }
+
+    #[test]
+    fn local_fake_super_writes_posix_sidecar_manifest() {
+        let root = unique_temp_dir("rsync-cli-posix-sidecar");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"data").unwrap();
+
+        let output = parse_and_execute([
+            "rsync-win",
+            "-r",
+            "--fake-super",
+            "--acls",
+            "--xattrs",
+            "--atimes",
+            "--crtimes",
+            "--chmod=u=rw,go=r",
+            &source.to_string_lossy(),
+            &dest.to_string_lossy(),
+        ])
+        .unwrap();
+
+        assert!(
+            output.contains("posix sidecars: planned 2, written 2"),
+            "{output}"
+        );
+        let sidecar_root = dest.join(".rsync-win.fake-super");
+        let manifests: Vec<_> = fs::read_dir(&sidecar_root)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        assert!(manifests
+            .iter()
+            .any(|manifest| manifest.contains("path=") && manifest.contains("file.txt")));
+        assert!(manifests
+            .iter()
+            .any(|manifest| manifest.contains("fake_super=true")));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8010,18 +8449,18 @@ mod tests {
     }
 
     #[test]
-    fn chmod_rejects_complex_symbolic_forms_in_cli_plan() {
+    fn chmod_accepts_symbolic_forms_in_cli_plan() {
         let output = parse_and_render([
             "rsync-win",
             "--plan",
             "--chmod",
-            "u+rw",
+            "u+rw,go-w",
             "src",
             "host:/dest",
         ]);
 
-        assert!(output.contains("[error] E_CHMOD"));
-        assert!(output.contains("supported subset accepts only numeric modes"));
+        assert!(output.contains("posix metadata: chmod"));
+        assert!(!output.contains("[error] E_CHMOD"));
     }
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -8055,6 +8494,7 @@ mod tests {
             },
             checksum: None,
             hardlink_group: None,
+            metadata: RsyncFileListMetadata::default(),
         }
     }
 
@@ -8171,6 +8611,7 @@ mod tests {
                     mode: RSYNC_DIRECTORY_MODE,
                     checksum: None,
                     hardlink_group: None,
+                    metadata: RsyncFileListMetadata::default(),
                 },
                 RsyncFileListEntry {
                     path: PathBuf::from("file.txt"),
@@ -8180,6 +8621,7 @@ mod tests {
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
                     hardlink_group: None,
+                    metadata: RsyncFileListMetadata::default(),
                 },
             ],
             1,
@@ -8197,6 +8639,7 @@ mod tests {
                     mode: RSYNC_DIRECTORY_MODE,
                     checksum: None,
                     hardlink_group: None,
+                    metadata: RsyncFileListMetadata::default(),
                 },
                 RsyncFileListEntry {
                     path: PathBuf::from("file.txt"),
@@ -8206,6 +8649,7 @@ mod tests {
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
                     hardlink_group: None,
+                    metadata: RsyncFileListMetadata::default(),
                 },
             ],
             1,
@@ -8261,6 +8705,7 @@ mod tests {
                 mode: RSYNC_DIRECTORY_MODE,
                 checksum: None,
                 hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
             },
             RsyncFileListEntry {
                 path: PathBuf::from(path),
@@ -8270,6 +8715,7 @@ mod tests {
                 mode: RSYNC_REGULAR_FILE_MODE,
                 checksum: None,
                 hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
             },
         ]);
 
@@ -8317,6 +8763,7 @@ mod tests {
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
                     hardlink_group: None,
+                    metadata: RsyncFileListMetadata::default(),
                 },
                 RsyncFileListEntry {
                     path: PathBuf::from("file.txt"),
@@ -8326,6 +8773,7 @@ mod tests {
                     mode: RSYNC_REGULAR_FILE_MODE,
                     checksum: None,
                     hardlink_group: None,
+                    metadata: RsyncFileListMetadata::default(),
                 },
             ],
             1,

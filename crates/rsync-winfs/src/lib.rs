@@ -25,8 +25,10 @@ pub use security::{
     capture_security_descriptor_summary, password_file_has_broad_access, SecurityDescriptorSummary,
 };
 pub use sidecar::{
-    parse_ntfs_native_sidecar_manifest, NtfsNativeSidecar, NtfsNativeSidecarManifest,
-    SidecarParseError, NTFS_SIDECAR_HEADER,
+    parse_ntfs_native_sidecar_manifest, parse_posix_fake_super_sidecar_manifest, NtfsNativeSidecar,
+    NtfsNativeSidecarManifest, PosixAclRecord, PosixFakeSuperSidecar,
+    PosixFakeSuperSidecarManifest, PosixXattrRecord, SidecarParseError, NTFS_SIDECAR_HEADER,
+    POSIX_FAKE_SUPER_SIDECAR_HEADER,
 };
 pub use streams::{
     copy_alternate_data_streams, enumerate_alternate_data_streams, AlternateDataStream,

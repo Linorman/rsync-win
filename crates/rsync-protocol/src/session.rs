@@ -52,8 +52,19 @@ pub struct RemoteShellOptions {
     pub inplace: bool,
     pub append_verify: bool,
     pub executability: bool,
+    pub preserve_owner: bool,
+    pub preserve_group: bool,
     pub numeric_ids: bool,
+    pub user_maps: Vec<String>,
+    pub group_maps: Vec<String>,
+    pub chown: Option<String>,
     pub chmod: Option<String>,
+    pub acls: bool,
+    pub xattrs: bool,
+    pub fake_super: bool,
+    pub atimes: bool,
+    pub crtimes: bool,
+    pub omit_dir_times: bool,
     pub omit_link_times: bool,
     pub preserve_links: bool,
     pub copy_links: bool,
@@ -91,8 +102,19 @@ impl Default for RemoteShellOptions {
             inplace: false,
             append_verify: false,
             executability: false,
+            preserve_owner: false,
+            preserve_group: false,
             numeric_ids: false,
+            user_maps: Vec::new(),
+            group_maps: Vec::new(),
+            chown: None,
             chmod: None,
+            acls: false,
+            xattrs: false,
+            fake_super: false,
+            atimes: false,
+            crtimes: false,
+            omit_dir_times: false,
             omit_link_times: false,
             preserve_links: false,
             copy_links: false,
@@ -271,7 +293,7 @@ pub fn build_remote_shell_argv_for_paths(
         argv.push("--times".to_string());
     }
     append_remote_delete_option(&mut argv, options.delete_mode);
-    if matches!(options.direction, TransferDirection::Pull) && options.recursive {
+    if options.recursive {
         argv.push("--no-inc-recursive".to_string());
     }
     if options.dry_run {
@@ -306,7 +328,7 @@ pub fn build_remote_shell_protocol31_argv_for_paths(
         argv.push("--sender".to_string());
     }
     append_remote_delete_option(&mut argv, options.delete_mode);
-    if matches!(options.direction, TransferDirection::Pull) && options.recursive {
+    if options.recursive {
         argv.push("--no-inc-recursive".to_string());
     }
     append_remote_shell_long_options(&mut argv, options);
@@ -371,6 +393,12 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     if options.executability {
         argv.push("--executability".to_string());
     }
+    if options.preserve_owner {
+        argv.push("--owner".to_string());
+    }
+    if options.preserve_group {
+        argv.push("--group".to_string());
+    }
     if options.size_only {
         argv.push("--size-only".to_string());
     }
@@ -392,8 +420,35 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     if options.numeric_ids {
         argv.push("--numeric-ids".to_string());
     }
+    for map in &options.user_maps {
+        argv.push(format!("--usermap={map}"));
+    }
+    for map in &options.group_maps {
+        argv.push(format!("--groupmap={map}"));
+    }
+    if let Some(chown) = &options.chown {
+        argv.push(format!("--chown={chown}"));
+    }
     if let Some(chmod) = &options.chmod {
         argv.push(format!("--chmod={chmod}"));
+    }
+    if options.acls {
+        argv.push("--acls".to_string());
+    }
+    if options.xattrs {
+        argv.push("--xattrs".to_string());
+    }
+    if options.fake_super {
+        argv.push("--fake-super".to_string());
+    }
+    if options.atimes {
+        argv.push("--atimes".to_string());
+    }
+    if options.crtimes {
+        argv.push("--crtimes".to_string());
+    }
+    if options.omit_dir_times {
+        argv.push("--omit-dir-times".to_string());
     }
     if options.omit_link_times {
         argv.push("--omit-link-times".to_string());
@@ -862,6 +917,7 @@ mod tests {
                 "--recursive",
                 "--times",
                 "--delete-before",
+                "--no-inc-recursive",
                 "--dry-run",
                 "--whole-file",
                 "-v",
@@ -908,6 +964,7 @@ mod tests {
                 "rsync",
                 "--server",
                 "--delete-before",
+                "--no-inc-recursive",
                 "-vnWtre.LsfxCIvu",
                 ".",
                 "dest",
@@ -967,6 +1024,46 @@ mod tests {
             "--write-devices",
         ] {
             assert!(argv.contains(&expected.to_string()), "{expected}");
+        }
+    }
+
+    #[test]
+    fn builds_server_argv_with_posix_metadata_options() {
+        let options = RemoteShellOptions {
+            recursive: true,
+            preserve_owner: true,
+            preserve_group: true,
+            acls: true,
+            xattrs: true,
+            fake_super: true,
+            atimes: true,
+            crtimes: true,
+            omit_dir_times: true,
+            numeric_ids: true,
+            user_maps: vec!["0:root".to_string(), "*:nobody".to_string()],
+            group_maps: vec!["0:root".to_string()],
+            chown: Some("deploy:staff".to_string()),
+            ..RemoteShellOptions::default()
+        };
+
+        let argv = build_remote_shell_protocol31_argv(&options, Path::new("dest")).unwrap();
+
+        for expected in [
+            "--owner",
+            "--group",
+            "--acls",
+            "--xattrs",
+            "--fake-super",
+            "--atimes",
+            "--crtimes",
+            "--omit-dir-times",
+            "--numeric-ids",
+            "--usermap=0:root",
+            "--usermap=*:nobody",
+            "--groupmap=0:root",
+            "--chown=deploy:staff",
+        ] {
+            assert!(argv.contains(&expected.to_string()), "{argv:?}");
         }
     }
 

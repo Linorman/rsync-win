@@ -76,6 +76,7 @@ pub enum MetadataFeature {
     FakeSuper,
     SecurityDescriptor,
     AlternateDataStream,
+    AccessTime,
     CreationTime,
     WindowsAttributes,
     SparseFile,
@@ -99,6 +100,7 @@ impl MetadataFeature {
             Self::FakeSuper => "fake-super",
             Self::SecurityDescriptor => "security-descriptor",
             Self::AlternateDataStream => "alternate-data-stream",
+            Self::AccessTime => "access-time",
             Self::CreationTime => "creation-time",
             Self::WindowsAttributes => "windows-attributes",
             Self::SparseFile => "sparse-file",
@@ -206,6 +208,12 @@ pub struct PosixMetadataRequest {
     pub acls: bool,
     pub xattrs: bool,
     pub fake_super: bool,
+    pub atimes: bool,
+    pub crtimes: bool,
+    pub omit_dir_times: bool,
+    pub user_map: bool,
+    pub group_map: bool,
+    pub chown: bool,
 }
 
 impl PosixMetadataRequest {
@@ -220,6 +228,12 @@ impl PosixMetadataRequest {
             || self.acls
             || self.xattrs
             || self.fake_super
+            || self.atimes
+            || self.crtimes
+            || self.omit_dir_times
+            || self.user_map
+            || self.group_map
+            || self.chown
     }
 
     pub fn degradations(self, policy: MetadataPolicy) -> Vec<MetadataDegradation> {
@@ -229,49 +243,85 @@ impl PosixMetadataRequest {
         if self.permissions {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Permissions,
-                MetadataAction::Degraded,
-                format!(
-                    "--perms requests POSIX mode preservation; {policy_label} local transfers record mode intent but do not chmod Windows destinations yet"
-                ),
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--perms requests POSIX mode preservation; mode bits are stored in the fake-super sidecar".to_string()
+                } else {
+                    format!(
+                        "--perms requests POSIX mode preservation; {policy_label} local transfers record mode intent but do not chmod Windows destinations yet"
+                    )
+                },
             ));
         }
         if self.chmod {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Permissions,
-                MetadataAction::Degraded,
-                format!(
-                    "--chmod requests POSIX mode rewriting; {policy_label} local transfers report the request but do not apply chmod expressions yet"
-                ),
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--chmod requests POSIX mode rewriting; rewritten mode bits are stored in the fake-super sidecar".to_string()
+                } else {
+                    format!(
+                        "--chmod requests POSIX mode rewriting; {policy_label} local transfers report the request but do not apply chmod expressions yet"
+                    )
+                },
             ));
         }
         if self.executability {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Executability,
-                MetadataAction::Degraded,
-                "--executability is represented in sender mode mapping for remote uploads; local Windows destinations do not apply executable bits",
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--executability mode intent is stored in the fake-super sidecar"
+                } else {
+                    "--executability is represented in sender mode mapping for remote uploads; local Windows destinations do not apply executable bits"
+                },
             ));
         }
         if self.owner {
-            let message = if self.numeric_ids {
+            let message = if self.fake_super {
+                "owner metadata is stored in the fake-super sidecar"
+            } else if self.numeric_ids {
                 "--numeric-ids requests numeric POSIX owner ids; Windows local transfers do not apply POSIX owners"
             } else {
                 "--owner requests POSIX owner preservation; Windows local transfers do not apply POSIX owners"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Owner,
-                MetadataAction::Ignored,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
                 message,
             ));
         }
         if self.group {
-            let message = if self.numeric_ids {
+            let message = if self.fake_super {
+                "group metadata is stored in the fake-super sidecar"
+            } else if self.numeric_ids {
                 "--numeric-ids requests numeric POSIX group ids; Windows local transfers do not apply POSIX groups"
             } else {
                 "--group requests POSIX group preservation; Windows local transfers do not apply POSIX groups"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Group,
-                MetadataAction::Ignored,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
                 message,
             ));
         }
@@ -284,33 +334,108 @@ impl PosixMetadataRequest {
         }
         if self.acls {
             let message = if self.fake_super {
-                "--acls metadata requested with fake-super, but POSIX ACL sidecar storage is not implemented yet"
+                "--acls metadata requested with fake-super; POSIX ACL intent is stored in the fake-super sidecar"
             } else {
                 "--acls requests POSIX ACL preservation; Windows local transfers do not apply POSIX ACLs"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Acl,
-                MetadataAction::Ignored,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
                 message,
             ));
         }
         if self.xattrs {
             let message = if self.fake_super {
-                "--xattrs metadata requested with fake-super, but POSIX xattr sidecar storage is not implemented yet"
+                "--xattrs metadata requested with fake-super; POSIX xattr intent is stored in the fake-super sidecar"
             } else {
                 "--xattrs requests extended attribute preservation; Windows local transfers do not apply POSIX xattrs"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Xattr,
-                MetadataAction::Ignored,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
                 message,
             ));
         }
         if self.fake_super {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::FakeSuper,
-                MetadataAction::Degraded,
-                "--fake-super sidecar storage is planned explicitly; transfer restore/apply is not wired into the local executor yet",
+                MetadataAction::Stored,
+                "--fake-super metadata is stored in a Windows sidecar for local transfers",
+            ));
+        }
+        if self.atimes {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::AccessTime,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--atimes intent is stored in the fake-super sidecar"
+                } else {
+                    "--atimes preservation is platform-dependent and is not applied by the local Windows executor yet"
+                },
+            ));
+        }
+        if self.crtimes {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::CreationTime,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--crtimes intent is stored in the fake-super sidecar"
+                } else {
+                    "--crtimes preservation requires platform-specific creation-time support"
+                },
+            ));
+        }
+        if self.omit_dir_times {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::Permissions,
+                MetadataAction::Applied,
+                "--omit-dir-times is applied by not scheduling directory mtime preservation in local planning",
+            ));
+        }
+        if self.user_map || self.chown {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::Owner,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
+                if self.fake_super {
+                    "owner mapping intent is stored in the fake-super sidecar"
+                } else {
+                    "owner mapping is meaningful for remote POSIX receivers; local Windows transfers do not apply POSIX owners"
+                },
+            ));
+        }
+        if self.group_map || self.chown {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::Group,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
+                if self.fake_super {
+                    "group mapping intent is stored in the fake-super sidecar"
+                } else {
+                    "group mapping is meaningful for remote POSIX receivers; local Windows transfers do not apply POSIX groups"
+                },
             ));
         }
 
@@ -724,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn posix_request_reports_fake_super_as_unimplemented_storage_loss() {
+    fn posix_request_reports_fake_super_as_stored_sidecar_metadata() {
         let request = PosixMetadataRequest {
             permissions: true,
             owner: true,
@@ -739,16 +864,18 @@ mod tests {
         assert!(request.any());
         assert!(degradations.iter().any(|degradation| {
             degradation.feature == MetadataFeature::Acl
-                && degradation.action == MetadataAction::Ignored
-                && degradation.is_loss()
+                && degradation.action == MetadataAction::Stored
+                && !degradation.is_loss()
         }));
         assert!(degradations.iter().any(|degradation| {
             degradation.feature == MetadataFeature::Xattr
-                && degradation.action == MetadataAction::Ignored
-                && degradation.is_loss()
+                && degradation.action == MetadataAction::Stored
+                && !degradation.is_loss()
         }));
         assert!(degradations.iter().any(|degradation| {
-            degradation.feature == MetadataFeature::Permissions && degradation.is_loss()
+            degradation.feature == MetadataFeature::Permissions
+                && degradation.action == MetadataAction::Stored
+                && !degradation.is_loss()
         }));
     }
 

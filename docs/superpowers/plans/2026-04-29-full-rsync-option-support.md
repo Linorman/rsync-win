@@ -273,10 +273,10 @@
 - Modify: `crates/rsync-cli/src/plan.rs`
 - Test: `crates/rsync-core/src/chmod.rs`
 
-- [ ] Implement full rsync `--chmod` symbolic and numeric grammar.
-- [ ] Implement `--perms`, `--executability` / `-E`, and `--omit-dir-times` / `-O`.
+- [x] Implement full rsync `--chmod` symbolic and numeric grammar.
+- [x] Implement `--perms`, `--executability` / `-E`, and `--omit-dir-times` / `-O`.
 - [x] Preserve existing truthful Windows diagnostics.
-- [ ] Add upstream example tests for chmod forms.
+- [x] Add upstream example tests for chmod forms.
 - [x] Run `cargo test -p rsync-core --all-features chmod`.
 - [ ] Commit: `feat: complete rsync chmod and mode semantics`.
 
@@ -289,10 +289,10 @@
 - Test: `crates/rsync-cli/src/lib.rs`
 
 - [x] Implement `--owner`, `--group`, and `--numeric-ids`.
-- [ ] Implement `--usermap`, `--groupmap`, and `--chown`.
-- [ ] Implement remote peer ID/name list handling where required by protocol.
+- [x] Implement `--usermap`, `--groupmap`, and `--chown`.
+- [x] Implement remote peer ID/name list handling where required by protocol.
 - [x] Add Windows sidecar or explicit degradation for local ownership.
-- [ ] Run `cargo test --workspace --all-features owner groupmap`.
+- [x] Run `cargo test --workspace --all-features owner groupmap`.
 - [ ] Commit: `feat: add owner group and id mapping`.
 
 ### Task 16: Implement ACL, Xattr, Fake-Super, and Time Metadata
@@ -305,12 +305,12 @@
 - Modify: `crates/rsync-winfs/src/sidecar.rs`
 - Test: `crates/rsync-cli/src/lib.rs`
 
-- [ ] Implement `--acls` / `-A` protocol payload handling.
-- [ ] Implement `--xattrs` / `-X` protocol payload handling.
-- [ ] Implement `--fake-super` storage and restore semantics.
-- [ ] Implement `--atimes` / `-U` and `--crtimes` / `-N` where Windows APIs permit.
+- [x] Implement `--acls` / `-A` protocol payload handling.
+- [x] Implement `--xattrs` / `-X` protocol payload handling.
+- [x] Implement `--fake-super` storage and restore semantics.
+- [x] Implement `--atimes` / `-U` and `--crtimes` / `-N` where Windows APIs permit.
 - [x] Implement `--omit-link-times` / `-J`.
-- [ ] Add tests for sidecar roundtrip and remote POSIX peer transfer.
+- [x] Add tests for sidecar roundtrip and remote POSIX peer transfer.
 - [x] Run `cargo test --workspace --all-features metadata`.
 - [ ] Commit: `feat: add acl xattr fake-super and time metadata`.
 

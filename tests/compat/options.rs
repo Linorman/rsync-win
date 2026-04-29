@@ -767,6 +767,59 @@ fn parser_routes_full_link_and_device_options() {
 }
 
 #[test]
+fn parser_routes_chunk7_posix_metadata_options_to_remote_receiver() {
+    let output = parse_and_render([
+        "rsync-win",
+        "--plan",
+        "-rtO",
+        "--owner",
+        "--group",
+        "--numeric-ids",
+        "--usermap=0:root,*:nobody",
+        "--groupmap=0:root,*:nogroup",
+        "--chown=deploy:staff",
+        "--acls",
+        "--xattrs",
+        "--fake-super",
+        "--atimes",
+        "--crtimes",
+        "--chmod=u=rwX,go=rX",
+        "src",
+        "host:/dst",
+    ]);
+    let server_line = output
+        .lines()
+        .find(|line| line.starts_with("remote --server argv:"))
+        .unwrap();
+
+    assert!(output.contains("posix metadata: perms,owner,group,acls,xattrs,fake-super,omit-dir-times,atimes,crtimes,numeric-ids,chmod,usermap,groupmap,chown"), "{output}");
+    for expected in [
+        "--owner",
+        "--group",
+        "--numeric-ids",
+        "--usermap=0:root,*:nobody",
+        "--groupmap=0:root,*:nogroup",
+        "--chown=deploy:staff",
+        "--acls",
+        "--xattrs",
+        "--fake-super",
+        "--omit-dir-times",
+        "--atimes",
+        "--crtimes",
+        "--chmod=u=rwX,go=rX",
+    ] {
+        assert!(
+            server_line.contains(expected),
+            "missing {expected} in {server_line}"
+        );
+    }
+    assert!(
+        !output.contains("--omit-dir-times is accepted for future compatibility"),
+        "{output}"
+    );
+}
+
+#[test]
 fn transfer_plan_reports_mode_gating_for_all_modes() {
     let local = parse_and_render(["rsync-win", "--plan", "src", "dst"]);
     assert!(local.contains("transfer mode: local"), "{local}");

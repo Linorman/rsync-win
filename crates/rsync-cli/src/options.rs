@@ -185,10 +185,10 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("specials", None, I),
     flag("D", Some('D'), I),
     flag("times", Some('t'), I),
-    flag("atimes", Some('U'), P),
+    flag("atimes", Some('U'), I),
     flag("open-noatime", None, P),
-    flag("crtimes", Some('N'), P),
-    flag("omit-dir-times", Some('O'), P),
+    flag("crtimes", Some('N'), I),
+    flag("omit-dir-times", Some('O'), I),
     flag("omit-link-times", Some('J'), I),
     flag("super", None, P),
     flag("fake-super", None, I),
@@ -226,9 +226,9 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("delay-updates", None, I),
     flag("prune-empty-dirs", Some('m'), P),
     flag("numeric-ids", None, I),
-    value("usermap", None, P),
-    value("groupmap", None, P),
-    value("chown", None, P),
+    append_value("usermap", None, I),
+    append_value("groupmap", None, I),
+    value("chown", None, I),
     value("timeout", None, P),
     value("contimeout", None, P),
     flag("ignore-times", Some('I'), I),
@@ -698,6 +698,9 @@ impl Default for Cli {
             acls: false,
             xattrs: false,
             fake_super: false,
+            atimes: false,
+            crtimes: false,
+            omit_dir_times: false,
             omit_link_times: false,
             vss: false,
             daemon_server: false,
@@ -738,6 +741,9 @@ impl Default for Cli {
             delay_updates: false,
             fsync: false,
             numeric_ids: false,
+            user_maps: Vec::new(),
+            group_maps: Vec::new(),
+            chown: None,
             no_owner: false,
             no_group: false,
             chmod: None,
@@ -905,9 +911,9 @@ fn apply_short_option(cli: &mut Cli, option: char, value: Option<&str>) -> Resul
             cli.preserve_times = true;
             cli.no_times = false;
         }
-        'U' => remember_unsupported(cli, "--atimes"),
-        'N' => remember_unsupported(cli, "--crtimes"),
-        'O' => remember_unsupported(cli, "--omit-dir-times"),
+        'U' => cli.atimes = true,
+        'N' => cli.crtimes = true,
+        'O' => cli.omit_dir_times = true,
         'J' => cli.omit_link_times = true,
         'S' => remember_unsupported(cli, "--sparse"),
         'n' => cli.dry_run = true,
@@ -1077,6 +1083,9 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
             cli.preserve_times = true;
             cli.no_times = false;
         }
+        "atimes" => cli.atimes = true,
+        "crtimes" => cli.crtimes = true,
+        "omit-dir-times" => cli.omit_dir_times = true,
         "omit-link-times" => cli.omit_link_times = true,
         "fake-super" => cli.fake_super = true,
         "dry-run" => cli.dry_run = true,
@@ -1118,6 +1127,15 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         }
         "delay-updates" => cli.delay_updates = true,
         "numeric-ids" => cli.numeric_ids = true,
+        "usermap" => cli.user_maps.push(required_value(name, value)?.to_string()),
+        "groupmap" => cli
+            .group_maps
+            .push(required_value(name, value)?.to_string()),
+        "chown" => {
+            let chown = required_value(name, value)?.to_string();
+            apply_chown_implications(cli, &chown);
+            cli.chown = Some(chown);
+        }
         "ignore-times" => cli.ignore_times = true,
         "size-only" => cli.size_only = true,
         "modify-window" => cli.modify_window = parse_i64(required_value(name, value)?, name)?,
@@ -1239,6 +1257,9 @@ fn apply_negated_option(cli: &mut Cli, name: &str) -> Result<()> {
         "list-only" => cli.list_only = false,
         "mkpath" => cli.mkpath = false,
         "numeric-ids" => cli.numeric_ids = false,
+        "atimes" | "U" => cli.atimes = false,
+        "crtimes" | "N" => cli.crtimes = false,
+        "omit-dir-times" | "O" => cli.omit_dir_times = false,
         "omit-link-times" | "J" => cli.omit_link_times = false,
         "partial" => {
             cli.partial = false;
@@ -1319,6 +1340,18 @@ fn apply_negated_option(cli: &mut Cli, name: &str) -> Result<()> {
 
 fn required_value<'a>(name: &str, value: Option<&'a str>) -> Result<&'a str> {
     value.ok_or_else(|| anyhow::anyhow!("option --{name} requires a value"))
+}
+
+fn apply_chown_implications(cli: &mut Cli, chown: &str) {
+    let (user, group) = chown.split_once(':').unwrap_or((chown, ""));
+    if !user.is_empty() {
+        cli.preserve_owner = true;
+        cli.no_owner = false;
+    }
+    if !group.is_empty() {
+        cli.preserve_group = true;
+        cli.no_group = false;
+    }
 }
 
 fn parse_metadata_policy(value: &str) -> Result<CliMetadataPolicy> {
