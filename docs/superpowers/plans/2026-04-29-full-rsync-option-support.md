@@ -382,7 +382,7 @@
 - [x] Implement `--ipv4` / `-4` and `--ipv6` / `-6` where transport supports it.
 - [x] Add command-construction tests with paths containing spaces and shell metacharacters.
 - [x] Run `cargo test -p rsync-cli --all-features remote_shell`.
-- [x] Run SSH smoke against `root@192.168.100.181:/root/rsync-test/` with `--rsync-path`, `--blocking-io`, `--ipv4`, `--trust-sender`, and `--secluded-args`; cleaned remote and local test directories.
+- [x] Run SSH smoke against `root@192.168.100.181:/root/rsync-test/` with `--rsync-path`, `--blocking-io`, `--ipv4`, `--trust-sender`, and true `--secluded-args` protected arg streaming using paths with spaces/shell metacharacters; cleaned remote and local test directories.
 - [x] Commit: `feat: add remote-shell transport options and trust-sender gating` (combined chunk9 commit).
 
 ### Task 21: Harden Remote Peer Trust Semantics

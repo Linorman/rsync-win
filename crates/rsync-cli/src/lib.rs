@@ -25,23 +25,25 @@ use rsync_fs::{
 };
 use rsync_protocol::{
     authenticate_daemon_module, build_remote_shell_argv_for_paths,
-    build_remote_shell_protocol31_argv, build_remote_shell_protocol31_argv_for_paths,
-    exchange_daemon_greeting, exchange_protocol31_setup_with_options,
-    exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake_with_options,
-    read_i32_le, read_multiplexed_i32, read_multiplexed_long, read_rsync27_file_list_with_options,
+    build_remote_shell_invocation_for_paths, build_remote_shell_protocol31_argv_for_paths,
+    build_remote_shell_protocol31_invocation_for_paths, exchange_daemon_greeting,
+    exchange_protocol31_setup_with_options, exchange_remote_shell_mvp_handshake,
+    exchange_remote_shell_protocol31_handshake_with_options, read_i32_le, read_multiplexed_i32,
+    read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
     read_vstring, request_module_list, rsync_plain_md4_checksum_reader,
     rsync_whole_file_checksum_reader, select_daemon_module, write_daemon_args, write_i32_le,
-    write_rsync27_file_list_with_options, write_rsync31_file_list_with_metadata, write_rsync_i32,
-    write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
-    DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter,
-    Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError, RemoteShellOperand,
-    RemoteShellOptions, RsyncDeflatedToken, RsyncDeflatedTokenMode, RsyncDeflatedTokenReader,
-    RsyncDeflatedTokenWriter, RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions,
-    RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection,
-    WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
-    MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
-    REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
+    write_remote_shell_protected_args, write_rsync27_file_list_with_options,
+    write_rsync31_file_list_with_metadata, write_rsync_i32, write_rsync_index,
+    write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection, DaemonOperand,
+    MultiplexReadState, MultiplexedReader, MultiplexedWriter, Protocol31SetupOptions,
+    RemoteDeleteMode, RemoteSessionError, RemoteShellOperand, RemoteShellOptions,
+    RsyncDeflatedToken, RsyncDeflatedTokenMode, RsyncDeflatedTokenReader, RsyncDeflatedTokenWriter,
+    RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions, RsyncHardLinkGroup,
+    RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection, WireFileType,
+    DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION,
+    MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL,
+    RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command_with_options, build_ssh_remote_command_with_options,
@@ -760,6 +762,16 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
         }
         output.push('\n');
     }
+    if let Some(args) = &plan.remote_protected_args {
+        if !args.is_empty() {
+            output.push_str("remote protected args:");
+            for arg in args {
+                output.push(' ');
+                output.push_str(arg);
+            }
+            output.push('\n');
+        }
+    }
     if let Some(argv) = &plan.remote_ssh_argv {
         output.push_str("remote ssh argv:");
         for arg in argv {
@@ -1405,6 +1417,10 @@ fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
 
     let mut transport = spawn_ssh_remote_command(command)
         .with_context(|| format!("failed to spawn {}", command.display_command()))?;
+    if let Some(protected_args) = &plan.remote_protected_args {
+        write_remote_shell_protected_args(&mut transport, protected_args)
+            .context("failed to send remote-shell protected args")?;
+    }
 
     let session_result = match direction {
         TransferDirection::Push => execute_remote_push(cli, &plan, &mut transport),
@@ -1452,7 +1468,7 @@ fn execute_remote_shell_protocol27_fallback(
     plan: &TransferPlan,
     direction: TransferDirection,
 ) -> Result<String> {
-    let command = build_protocol27_fallback_command(cli, plan, direction)?;
+    let (command, protected_args) = build_protocol27_fallback_command(cli, plan, direction)?;
     ProgressLog::from_cli(cli).info(format!(
         "remote-shell protocol 31 was not accepted; retrying {} via {}",
         transfer_direction_label(direction),
@@ -1460,6 +1476,8 @@ fn execute_remote_shell_protocol27_fallback(
     ));
     let mut transport = spawn_ssh_remote_command(&command)
         .with_context(|| format!("failed to spawn {}", command.display_command()))?;
+    write_remote_shell_protected_args(&mut transport, &protected_args)
+        .context("failed to send remote-shell protected args for protocol 27 fallback")?;
 
     let session_result = match direction {
         TransferDirection::Push => execute_remote_push_protocol27(cli, plan, &mut transport),
@@ -1504,7 +1522,7 @@ fn build_protocol27_fallback_command(
     cli: &Cli,
     plan: &TransferPlan,
     direction: TransferDirection,
-) -> Result<SshRemoteCommand> {
+) -> Result<(SshRemoteCommand, Vec<String>)> {
     let remote = plan
         .remote_operand
         .as_ref()
@@ -1523,13 +1541,14 @@ fn build_protocol27_fallback_command(
     let remote_path_refs: Vec<&Path> = remote_paths.iter().map(PathBuf::as_path).collect();
     let (includes, excludes, filters) = remote_receiver_filter_args_from_cli(cli, direction);
     let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
-    let argv = build_remote_shell_argv_for_paths(
+    let invocation = build_remote_shell_invocation_for_paths(
         &RemoteShellOptions {
             rsync_path: plan
                 .rsync_path
                 .clone()
                 .unwrap_or_else(|| "rsync".to_string()),
             direction,
+            secluded_args: plan.secluded_args,
             recursive: plan.recursive,
             preserve_times: plan.preserve_times,
             delete_mode: remote_delete_mode(plan.delete, plan.delete_mode),
@@ -1619,7 +1638,10 @@ fn build_protocol27_fallback_command(
         },
         &remote_path_refs,
     )?;
-    build_remote_transport_command(cli, &remote.host, &argv)
+    Ok((
+        build_remote_transport_command(cli, &remote.host, &invocation.argv)?,
+        invocation.protected_args,
+    ))
 }
 
 fn build_remote_transport_command(
@@ -1656,6 +1678,7 @@ fn remote_shell_command_options_from_cli(cli: &Cli) -> RemoteShellCommandOptions
     RemoteShellCommandOptions {
         address_family,
         blocking_io: cli.blocking_io,
+        old_args: cli.old_args,
     }
 }
 
@@ -5218,7 +5241,11 @@ fn validate_remote_sender_claims(
     if plan.trust_sender {
         return Ok(());
     }
-    let allowed_single_file_sources = remote_single_file_source_basenames(plan);
+    let allowed_single_file_sources = if plan.old_args {
+        Vec::new()
+    } else {
+        remote_single_file_source_basenames(plan)
+    };
     for entry in entries {
         if remote_entry_is_top_dir(entry) {
             continue;
@@ -5362,6 +5389,7 @@ struct TransferPlan {
     ipv4: bool,
     ipv6: bool,
     remote_server_argv: Option<Vec<String>>,
+    remote_protected_args: Option<Vec<String>>,
     remote_ssh_argv: Option<Vec<String>>,
     remote_ssh_command: Option<SshRemoteCommand>,
     remote_operand: Option<RemoteShellOperand>,
@@ -5441,6 +5469,7 @@ impl TransferPlan {
         };
         let (
             remote_server_argv,
+            remote_protected_args,
             remote_ssh_argv,
             remote_ssh_command,
             remote_operand,
@@ -5448,7 +5477,7 @@ impl TransferPlan {
             remote_direction,
             remote_wire_protocol,
         ) = if explicit_server_mode || has_daemon_operand {
-            (None, None, None, None, Vec::new(), None, None)
+            (None, None, None, None, None, Vec::new(), None, None)
         } else if cli.paths.len() >= 2 {
             let sources = &cli.paths[..cli.paths.len() - 1];
             let destination = cli.paths.last().expect("checked len");
@@ -5459,20 +5488,20 @@ impl TransferPlan {
             let destination_remote = parse_remote_shell_operand(destination, &mut report);
             let any_source_remote = source_remotes.iter().any(Option::is_some);
             if !any_source_remote && destination_remote.is_none() {
-                (None, None, None, None, Vec::new(), None, None)
+                (None, None, None, None, None, Vec::new(), None, None)
             } else if any_source_remote && destination_remote.is_some() {
                 report.error(
                     "E_REMOTE_BOTH",
                     "remote-to-remote transfers are not supported by this development build",
                 );
-                (None, None, None, None, Vec::new(), None, None)
+                (None, None, None, None, None, Vec::new(), None, None)
             } else if any_source_remote {
                 if !source_remotes.iter().all(Option::is_some) {
                     report.error(
                         "E_REMOTE_MIXED_SOURCES",
                         "remote-shell pull sources must all be remote operands from the same host",
                     );
-                    (None, None, None, None, Vec::new(), None, None)
+                    (None, None, None, None, None, Vec::new(), None, None)
                 } else {
                     let remotes: Vec<_> = source_remotes.into_iter().flatten().collect();
                     let remote = remotes.first().expect("checked remote source");
@@ -5481,7 +5510,7 @@ impl TransferPlan {
                             "E_REMOTE_HOST_MISMATCH",
                             "remote-shell pull sources must use the same remote host",
                         );
-                        (None, None, None, None, Vec::new(), None, None)
+                        (None, None, None, None, None, Vec::new(), None, None)
                     } else {
                         let direction = TransferDirection::Pull;
                         let remote_paths: Vec<PathBuf> = remotes
@@ -5490,7 +5519,7 @@ impl TransferPlan {
                             .collect();
                         let remote_path_refs: Vec<&Path> =
                             remote_paths.iter().map(PathBuf::as_path).collect();
-                        match build_remote_shell_protocol31_argv_for_paths(
+                        match build_remote_shell_protocol31_invocation_for_paths(
                             &remote_shell_options_from_cli(
                                 cli,
                                 direction,
@@ -5500,8 +5529,12 @@ impl TransferPlan {
                             ),
                             &remote_path_refs,
                         ) {
-                            Ok(argv) => {
-                                match build_remote_transport_command(cli, &remote.host, &argv) {
+                            Ok(invocation) => {
+                                match build_remote_transport_command(
+                                    cli,
+                                    &remote.host,
+                                    &invocation.argv,
+                                ) {
                                     Ok(ssh_command) => {
                                         report.info(
                                         "I_REMOTE_PROTOCOL31_MVP",
@@ -5510,7 +5543,8 @@ impl TransferPlan {
                                         ),
                                     );
                                         (
-                                            Some(argv),
+                                            Some(invocation.argv),
+                                            Some(invocation.protected_args),
                                             Some(render_ssh_command(&ssh_command)),
                                             Some(ssh_command),
                                             Some(remote.clone()),
@@ -5524,7 +5558,7 @@ impl TransferPlan {
                                             "E_REMOTE_SHELL",
                                             format!("could not parse remote shell command: {err}"),
                                         );
-                                        (None, None, None, None, Vec::new(), None, None)
+                                        (None, None, None, None, None, Vec::new(), None, None)
                                     }
                                 }
                             }
@@ -5533,7 +5567,7 @@ impl TransferPlan {
                                     "E_REMOTE_ARGV",
                                     format!("could not build remote --server argv: {err}"),
                                 );
-                                (None, None, None, None, Vec::new(), None, None)
+                                (None, None, None, None, None, Vec::new(), None, None)
                             }
                         }
                     }
@@ -5543,7 +5577,7 @@ impl TransferPlan {
                     .as_ref()
                     .expect("checked remote destination");
                 let direction = TransferDirection::Push;
-                match build_remote_shell_protocol31_argv(
+                match build_remote_shell_protocol31_invocation_for_paths(
                     &remote_shell_options_from_cli(
                         cli,
                         direction,
@@ -5551,45 +5585,48 @@ impl TransferPlan {
                         preserve_times,
                         symlink_mode,
                     ),
-                    Path::new(&remote.path),
+                    &[Path::new(&remote.path)],
                 ) {
-                    Ok(argv) => match build_remote_transport_command(cli, &remote.host, &argv) {
-                        Ok(ssh_command) => {
-                            report.info(
+                    Ok(invocation) => {
+                        match build_remote_transport_command(cli, &remote.host, &invocation.argv) {
+                            Ok(ssh_command) => {
+                                report.info(
                                     "I_REMOTE_PROTOCOL31_MVP",
                                     format!(
                                         "remote-shell execution tries protocol {REMOTE_SHELL_MODERN_PROTOCOL} first for the ordinary-file MVP"
                                     ),
                                 );
-                            (
-                                Some(argv),
-                                Some(render_ssh_command(&ssh_command)),
-                                Some(ssh_command),
-                                Some(remote.clone()),
-                                vec![remote.clone()],
-                                Some(direction),
-                                Some(RemoteWireProtocol::Modern31),
-                            )
+                                (
+                                    Some(invocation.argv),
+                                    Some(invocation.protected_args),
+                                    Some(render_ssh_command(&ssh_command)),
+                                    Some(ssh_command),
+                                    Some(remote.clone()),
+                                    vec![remote.clone()],
+                                    Some(direction),
+                                    Some(RemoteWireProtocol::Modern31),
+                                )
+                            }
+                            Err(err) => {
+                                report.error(
+                                    "E_REMOTE_SHELL",
+                                    format!("could not parse remote shell command: {err}"),
+                                );
+                                (None, None, None, None, None, Vec::new(), None, None)
+                            }
                         }
-                        Err(err) => {
-                            report.error(
-                                "E_REMOTE_SHELL",
-                                format!("could not parse remote shell command: {err}"),
-                            );
-                            (None, None, None, None, Vec::new(), None, None)
-                        }
-                    },
+                    }
                     Err(err) => {
                         report.error(
                             "E_REMOTE_ARGV",
                             format!("could not build remote --server argv: {err}"),
                         );
-                        (None, None, None, None, Vec::new(), None, None)
+                        (None, None, None, None, None, Vec::new(), None, None)
                     }
                 }
             }
         } else {
-            (None, None, None, None, Vec::new(), None, None)
+            (None, None, None, None, None, Vec::new(), None, None)
         };
 
         add_metadata_degradations(
@@ -5702,6 +5739,7 @@ impl TransferPlan {
             ipv4: cli.ipv4,
             ipv6: cli.ipv6,
             remote_server_argv,
+            remote_protected_args,
             remote_ssh_argv,
             remote_ssh_command,
             remote_operand,
@@ -5897,6 +5935,7 @@ fn remote_shell_options_from_cli(
             .clone()
             .unwrap_or_else(|| "rsync".to_string()),
         direction,
+        secluded_args: cli.secluded_args,
         recursive,
         preserve_times,
         delete_mode: remote_delete_mode_from_cli(cli),
@@ -6604,13 +6643,13 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
     if cli.old_args {
         report.info(
             "I_REMOTE_ARGS",
-            "--old-args requested; remote argv remains shell-quoted for compatibility",
+            "--old-args requested; remote filename args use legacy shell splitting and sender arg names are trusted",
         );
     }
     if cli.secluded_args {
         report.info(
             "I_REMOTE_ARGS",
-            "--secluded-args requested; remote argv is shell-quoted before transport launch",
+            "--secluded-args requested; remote filename args are sent in the protected pre-handshake arg stream",
         );
     }
     if cli.trust_sender {
@@ -8529,6 +8568,63 @@ mod tests {
             "{err:#}"
         );
         assert!(fs::read_dir(&dest).unwrap().next().is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_args_trusts_remote_source_arg_names_but_not_filters() {
+        let root = unique_temp_dir("rsync-cli-old-args-source-trust");
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let cli = options::parse_cli(vec![
+            "rsync-win".to_string(),
+            "--dry-run".to_string(),
+            "--old-args".to_string(),
+            "host:/tmp/allowed.txt".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_dry_run_input_with_entries(
+            &[
+                test_remote_entry(".", WireFileType::Directory),
+                test_remote_entry("other.txt", WireFileType::File),
+            ],
+            1,
+        ));
+
+        let output = execute_remote_pull(&cli, &plan, &mut transport).unwrap();
+
+        assert!(output.contains("files received: 1"), "{output}");
+        assert!(fs::read_dir(&dest).unwrap().next().is_none());
+
+        let cli = options::parse_cli(vec![
+            "rsync-win".to_string(),
+            "--dry-run".to_string(),
+            "--old-args".to_string(),
+            "--exclude".to_string(),
+            "*.tmp".to_string(),
+            "host:/tmp/allowed.txt".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_dry_run_input_with_entries(
+            &[
+                test_remote_entry(".", WireFileType::Directory),
+                test_remote_entry("skip.tmp", WireFileType::File),
+            ],
+            1,
+        ));
+
+        let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(
+            err.to_string().contains("remote sender sent filtered path"),
+            "{err:#}"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

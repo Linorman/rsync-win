@@ -16,6 +16,7 @@ pub enum SshAddressFamily {
 pub struct RemoteShellCommandOptions {
     pub address_family: Option<SshAddressFamily>,
     pub blocking_io: bool,
+    pub old_args: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,32 +102,52 @@ fn build_remote_shell_command(
     remote_server_argv: &[String],
     options: RemoteShellCommandOptions,
 ) -> SshRemoteCommand {
-    let remote_command = remote_server_command(remote_server_argv);
+    let program = program.into();
+    let remote_command = remote_server_command(remote_server_argv, options.old_args);
     let mut args: Vec<OsString> = args.into_iter().collect();
-    match options.address_family {
-        Some(SshAddressFamily::Ipv4) => args.push(OsString::from("-4")),
-        Some(SshAddressFamily::Ipv6) => args.push(OsString::from("-6")),
-        None => {}
+    if remote_shell_supports_address_family(&program) {
+        match options.address_family {
+            Some(SshAddressFamily::Ipv4) => args.push(OsString::from("-4")),
+            Some(SshAddressFamily::Ipv6) => args.push(OsString::from("-6")),
+            None => {}
+        }
     }
     args.extend([OsString::from(host), OsString::from(remote_command.clone())]);
 
     SshRemoteCommand {
-        program: program.into(),
+        program,
         args,
         remote_command,
     }
 }
 
-fn remote_server_command(remote_server_argv: &[String]) -> String {
+fn remote_server_command(remote_server_argv: &[String], old_args: bool) -> String {
     let Some((program, args)) = remote_server_argv.split_first() else {
         return String::new();
     };
     let mut command = program.clone();
+    let mut filename_args = false;
     for arg in args {
         command.push(' ');
-        command.push_str(&shell_quote(arg));
+        if old_args && filename_args {
+            command.push_str(arg);
+        } else {
+            command.push_str(&shell_quote(arg));
+        }
+        if arg == "." {
+            filename_args = true;
+        }
     }
     command
+}
+
+fn remote_shell_supports_address_family(program: &OsString) -> bool {
+    let program = program.to_string_lossy();
+    let basename = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program.as_ref());
+    basename.eq_ignore_ascii_case("ssh") || basename.eq_ignore_ascii_case("ssh.exe")
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -295,6 +316,7 @@ mod tests {
             RemoteShellCommandOptions {
                 address_family: Some(SshAddressFamily::Ipv4),
                 blocking_io: true,
+                old_args: false,
             },
         );
 
@@ -313,6 +335,56 @@ mod tests {
         assert_eq!(
             command.remote_command,
             "sudo rsync --server . 'path with spaces' 'path;name'"
+        );
+    }
+
+    #[test]
+    fn address_family_is_only_added_for_ssh_remote_shells() {
+        let command = build_custom_remote_shell_command_with_options(
+            "rsh -l backup",
+            "example.test",
+            &["rsync".to_string(), "--server".to_string(), ".".to_string()],
+            RemoteShellCommandOptions {
+                address_family: Some(SshAddressFamily::Ipv6),
+                blocking_io: false,
+                old_args: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            command.args,
+            vec![
+                OsString::from("-l"),
+                OsString::from("backup"),
+                OsString::from("example.test"),
+                OsString::from("rsync --server ."),
+            ]
+        );
+    }
+
+    #[test]
+    fn old_args_leaves_remote_filename_args_unquoted() {
+        let command = build_ssh_remote_command_with_options(
+            "ssh",
+            "example.test",
+            &[
+                "rsync".to_string(),
+                "--server".to_string(),
+                ".".to_string(),
+                "path with spaces".to_string(),
+                "path;name".to_string(),
+            ],
+            RemoteShellCommandOptions {
+                address_family: None,
+                blocking_io: false,
+                old_args: true,
+            },
+        );
+
+        assert_eq!(
+            command.remote_command,
+            "rsync --server . path with spaces path;name"
         );
     }
 

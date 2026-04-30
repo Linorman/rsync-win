@@ -547,6 +547,7 @@ pub enum RemoteDeleteMode {
 pub struct RemoteShellOptions {
     pub rsync_path: String,
     pub direction: TransferDirection,
+    pub secluded_args: bool,
     pub recursive: bool,
     pub preserve_times: bool,
     pub delete_mode: RemoteDeleteMode,
@@ -607,6 +608,7 @@ impl Default for RemoteShellOptions {
         Self {
             rsync_path: "rsync".to_string(),
             direction: TransferDirection::Push,
+            secluded_args: false,
             recursive: false,
             preserve_times: false,
             delete_mode: RemoteDeleteMode::None,
@@ -662,6 +664,12 @@ impl Default for RemoteShellOptions {
             filters: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteShellInvocation {
+    pub argv: Vec<String>,
+    pub protected_args: Vec<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -813,6 +821,13 @@ pub fn build_remote_shell_argv_for_paths(
     options: &RemoteShellOptions,
     paths: &[&Path],
 ) -> Result<Vec<String>, SessionError> {
+    Ok(build_remote_shell_invocation_for_paths(options, paths)?.argv)
+}
+
+pub fn build_remote_shell_invocation_for_paths(
+    options: &RemoteShellOptions,
+    paths: &[&Path],
+) -> Result<RemoteShellInvocation, SessionError> {
     let mut argv = vec![options.rsync_path.clone(), "--server".to_string()];
     if matches!(options.direction, TransferDirection::Pull) {
         argv.push("--sender".to_string());
@@ -840,7 +855,7 @@ pub fn build_remote_shell_argv_for_paths(
     argv.push(".".to_string());
     append_remote_paths(&mut argv, paths)?;
 
-    Ok(argv)
+    Ok(remote_shell_invocation_for_argv(options, argv))
 }
 
 pub fn build_remote_shell_protocol31_argv(
@@ -854,6 +869,13 @@ pub fn build_remote_shell_protocol31_argv_for_paths(
     options: &RemoteShellOptions,
     paths: &[&Path],
 ) -> Result<Vec<String>, SessionError> {
+    Ok(build_remote_shell_protocol31_invocation_for_paths(options, paths)?.argv)
+}
+
+pub fn build_remote_shell_protocol31_invocation_for_paths(
+    options: &RemoteShellOptions,
+    paths: &[&Path],
+) -> Result<RemoteShellInvocation, SessionError> {
     let mut argv = vec![options.rsync_path.clone(), "--server".to_string()];
     if matches!(options.direction, TransferDirection::Pull) {
         argv.push("--sender".to_string());
@@ -886,7 +908,37 @@ pub fn build_remote_shell_protocol31_argv_for_paths(
     argv.push(".".to_string());
     append_remote_paths(&mut argv, paths)?;
 
-    Ok(argv)
+    Ok(remote_shell_invocation_for_argv(options, argv))
+}
+
+fn remote_shell_invocation_for_argv(
+    options: &RemoteShellOptions,
+    argv: Vec<String>,
+) -> RemoteShellInvocation {
+    if !options.secluded_args {
+        return RemoteShellInvocation {
+            argv,
+            protected_args: Vec::new(),
+        };
+    }
+
+    let mut public_argv = vec![options.rsync_path.clone(), "--server".to_string()];
+    if matches!(options.direction, TransferDirection::Pull) {
+        public_argv.push("--sender".to_string());
+    }
+    public_argv.push("-s".to_string());
+
+    let mut protected_args = vec!["rsync".to_string()];
+    let mut skip = 2;
+    if matches!(options.direction, TransferDirection::Pull) {
+        skip += 1;
+    }
+    protected_args.extend(argv.into_iter().skip(skip));
+
+    RemoteShellInvocation {
+        argv: public_argv,
+        protected_args,
+    }
 }
 
 fn append_remote_paths(argv: &mut Vec<String>, paths: &[&Path]) -> Result<(), SessionError> {
@@ -1076,6 +1128,25 @@ pub fn exchange_remote_shell_handshake<T: Read + Write>(
         compat_flags: None,
         checksum_name: None,
     })
+}
+
+pub fn write_remote_shell_protected_args<W: Write>(
+    writer: &mut W,
+    args: &[String],
+) -> io::Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+
+    for arg in args {
+        if arg.is_empty() {
+            writer.write_all(b".\0")?;
+        } else {
+            writer.write_all(arg.as_bytes())?;
+            writer.write_all(&[0])?;
+        }
+    }
+    writer.write_all(&[0])
 }
 
 pub fn exchange_remote_shell_mvp_handshake<T: Read + Write>(
@@ -1598,6 +1669,49 @@ mod tests {
             assert!(argv.contains(&"--log-file=/tmp/remote rsync.log".to_string()));
             assert_eq!(argv.last().map(String::as_str), Some("dest path"));
         }
+    }
+
+    #[test]
+    fn builds_secluded_protocol31_invocation_with_protected_args() {
+        let invocation = build_remote_shell_protocol31_invocation_for_paths(
+            &RemoteShellOptions {
+                direction: TransferDirection::Pull,
+                secluded_args: true,
+                recursive: true,
+                dry_run: false,
+                whole_file: true,
+                remote_options: vec!["--fake-super".to_string()],
+                ..RemoteShellOptions::default()
+            },
+            &[Path::new("path with spaces;name")],
+        )
+        .unwrap();
+
+        assert_eq!(invocation.argv, vec!["rsync", "--server", "--sender", "-s"]);
+        assert_eq!(
+            invocation.protected_args,
+            vec![
+                "rsync",
+                "--no-inc-recursive",
+                "--fake-super",
+                "-Wre.LsfxCIvu",
+                ".",
+                "path with spaces;name",
+            ]
+        );
+    }
+
+    #[test]
+    fn writes_remote_shell_protected_args_as_nul_records() {
+        let mut bytes = Vec::new();
+
+        write_remote_shell_protected_args(
+            &mut bytes,
+            &["rsync".to_string(), String::new(), "path".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(bytes, b"rsync\0.\0path\0\0");
     }
 
     #[test]

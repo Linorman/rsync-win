@@ -459,7 +459,13 @@ fn parser_routes_chunk9_remote_shell_transport_options() {
     assert!(output.contains("address family: ipv4"), "{output}");
     assert!(output.contains("remote options: --fake-super"), "{output}");
     assert!(
-        output.contains("remote --server argv: sudo rsync --server"),
+        output.contains("remote --server argv: sudo rsync --server -s"),
+        "{output}"
+    );
+    assert!(
+        output.contains("remote protected args: rsync")
+            && output.contains("--fake-super")
+            && output.contains("/dst path;name"),
         "{output}"
     );
     assert!(
@@ -467,7 +473,7 @@ fn parser_routes_chunk9_remote_shell_transport_options() {
         "{output}"
     );
     assert!(
-        output.contains("sudo rsync --server") && output.contains("'/dst path;name'"),
+        output.contains("sudo rsync --server -s") && !output.contains("'/dst path;name'"),
         "{output}"
     );
     assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
