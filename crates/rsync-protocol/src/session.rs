@@ -1,6 +1,10 @@
+use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
 
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use thiserror::Error;
 
 use crate::flist::{read_rsync_long, write_rsync_long, FileListError};
@@ -18,6 +22,511 @@ const RSYNC_MULTIPLEX_DATA_TAG: u32 = 7;
 const RSYNC_MULTIPLEX_ERROR_CODE: u32 = 1;
 const RSYNC_PROTOCOL31_CHECKSUM_LIST: &str = "md4";
 const RSYNC_CF_VARINT_FLIST_FLAGS: u32 = 1 << 7;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Protocol31SetupOptions {
+    pub checksum_choices: Vec<String>,
+    pub checksum_seed: Option<i32>,
+}
+
+impl Default for Protocol31SetupOptions {
+    fn default() -> Self {
+        Self {
+            checksum_choices: vec!["md4".to_string()],
+            checksum_seed: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+    pub choices: Vec<String>,
+    pub level: Option<u32>,
+    pub threads: Option<usize>,
+    pub skip_suffixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionAlgorithm {
+    Zlib,
+    Zlibx,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegotiatedCompression {
+    pub algorithm: CompressionAlgorithm,
+    pub level: u32,
+    pub threads: Option<usize>,
+    pub skip_suffixes: Vec<String>,
+}
+
+impl CompressionConfig {
+    pub fn negotiate(
+        &self,
+        peer_choices: &[&str],
+    ) -> Result<Option<NegotiatedCompression>, RemoteSessionError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        let local_choices = if self.choices.is_empty() {
+            vec!["zlib".to_string()]
+        } else {
+            normalized_name_list(&self.choices.join(","))
+        };
+        let peer_choices: Vec<_> = peer_choices
+            .iter()
+            .map(|choice| normalize_name(choice))
+            .collect();
+
+        let selected = local_choices
+            .iter()
+            .find(|choice| {
+                matches!(choice.as_str(), "zlib" | "zlibx")
+                    && peer_choices.iter().any(|peer| peer == *choice)
+            })
+            .ok_or(RemoteSessionError::UnsupportedCompressionNegotiation)?;
+
+        Ok(Some(NegotiatedCompression {
+            algorithm: match selected.as_str() {
+                "zlibx" => CompressionAlgorithm::Zlibx,
+                _ => CompressionAlgorithm::Zlib,
+            },
+            level: self.level.unwrap_or(6).min(9),
+            threads: self.threads,
+            skip_suffixes: self.skip_suffixes.clone(),
+        }))
+    }
+}
+
+impl NegotiatedCompression {
+    pub fn compress(&self, bytes: &[u8]) -> io::Result<Vec<u8>> {
+        match self.algorithm {
+            CompressionAlgorithm::Zlib | CompressionAlgorithm::Zlibx => {
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(self.level));
+                encoder.write_all(bytes)?;
+                encoder.finish()
+            }
+        }
+    }
+
+    pub fn decompress(&self, bytes: &[u8]) -> io::Result<Vec<u8>> {
+        match self.algorithm {
+            CompressionAlgorithm::Zlib | CompressionAlgorithm::Zlibx => {
+                let mut decoder = ZlibDecoder::new(bytes);
+                let mut output = Vec::new();
+                decoder.read_to_end(&mut output)?;
+                Ok(output)
+            }
+        }
+    }
+
+    pub fn should_skip_path(&self, path: &Path) -> bool {
+        let path = path.to_string_lossy().to_ascii_lowercase();
+        self.skip_suffixes
+            .iter()
+            .map(|suffix| {
+                suffix
+                    .trim()
+                    .trim_start_matches("*.")
+                    .trim_start_matches('.')
+            })
+            .filter(|suffix| !suffix.is_empty())
+            .any(|suffix| path.ends_with(&format!(".{}", suffix.to_ascii_lowercase())))
+    }
+}
+
+const RSYNC_DEFLATED_END_FLAG: u8 = 0;
+const RSYNC_DEFLATED_TOKEN_LONG: u8 = 0x20;
+const RSYNC_DEFLATED_TOKENRUN_LONG: u8 = 0x21;
+const RSYNC_DEFLATED_DATA: u8 = 0x40;
+const RSYNC_DEFLATED_TOKEN_REL: u8 = 0x80;
+const RSYNC_DEFLATED_TOKENRUN_REL: u8 = 0xc0;
+const RSYNC_DEFLATED_MAX_DATA_COUNT: usize = 16_383;
+const RSYNC_DEFLATED_CHUNK_SIZE: usize = 32 * 1024;
+const RSYNC_ZLIB_SYNC_TAIL: [u8; 4] = [0, 0, 0xff, 0xff];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsyncDeflatedTokenMode {
+    Zlib,
+    Zlibx,
+}
+
+impl RsyncDeflatedTokenMode {
+    pub fn from_choice(choice: Option<&str>) -> Result<Self, RemoteSessionError> {
+        match choice.map(normalize_name).as_deref() {
+            None | Some("zlibx") => Ok(Self::Zlibx),
+            Some("zlib") => Ok(Self::Zlib),
+            _ => Err(RemoteSessionError::UnsupportedCompressionNegotiation),
+        }
+    }
+
+    pub fn remote_choice(self) -> &'static str {
+        match self {
+            Self::Zlib => "zlib",
+            Self::Zlibx => "zlibx",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RsyncDeflatedToken {
+    Literal(Vec<u8>),
+    Copy { block_index: usize },
+    End,
+}
+
+pub struct RsyncDeflatedTokenWriter {
+    compressor: Compress,
+    last_token: i32,
+    run_start: i32,
+    last_run_end: i32,
+    flush_pending: bool,
+}
+
+impl RsyncDeflatedTokenWriter {
+    pub fn new(level: u32) -> Self {
+        Self {
+            compressor: Compress::new(Compression::new(level.min(9)), false),
+            last_token: -1,
+            run_start: 0,
+            last_run_end: 0,
+            flush_pending: false,
+        }
+    }
+
+    pub fn send_literal<W: Write>(&mut self, writer: &mut W, literal: &[u8]) -> io::Result<()> {
+        for chunk in literal.chunks(RSYNC_DEFLATED_CHUNK_SIZE) {
+            self.send_token(writer, -2, chunk)?;
+        }
+        Ok(())
+    }
+
+    pub fn send_copy<W: Write>(&mut self, writer: &mut W, block_index: usize) -> io::Result<()> {
+        let token = i32::try_from(block_index).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "rsync compressed copy token exceeded i32 range",
+            )
+        })?;
+        self.send_token(writer, token, &[])
+    }
+
+    pub fn finish<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        self.send_token(writer, -1, &[])
+    }
+
+    fn send_token<W: Write>(&mut self, writer: &mut W, token: i32, data: &[u8]) -> io::Result<()> {
+        if self.last_token == -1 {
+            self.compressor.reset();
+            self.last_run_end = 0;
+            self.run_start = token;
+            self.flush_pending = false;
+        } else if self.last_token == -2 {
+            self.run_start = token;
+        } else if !data.is_empty()
+            || self.last_token.checked_add(1) != Some(token)
+            || self
+                .run_start
+                .checked_add(65_536)
+                .map_or(true, |limit| token >= limit)
+        {
+            self.write_pending_run(writer)?;
+            self.last_run_end = self.last_token;
+            self.run_start = token;
+        }
+
+        self.last_token = token;
+
+        if !data.is_empty() {
+            self.write_deflated(writer, data, FlushCompress::None)?;
+            self.flush_pending = true;
+        } else if self.flush_pending && token != -2 {
+            self.write_deflated(writer, &[], FlushCompress::Sync)?;
+            self.flush_pending = false;
+        }
+
+        if token == -1 {
+            writer.write_all(&[RSYNC_DEFLATED_END_FLAG])?;
+        }
+        Ok(())
+    }
+
+    fn write_pending_run<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let relative = self
+            .run_start
+            .checked_sub(self.last_run_end)
+            .ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    "rsync compressed token run underflowed",
+                )
+            })?;
+        let run_len = self.last_token.checked_sub(self.run_start).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "rsync compressed token run length underflowed",
+            )
+        })?;
+        if run_len > u16::MAX as i32 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "rsync compressed token run exceeded u16 range",
+            ));
+        }
+
+        if (0..=63).contains(&relative) {
+            let base = if run_len == 0 {
+                RSYNC_DEFLATED_TOKEN_REL
+            } else {
+                RSYNC_DEFLATED_TOKENRUN_REL
+            };
+            writer.write_all(&[base + relative as u8])?;
+        } else {
+            writer.write_all(&[if run_len == 0 {
+                RSYNC_DEFLATED_TOKEN_LONG
+            } else {
+                RSYNC_DEFLATED_TOKENRUN_LONG
+            }])?;
+            write_i32_le(writer, self.run_start)?;
+        }
+
+        if run_len != 0 {
+            writer.write_all(&[(run_len & 0xff) as u8, ((run_len >> 8) & 0xff) as u8])?;
+        }
+        Ok(())
+    }
+
+    fn write_deflated<W: Write>(
+        &mut self,
+        writer: &mut W,
+        input: &[u8],
+        flush: FlushCompress,
+    ) -> io::Result<()> {
+        let mut output = Vec::with_capacity(input.len() * 1001 / 1000 + 64);
+        let mut offset = 0_usize;
+        let mut out = [0_u8; RSYNC_DEFLATED_MAX_DATA_COUNT];
+        loop {
+            let before_in = self.compressor.total_in();
+            let before_out = self.compressor.total_out();
+            let status = self
+                .compressor
+                .compress(&input[offset..], &mut out, flush)
+                .map_err(io::Error::from)?;
+            let consumed = (self.compressor.total_in() - before_in) as usize;
+            let produced = (self.compressor.total_out() - before_out) as usize;
+            offset += consumed;
+            output.extend_from_slice(&out[..produced]);
+
+            if flush == FlushCompress::Sync && output.ends_with(&RSYNC_ZLIB_SYNC_TAIL) {
+                break;
+            }
+            if flush != FlushCompress::Sync
+                && offset == input.len()
+                && (produced < out.len() || status == Status::BufError)
+            {
+                break;
+            }
+            if consumed == 0 && produced == 0 {
+                break;
+            }
+        }
+        if flush == FlushCompress::Sync {
+            if output.ends_with(&RSYNC_ZLIB_SYNC_TAIL) {
+                output.truncate(output.len() - RSYNC_ZLIB_SYNC_TAIL.len());
+            } else {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "rsync compressed sync flush omitted zlib tail",
+                ));
+            }
+        }
+        write_deflated_data_chunks(writer, &output)
+    }
+}
+
+fn write_deflated_data_chunks<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
+    for chunk in bytes.chunks(RSYNC_DEFLATED_MAX_DATA_COUNT) {
+        let len = chunk.len();
+        writer.write_all(&[RSYNC_DEFLATED_DATA + ((len >> 8) as u8), len as u8])?;
+        writer.write_all(chunk)?;
+    }
+    Ok(())
+}
+
+pub struct RsyncDeflatedTokenReader {
+    mode: RsyncDeflatedTokenMode,
+    decompressor: Decompress,
+    rx_token: i32,
+    rx_run: u16,
+    needs_sync_tail: bool,
+    saved_flag: Option<u8>,
+    pending: VecDeque<RsyncDeflatedToken>,
+}
+
+impl RsyncDeflatedTokenReader {
+    pub fn new(mode: RsyncDeflatedTokenMode) -> Self {
+        Self {
+            mode,
+            decompressor: Decompress::new(false),
+            rx_token: 0,
+            rx_run: 0,
+            needs_sync_tail: false,
+            saved_flag: None,
+            pending: VecDeque::new(),
+        }
+    }
+
+    pub fn next_token<R: Read>(&mut self, reader: &mut R) -> io::Result<RsyncDeflatedToken> {
+        loop {
+            if let Some(token) = self.pending.pop_front() {
+                return Ok(token);
+            }
+            if self.rx_run > 0 {
+                self.rx_token = self.rx_token.checked_add(1).ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::InvalidData,
+                        "rsync compressed token run overflowed",
+                    )
+                })?;
+                self.rx_run -= 1;
+                return self.copy_token(self.rx_token);
+            }
+
+            let flag = match self.saved_flag.take() {
+                Some(flag) => flag,
+                None => read_byte(reader)?,
+            };
+            if (flag & 0xc0) == RSYNC_DEFLATED_DATA {
+                let len = (((flag & 0x3f) as usize) << 8) + read_byte(reader)? as usize;
+                let mut compressed = vec![0_u8; len];
+                reader.read_exact(&mut compressed)?;
+                let literal = self.inflate_bytes(&compressed, FlushDecompress::None)?;
+                self.needs_sync_tail = true;
+                if !literal.is_empty() {
+                    return Ok(RsyncDeflatedToken::Literal(literal));
+                }
+                continue;
+            }
+
+            if self.needs_sync_tail {
+                let literal = self.inflate_bytes(&RSYNC_ZLIB_SYNC_TAIL, FlushDecompress::Sync)?;
+                self.needs_sync_tail = false;
+                if !literal.is_empty() {
+                    self.saved_flag = Some(flag);
+                    return Ok(RsyncDeflatedToken::Literal(literal));
+                }
+            }
+
+            if flag == RSYNC_DEFLATED_END_FLAG {
+                self.reset_file();
+                return Ok(RsyncDeflatedToken::End);
+            }
+
+            let token_flag = if flag & RSYNC_DEFLATED_TOKEN_REL != 0 {
+                self.rx_token =
+                    self.rx_token
+                        .checked_add((flag & 0x3f) as i32)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                ErrorKind::InvalidData,
+                                "rsync compressed relative token overflowed",
+                            )
+                        })?;
+                flag >> 6
+            } else {
+                self.rx_token = read_i32_le(reader)?;
+                if self.rx_token < 0 {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "rsync compressed stream contained a negative token number",
+                    ));
+                }
+                flag
+            };
+            if token_flag & 1 != 0 {
+                let lo = read_byte(reader)? as u16;
+                let hi = read_byte(reader)? as u16;
+                self.rx_run = lo | (hi << 8);
+            }
+            return self.copy_token(self.rx_token);
+        }
+    }
+
+    pub fn observe_copy_data(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.mode != RsyncDeflatedTokenMode::Zlib || bytes.is_empty() {
+            return Ok(());
+        }
+        for chunk in bytes.chunks(u16::MAX as usize) {
+            let len = chunk.len() as u16;
+            let mut stored = Vec::with_capacity(5 + chunk.len());
+            stored.push(0);
+            stored.push((len & 0xff) as u8);
+            stored.push((len >> 8) as u8);
+            stored.push(!(len as u8));
+            stored.push(!((len >> 8) as u8));
+            stored.extend_from_slice(chunk);
+            let _ = self.inflate_bytes(&stored, FlushDecompress::Sync)?;
+        }
+        Ok(())
+    }
+
+    fn copy_token(&self, rx_token: i32) -> io::Result<RsyncDeflatedToken> {
+        let block_index = usize::try_from(rx_token).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "rsync compressed copy token did not fit usize",
+            )
+        })?;
+        Ok(RsyncDeflatedToken::Copy { block_index })
+    }
+
+    fn reset_file(&mut self) {
+        self.decompressor.reset(false);
+        self.rx_token = 0;
+        self.rx_run = 0;
+        self.needs_sync_tail = false;
+        self.saved_flag = None;
+        self.pending.clear();
+    }
+
+    fn inflate_bytes(&mut self, input: &[u8], flush: FlushDecompress) -> io::Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(RSYNC_DEFLATED_CHUNK_SIZE + 64);
+        let mut offset = 0_usize;
+        loop {
+            output.reserve(RSYNC_DEFLATED_CHUNK_SIZE + 64);
+            let before_in = self.decompressor.total_in();
+            let before_out = self.decompressor.total_out();
+            let status = self
+                .decompressor
+                .decompress_vec(&input[offset..], &mut output, flush)
+                .map_err(io::Error::from)?;
+            let consumed = (self.decompressor.total_in() - before_in) as usize;
+            let produced = (self.decompressor.total_out() - before_out) as usize;
+            offset += consumed;
+            if offset == input.len() && status != Status::Ok {
+                break;
+            }
+            if offset == input.len() && produced == 0 {
+                break;
+            }
+            if consumed == 0 && produced == 0 {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "rsync compressed stream made no inflate progress",
+                ));
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn read_byte<R: Read>(reader: &mut R) -> io::Result<u8> {
+    let mut byte = [0_u8; 1];
+    reader.read_exact(&mut byte)?;
+    Ok(byte[0])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferDirection {
@@ -45,6 +554,8 @@ pub struct RemoteShellOptions {
     pub verbosity: u8,
     pub preserve_permissions: bool,
     pub checksum: bool,
+    pub checksum_choice: Option<String>,
+    pub checksum_seed: Option<i32>,
     pub size_only: bool,
     pub ignore_times: bool,
     pub partial: bool,
@@ -78,6 +589,12 @@ pub struct RemoteShellOptions {
     pub preserve_specials: bool,
     pub copy_devices: bool,
     pub write_devices: bool,
+    pub block_size: Option<u64>,
+    pub compress: bool,
+    pub compress_choice: Option<String>,
+    pub compress_level: Option<u32>,
+    pub compress_threads: Option<usize>,
+    pub skip_compress: Vec<String>,
     pub includes: Vec<String>,
     pub excludes: Vec<String>,
     pub filters: Vec<String>,
@@ -95,6 +612,8 @@ impl Default for RemoteShellOptions {
             verbosity: 0,
             preserve_permissions: false,
             checksum: false,
+            checksum_choice: None,
+            checksum_seed: None,
             size_only: false,
             ignore_times: false,
             partial: false,
@@ -128,6 +647,12 @@ impl Default for RemoteShellOptions {
             preserve_specials: false,
             copy_devices: false,
             write_devices: false,
+            block_size: None,
+            compress: false,
+            compress_choice: None,
+            compress_level: None,
+            compress_threads: None,
+            skip_compress: Vec::new(),
             includes: Vec::new(),
             excludes: Vec::new(),
             filters: Vec::new(),
@@ -199,6 +724,8 @@ pub enum RemoteSessionError {
     UnsupportedChecksumNegotiation,
     #[error("remote sent invalid checksum list text")]
     InvalidChecksumList,
+    #[error("protocol 31 compression negotiation did not find a supported algorithm")]
+    UnsupportedCompressionNegotiation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +914,12 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     if options.checksum {
         argv.push("--checksum".to_string());
     }
+    if let Some(choice) = &options.checksum_choice {
+        argv.push(format!("--checksum-choice={choice}"));
+    }
+    if let Some(seed) = options.checksum_seed {
+        argv.push(format!("--checksum-seed={seed}"));
+    }
     if options.preserve_permissions {
         argv.push("--perms".to_string());
     }
@@ -489,6 +1022,24 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     if options.write_devices {
         argv.push("--write-devices".to_string());
     }
+    if let Some(block_size) = options.block_size {
+        argv.push(format!("--block-size={block_size}"));
+    }
+    if options.compress {
+        argv.push("--compress".to_string());
+    }
+    if let Some(choice) = &options.compress_choice {
+        argv.push(format!("--compress-choice={choice}"));
+    }
+    if let Some(level) = options.compress_level {
+        argv.push(format!("--compress-level={level}"));
+    }
+    if let Some(threads) = options.compress_threads {
+        argv.push(format!("--compress-threads={threads}"));
+    }
+    for skip in &options.skip_compress {
+        argv.push(format!("--skip-compress={skip}"));
+    }
     for pattern in &options.includes {
         argv.push(format!("--include={pattern}"));
     }
@@ -538,18 +1089,40 @@ pub fn exchange_remote_shell_mvp_handshake<T: Read + Write>(
 pub fn exchange_remote_shell_protocol31_handshake<T: Read + Write>(
     transport: &mut T,
 ) -> Result<RemoteShellHandshake, RemoteSessionError> {
+    exchange_remote_shell_protocol31_handshake_with_options(
+        transport,
+        Protocol31SetupOptions::default(),
+    )
+}
+
+pub fn exchange_remote_shell_protocol31_handshake_with_options<T: Read + Write>(
+    transport: &mut T,
+    options: Protocol31SetupOptions,
+) -> Result<RemoteShellHandshake, RemoteSessionError> {
     write_u32_le(transport, REMOTE_SHELL_MODERN_PROTOCOL)?;
     transport.flush()?;
 
     let mut prefix = [0_u8; 4];
     transport.read_exact(&mut prefix)?;
     let peer_protocol = validate_protocol_stream_prefix(&prefix)?;
-    exchange_protocol31_setup(transport, peer_protocol)
+    exchange_protocol31_setup_with_options(transport, peer_protocol, options)
 }
 
 pub fn exchange_protocol31_setup<T: Read + Write>(
     transport: &mut T,
     peer_protocol: u32,
+) -> Result<RemoteShellHandshake, RemoteSessionError> {
+    exchange_protocol31_setup_with_options(
+        transport,
+        peer_protocol,
+        Protocol31SetupOptions::default(),
+    )
+}
+
+pub fn exchange_protocol31_setup_with_options<T: Read + Write>(
+    transport: &mut T,
+    peer_protocol: u32,
+    options: Protocol31SetupOptions,
 ) -> Result<RemoteShellHandshake, RemoteSessionError> {
     let selected_protocol =
         negotiate_protocol_version_with_local(peer_protocol, REMOTE_SHELL_MODERN_PROTOCOL)?;
@@ -565,16 +1138,21 @@ pub fn exchange_protocol31_setup<T: Read + Write>(
         let checksum_list = read_vstring(transport, 1024)?;
         let checksum_list = String::from_utf8(checksum_list)
             .map_err(|_| RemoteSessionError::InvalidChecksumList)?;
-        let checksum_name =
-            select_protocol31_checksum(RSYNC_PROTOCOL31_CHECKSUM_LIST, &checksum_list)
-                .ok_or(RemoteSessionError::UnsupportedChecksumNegotiation)?;
+        let client_list = if options.checksum_choices.is_empty() {
+            RSYNC_PROTOCOL31_CHECKSUM_LIST.to_string()
+        } else {
+            normalized_name_list(&options.checksum_choices.join(",")).join(" ")
+        };
+        let checksum_name = select_protocol31_checksum(&client_list, &checksum_list)
+            .ok_or(RemoteSessionError::UnsupportedChecksumNegotiation)?;
         write_vstring(transport, checksum_name.as_bytes())?;
         transport.flush()?;
         Some(checksum_name)
     } else {
         None
     };
-    let checksum_seed = read_i32_le(transport)?;
+    let remote_checksum_seed = read_i32_le(transport)?;
+    let checksum_seed = options.checksum_seed.unwrap_or(remote_checksum_seed);
 
     Ok(RemoteShellHandshake {
         peer_protocol,
@@ -586,11 +1164,21 @@ pub fn exchange_protocol31_setup<T: Read + Write>(
 }
 
 fn select_protocol31_checksum(client_list: &str, server_list: &str) -> Option<String> {
-    let server_names = server_list.split_whitespace().collect::<Vec<_>>();
-    client_list
-        .split_whitespace()
+    let server_names = normalized_name_list(server_list);
+    normalized_name_list(client_list)
+        .into_iter()
         .find(|name| server_names.contains(name))
-        .map(str::to_owned)
+}
+
+fn normalized_name_list(list: &str) -> Vec<String> {
+    list.split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .map(normalize_name)
+        .filter(|name| !name.is_empty() && name != "auto")
+        .collect()
+}
+
+fn normalize_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
 }
 
 impl<'a, R: Read> MultiplexedReader<'a, R> {
@@ -725,6 +1313,7 @@ pub fn rsync_plain_md4_checksum_reader<R: Read>(reader: &mut R) -> io::Result<[u
 
 pub struct RsyncMd4Checksum {
     hasher: md4::Md4,
+    seed: Option<i32>,
 }
 
 impl RsyncMd4Checksum {
@@ -733,12 +1322,21 @@ impl RsyncMd4Checksum {
 
         Self {
             hasher: md4::Md4::new(),
+            seed: None,
         }
     }
 
     pub fn seeded(seed: i32) -> Self {
         let mut checksum = Self::plain();
-        checksum.update(&seed.to_le_bytes());
+        checksum.seed = (seed != 0).then_some(seed);
+        checksum
+    }
+
+    pub fn seeded_prefix(seed: i32) -> Self {
+        let mut checksum = Self::plain();
+        if seed != 0 {
+            checksum.update(&seed.to_le_bytes());
+        }
         checksum
     }
 
@@ -748,9 +1346,12 @@ impl RsyncMd4Checksum {
         self.hasher.update(bytes);
     }
 
-    pub fn finalize(self) -> [u8; 16] {
+    pub fn finalize(mut self) -> [u8; 16] {
         use digest::Digest;
 
+        if let Some(seed) = self.seed {
+            self.hasher.update(seed.to_le_bytes());
+        }
         let digest = self.hasher.finalize();
         let mut out = [0_u8; 16];
         out.copy_from_slice(&digest);
@@ -1199,6 +1800,117 @@ mod tests {
     }
 
     #[test]
+    fn protocol31_checksum_options_select_requested_algorithm_and_seed() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&[0x81, 0xff]);
+        input.push(35);
+        input.extend_from_slice(b"xxh128 xxh3 xxh64 md5 md4 sha1 none");
+        input.extend_from_slice(&123_i32.to_le_bytes());
+        let mut transport = TestTransport::with_input(input);
+
+        let handshake = exchange_protocol31_setup_with_options(
+            &mut transport,
+            31,
+            Protocol31SetupOptions {
+                checksum_choices: vec!["md5".to_string(), "md4".to_string()],
+                checksum_seed: Some(77),
+                ..Protocol31SetupOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(handshake.checksum_name.as_deref(), Some("md5"));
+        assert_eq!(handshake.checksum_seed, 77);
+        assert_eq!(transport.written, [3, b'm', b'd', b'5']);
+    }
+
+    #[test]
+    fn protocol31_checksum_options_reject_unsupported_requested_list() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&[0x81, 0xff]);
+        input.push(7);
+        input.extend_from_slice(b"md5 md4");
+        input.extend_from_slice(&123_i32.to_le_bytes());
+        let mut transport = TestTransport::with_input(input);
+
+        let err = exchange_protocol31_setup_with_options(
+            &mut transport,
+            31,
+            Protocol31SetupOptions {
+                checksum_choices: vec!["sha1".to_string()],
+                ..Protocol31SetupOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RemoteSessionError::UnsupportedChecksumNegotiation
+        ));
+    }
+
+    #[test]
+    fn compression_codec_roundtrips_skips_and_rejects_corruption() {
+        let compression = CompressionConfig {
+            enabled: true,
+            choices: vec!["zlibx".to_string(), "zlib".to_string()],
+            level: Some(6),
+            threads: Some(2),
+            skip_suffixes: vec!["jpg".to_string(), "zip".to_string()],
+        }
+        .negotiate(&["zstd", "zlibx", "zlib"])
+        .unwrap()
+        .unwrap();
+        let input = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        assert_eq!(compression.algorithm, CompressionAlgorithm::Zlibx);
+        let compressed = compression.compress(input).unwrap();
+
+        assert!(compressed.len() < input.len(), "{compressed:?}");
+        assert_eq!(compression.decompress(&compressed).unwrap(), input);
+        assert!(compression.should_skip_path(Path::new("photo.JPG")));
+        assert!(!compression.should_skip_path(Path::new("notes.txt")));
+        assert!(compression.decompress(b"not a zlib stream").is_err());
+    }
+
+    #[test]
+    fn deflated_token_codec_roundtrips_literals_copy_tokens_and_end() {
+        let mut stream = Vec::new();
+        let mut writer = RsyncDeflatedTokenWriter::new(6);
+
+        writer
+            .send_literal(&mut stream, b"hello hello hello")
+            .unwrap();
+        writer.send_copy(&mut stream, 0).unwrap();
+        writer.finish(&mut stream).unwrap();
+
+        let mut reader = RsyncDeflatedTokenReader::new(RsyncDeflatedTokenMode::Zlibx);
+        let mut cursor = stream.as_slice();
+        assert_eq!(
+            reader.next_token(&mut cursor).unwrap(),
+            RsyncDeflatedToken::Literal(b"hello hello hello".to_vec())
+        );
+        assert_eq!(
+            reader.next_token(&mut cursor).unwrap(),
+            RsyncDeflatedToken::Copy { block_index: 0 }
+        );
+        assert_eq!(
+            reader.next_token(&mut cursor).unwrap(),
+            RsyncDeflatedToken::End
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn deflated_token_reader_rejects_corrupt_streams() {
+        let mut stream = vec![0x40, 0x01, 0x06];
+        stream.push(0);
+        let mut reader = RsyncDeflatedTokenReader::new(RsyncDeflatedTokenMode::Zlibx);
+
+        assert!(reader.next_token(&mut stream.as_slice()).is_err());
+    }
+
+    #[test]
     fn exchanges_protocol31_without_checksum_negotiation_when_not_advertised() {
         let mut input = Vec::new();
         input.extend_from_slice(&31_u32.to_le_bytes());
@@ -1256,10 +1968,17 @@ mod tests {
     }
 
     #[test]
-    fn whole_file_checksum_uses_seed_prefix() {
+    fn whole_file_checksum_appends_seed_like_rsync_md4() {
+        use digest::Digest;
+
         let checksum = rsync_whole_file_checksum(5, b"abc");
         let checksum_again = rsync_whole_file_checksum(5, b"abc");
+        let mut expected = md4::Md4::new();
+        expected.update(b"abc");
+        expected.update(5_i32.to_le_bytes());
+        let expected: [u8; 16] = expected.finalize().into();
 
+        assert_eq!(checksum, expected);
         assert_eq!(checksum, checksum_again);
         assert_ne!(checksum, rsync_whole_file_checksum(6, b"abc"));
     }
@@ -1270,9 +1989,13 @@ mod tests {
             rsync_plain_md4_checksum(b"abc"),
             rsync_plain_md4_checksum(b"abc")
         );
-        assert_ne!(
+        assert_eq!(
             rsync_plain_md4_checksum(b"abc"),
             rsync_whole_file_checksum(0, b"abc")
+        );
+        assert_ne!(
+            rsync_plain_md4_checksum(b"abc"),
+            rsync_whole_file_checksum(5, b"abc")
         );
     }
 

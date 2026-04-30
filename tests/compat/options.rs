@@ -265,6 +265,38 @@ fn parser_accepts_attached_values_for_short_options() {
 }
 
 #[test]
+fn parser_routes_chunk8_checksum_and_compression_options() {
+    let output = parse_and_render([
+        "rsync-win",
+        "--plan",
+        "--checksum-choice=md5,md4",
+        "--cc=md4",
+        "--checksum-seed=12345",
+        "--compress",
+        "--compress-choice=zlib",
+        "--compress-level=6",
+        "--compress-threads=2",
+        "--skip-compress=jpg,zip",
+        "src",
+        "host:/dst",
+    ]);
+
+    assert!(output.contains("checksum choice: md4"), "{output}");
+    assert!(output.contains("checksum seed: 12345"), "{output}");
+    assert!(output.contains("compress: true"), "{output}");
+    assert!(output.contains("compress choice: zlib"), "{output}");
+    assert!(output.contains("compress level: 6"), "{output}");
+    assert!(output.contains("compress threads: 2"), "{output}");
+    assert!(output.contains("skip compress: jpg,zip"), "{output}");
+    assert!(output.contains("--checksum-choice=md4"), "{output}");
+    assert!(output.contains("--checksum-seed=12345"), "{output}");
+    assert!(output.contains("--compress"), "{output}");
+    assert!(output.contains("--compress-choice=zlib"), "{output}");
+    assert!(!output.contains("W_COMPRESS_UNSUPPORTED"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
 fn parser_accepts_long_equals_space_and_negated_options() {
     let output = parse_and_render([
         "rsync-win",
@@ -323,6 +355,7 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
     .unwrap();
 
     assert!(output.contains("existing only: true"));
+    assert!(output.contains("compress choice: zlib"));
     for option in [
         "--no-motd",
         "--msgs2stderr",
@@ -332,7 +365,6 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
         "--no-inc-recursive",
         "--no-i-r",
         "--protect-args",
-        "--compression-choice",
         "--time-limit",
         "--secluded-args",
         "--no-s",

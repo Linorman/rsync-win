@@ -13,6 +13,7 @@ use rsync_core::{
     ChmodFileKind, ChmodRules, Diagnostic, MetadataDegradation, MetadataFeature, MetadataPolicy,
     NtfsNativeMetadataRequest, PosixMetadataRequest, Report, Severity,
 };
+use rsync_delta::{BlockSignature, DeltaToken, StrongChecksum};
 use rsync_filter::{
     normalize_files_from_records, parse_files_from_bytes, EntryKind, Rule, RuleAction, RuleSet,
     RuleSide,
@@ -25,21 +26,22 @@ use rsync_fs::{
 use rsync_protocol::{
     authenticate_daemon_module, build_remote_shell_argv_for_paths,
     build_remote_shell_protocol31_argv, build_remote_shell_protocol31_argv_for_paths,
-    exchange_daemon_greeting, exchange_protocol31_setup, exchange_remote_shell_mvp_handshake,
-    exchange_remote_shell_protocol31_handshake, read_i32_le, read_multiplexed_i32,
-    read_multiplexed_long, read_rsync27_file_list_with_options,
+    exchange_daemon_greeting, exchange_protocol31_setup_with_options,
+    exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake_with_options,
+    read_i32_le, read_multiplexed_i32, read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
     read_vstring, request_module_list, rsync_plain_md4_checksum_reader,
     rsync_whole_file_checksum_reader, select_daemon_module, write_daemon_args, write_i32_le,
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_metadata, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
-    DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter, RemoteDeleteMode,
-    RemoteSessionError, RemoteShellOperand, RemoteShellOptions, RsyncFileListEntry,
-    RsyncFileListMetadata, RsyncFileListOptions, RsyncHardLinkGroup, RsyncIndexState,
-    RsyncMd4Checksum, SessionError, TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
-    DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
-    REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
-    RSYNC_INDEX_DONE,
+    DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter,
+    Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError, RemoteShellOperand,
+    RemoteShellOptions, RsyncDeflatedToken, RsyncDeflatedTokenMode, RsyncDeflatedTokenReader,
+    RsyncDeflatedTokenWriter, RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions,
+    RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection,
+    WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
+    MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
+    REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
@@ -115,8 +117,20 @@ pub struct Cli {
     #[arg(long = "whole-file", action = ArgAction::SetTrue, help = "Use whole-file transfer planning")]
     whole_file: bool,
 
-    #[arg(short = 'z', long = "compress", action = ArgAction::SetTrue, help = "Accept rsync compression syntax; compression is not applied yet")]
+    #[arg(short = 'z', long = "compress", action = ArgAction::SetTrue, help = "Enable negotiated rsync compression where the active transfer mode supports it")]
     compress: bool,
+
+    #[arg(skip)]
+    compress_choice: Option<String>,
+
+    #[arg(skip)]
+    compress_level: Option<u32>,
+
+    #[arg(skip)]
+    compress_threads: Option<usize>,
+
+    #[arg(skip)]
+    skip_compress: Vec<String>,
 
     #[arg(skip)]
     quiet: u8,
@@ -240,6 +254,12 @@ pub struct Cli {
 
     #[arg(short = 'c', long = "checksum", action = ArgAction::SetTrue, help = "Plan checksum-based updates")]
     checksum: bool,
+
+    #[arg(skip)]
+    checksum_choice: Option<String>,
+
+    #[arg(skip)]
+    checksum_seed: Option<i32>,
 
     #[arg(long = "size-only", action = ArgAction::SetTrue, help = "Plan updates using file size only")]
     size_only: bool,
@@ -532,7 +552,28 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
     }
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     output.push_str(&format!("whole file: {}\n", plan.whole_file));
-    output.push_str(&format!("compress: {}\n", cli.compress));
+    if let Some(checksum_choice) = &plan.checksum_choice {
+        output.push_str(&format!("checksum choice: {checksum_choice}\n"));
+    }
+    if let Some(checksum_seed) = plan.checksum_seed {
+        output.push_str(&format!("checksum seed: {checksum_seed}\n"));
+    }
+    output.push_str(&format!("compress: {}\n", plan.compress));
+    if let Some(compress_choice) = &plan.compress_choice {
+        output.push_str(&format!("compress choice: {compress_choice}\n"));
+    }
+    if let Some(compress_level) = plan.compress_level {
+        output.push_str(&format!("compress level: {compress_level}\n"));
+    }
+    if let Some(compress_threads) = plan.compress_threads {
+        output.push_str(&format!("compress threads: {compress_threads}\n"));
+    }
+    if !plan.skip_compress.is_empty() {
+        output.push_str(&format!(
+            "skip compress: {}\n",
+            plan.skip_compress.join(",")
+        ));
+    }
     output.push_str(&format!("verbosity: {}\n", plan.verbosity));
     output.push_str(&format!("quiet: {}\n", cli.quiet));
     output.push_str(&format!("human readable: {}\n", plan.human_readable));
@@ -984,6 +1025,94 @@ enum RemoteFileChecksum {
     PlainMd4,
 }
 
+impl RemoteFileChecksum {
+    fn md4_with_seed(seed: i32) -> Self {
+        if seed == 0 {
+            Self::PlainMd4
+        } else {
+            Self::SeededMd4(seed)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RemoteFinalChecksum {
+    PlainMd4,
+    SeededMd4Prefix(i32),
+}
+
+impl RemoteFinalChecksum {
+    fn protocol27(seed: i32) -> Self {
+        if seed == 0 {
+            Self::PlainMd4
+        } else {
+            Self::SeededMd4Prefix(seed)
+        }
+    }
+
+    fn protocol31() -> Self {
+        Self::PlainMd4
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RemoteDeltaStats {
+    literal_bytes: u64,
+    copied_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteCompressionConfig {
+    mode: RsyncDeflatedTokenMode,
+    level: u32,
+    skip_suffixes: Vec<String>,
+}
+
+impl RemoteCompressionConfig {
+    fn for_plan(plan: &TransferPlan) -> Result<Option<Self>> {
+        if !plan.compress {
+            return Ok(None);
+        }
+        let mode =
+            RsyncDeflatedTokenMode::from_choice(plan.compress_choice.as_deref()).map_err(|_| {
+                anyhow::anyhow!(
+                    "unsupported compression choice; rsync-win currently supports zlibx and zlib"
+                )
+            })?;
+        Ok(Some(Self {
+            mode,
+            level: plan.compress_level.unwrap_or(6).min(9),
+            skip_suffixes: plan.skip_compress.clone(),
+        }))
+    }
+
+    fn remote_choice(&self) -> &'static str {
+        self.mode.remote_choice()
+    }
+
+    fn level_for_path(&self, path: &Path) -> u32 {
+        if self.should_skip_path(path) {
+            0
+        } else {
+            self.level
+        }
+    }
+
+    fn should_skip_path(&self, path: &Path) -> bool {
+        let path = path.to_string_lossy().to_ascii_lowercase();
+        self.skip_suffixes
+            .iter()
+            .map(|suffix| {
+                suffix
+                    .trim()
+                    .trim_start_matches("*.")
+                    .trim_start_matches('.')
+            })
+            .filter(|suffix| !suffix.is_empty())
+            .any(|suffix| path.ends_with(&format!(".{}", suffix.to_ascii_lowercase())))
+    }
+}
+
 fn execute_daemon_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     ensure_daemon_execution_options_supported(cli, &plan)?;
 
@@ -1075,8 +1204,12 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
         .context("failed to send daemon server args")?;
 
     if greeting.peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL {
-        let handshake = exchange_protocol31_setup(transport, greeting.peer_protocol)
-            .context("daemon protocol 31 setup failed")?;
+        let handshake = exchange_protocol31_setup_with_options(
+            transport,
+            greeting.peer_protocol,
+            protocol31_setup_options_from_plan(plan),
+        )
+        .context("daemon protocol 31 setup failed")?;
         execute_remote_pull_protocol31_with_handshake(cli, plan, transport, handshake)
     } else {
         execute_remote_pull_protocol27(cli, plan, transport)
@@ -1347,6 +1480,7 @@ fn build_protocol27_fallback_command(
         };
     let remote_path_refs: Vec<&Path> = remote_paths.iter().map(PathBuf::as_path).collect();
     let (includes, excludes, filters) = remote_receiver_filter_args_from_cli(cli, direction);
+    let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
     let argv = build_remote_shell_argv_for_paths(
         &RemoteShellOptions {
             direction,
@@ -1359,6 +1493,8 @@ fn build_protocol27_fallback_command(
             verbosity: plan.verbosity,
             preserve_permissions: plan.preserve_permissions,
             checksum: plan.update_mode == UpdateMode::Checksum,
+            checksum_choice: plan.checksum_choice.clone(),
+            checksum_seed: plan.checksum_seed,
             size_only: direction == TransferDirection::Push
                 && plan.update_mode == UpdateMode::SizeOnly,
             ignore_times: direction == TransferDirection::Push
@@ -1422,6 +1558,14 @@ fn build_protocol27_fallback_command(
             preserve_specials: plan.preserve_specials,
             copy_devices: cli.copy_devices,
             write_devices: cli.write_devices,
+            block_size: plan.block_size,
+            compress: plan.compress,
+            compress_choice: remote_compression
+                .as_ref()
+                .map(|compression| compression.remote_choice().to_string()),
+            compress_level: plan.compress_level,
+            compress_threads: plan.compress_threads,
+            skip_compress: plan.skip_compress.clone(),
             includes,
             excludes,
             filters,
@@ -1562,12 +1706,14 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     transport.flush()?;
 
     let mut mux = MultiplexReadState::default();
+    let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
     let stats = serve_remote_receiver_requests(
         transport,
         &mut mux,
         &entries,
         handshake.checksum_seed,
         plan.dry_run,
+        remote_compression.as_ref(),
         progress,
     )?;
 
@@ -1617,8 +1763,11 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     ));
     progress.detail(format!("upload list entries: {}", entries.len(),));
 
-    let handshake =
-        exchange_remote_shell_protocol31_handshake(transport).map_err(protocol31_setup_error)?;
+    let handshake = exchange_remote_shell_protocol31_handshake_with_options(
+        transport,
+        protocol31_setup_options_from_plan(plan),
+    )
+    .map_err(protocol31_setup_error)?;
     progress.detail(format!(
         "protocol: rsync {}",
         handshake.selected_protocol.value()
@@ -1650,12 +1799,15 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     }
 
     let mut mux = MultiplexReadState::default();
+    let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
     let stats = serve_remote_receiver_requests_protocol31(
         transport,
         &mut mux,
         &entries,
         plan.dry_run,
         plan.append_verify,
+        RemoteFileChecksum::md4_with_seed(handshake.checksum_seed),
+        remote_compression.as_ref(),
         progress,
     )?;
 
@@ -1781,8 +1933,13 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
         &transfer_indexes,
         index_offset,
         plan.dry_run,
+        dest,
+        remote_delta_block_size(plan)?,
+        plan.whole_file,
+        RemoteFileChecksum::md4_with_seed(handshake.checksum_seed),
     )?;
     transport.flush()?;
+    let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
     let stats = receive_remote_sender_files(
         transport,
         &mut mux,
@@ -1797,6 +1954,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
             preserve_times: plan.preserve_times,
             file_write_options: file_write_options_from_plan(plan),
             append_verify: plan.append_verify,
+            compression: remote_compression.as_ref(),
             actions: &mut actions,
         },
     )?;
@@ -1841,8 +1999,11 @@ fn execute_remote_pull_protocol31<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
-    let handshake =
-        exchange_remote_shell_protocol31_handshake(transport).map_err(protocol31_setup_error)?;
+    let handshake = exchange_remote_shell_protocol31_handshake_with_options(
+        transport,
+        protocol31_setup_options_from_plan(plan),
+    )
+    .map_err(protocol31_setup_error)?;
     execute_remote_pull_protocol31_with_handshake(cli, plan, transport, handshake)
 }
 
@@ -1926,8 +2087,13 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
         &transfer_indexes,
         index_offset,
         plan.dry_run,
+        dest,
+        remote_delta_block_size(plan)?,
+        plan.whole_file,
+        RemoteFileChecksum::md4_with_seed(handshake.checksum_seed),
     )?;
     transport.flush()?;
+    let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
     let stats = receive_remote_sender_files_protocol31(
         transport,
         &mut mux,
@@ -1942,6 +2108,7 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
             preserve_times: plan.preserve_times,
             file_write_options: file_write_options_from_plan(plan),
             append_verify: plan.append_verify,
+            compression: remote_compression.as_ref(),
             actions: &mut actions,
         },
     )?;
@@ -3169,6 +3336,7 @@ fn serve_remote_receiver_requests<T: Read + Write>(
     entries: &[RemoteSourceEntry],
     checksum_seed: i32,
     dry_run: bool,
+    compression: Option<&RemoteCompressionConfig>,
     progress: ProgressLog,
 ) -> Result<RemoteExecutionStats> {
     let mut phase_markers = 0_usize;
@@ -3206,7 +3374,18 @@ fn serve_remote_receiver_requests<T: Read + Write>(
         let block_len = read_nonnegative_multiplexed_i32(transport, mux, "block length")?;
         let checksum_len = read_nonnegative_multiplexed_i32(transport, mux, "checksum length")?;
         let remainder = read_nonnegative_multiplexed_i32(transport, mux, "remainder length")?;
-        skip_remote_block_signatures(transport, mux, block_count, checksum_len)?;
+        let sum_head = RemoteSumHead {
+            block_count,
+            block_len,
+            checksum_len,
+            remainder,
+        };
+        let signatures = read_remote_block_signatures_multiplexed(
+            transport,
+            mux,
+            sum_head,
+            RemoteFileChecksum::md4_with_seed(checksum_seed),
+        )?;
 
         write_rsync_i32(transport, index)?;
         write_rsync_i32(transport, block_count as i32)?;
@@ -3215,15 +3394,18 @@ fn serve_remote_receiver_requests<T: Read + Write>(
         write_rsync_i32(transport, remainder as i32)?;
         let mut file_progress =
             FileProgress::start(progress, "upload", &entry.wire.path, Some(entry.wire.len));
-        let literal_bytes = write_file_tokens_from_path(
+        let delta_stats = write_delta_tokens_from_path(
             transport,
-            RemoteFileChecksum::SeededMd4(checksum_seed),
+            RemoteFileChecksum::md4_with_seed(checksum_seed),
+            RemoteFinalChecksum::protocol27(checksum_seed),
             &entry.local_path,
+            &signatures,
+            compression,
             Some(&mut file_progress),
         )?;
         file_progress.finish();
         stats.files += 1;
-        stats.bytes += literal_bytes;
+        stats.bytes += delta_stats.literal_bytes;
     }
 
     write_rsync_long_value(transport, 0)?;
@@ -3252,6 +3434,8 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
     entries: &[RemoteSourceEntry],
     dry_run: bool,
     append_verify: bool,
+    checksum: RemoteFileChecksum,
+    compression: Option<&RemoteCompressionConfig>,
     progress: ProgressLog,
 ) -> Result<RemoteExecutionStats> {
     let mut read_index_state = RsyncIndexState::default();
@@ -3271,21 +3455,19 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                 if iflags & RSYNC_ITEM_TRANSFER != 0 {
                     let sum_head = read_sum_head(&mut reader)?;
                     // Upstream append mode sends the append basis as a sum head only.
-                    if !append_verify {
-                        skip_remote_block_signatures_from_reader(
-                            &mut reader,
-                            sum_head.block_count,
-                            sum_head.checksum_len,
-                        )?;
-                    }
-                    Some((index, iflags, attrs, Some(sum_head)))
+                    let signatures = if append_verify {
+                        Vec::new()
+                    } else {
+                        read_remote_block_signatures_from_reader(&mut reader, sum_head, checksum)?
+                    };
+                    Some((index, iflags, attrs, Some(sum_head), signatures))
                 } else {
-                    Some((index, iflags, attrs, None))
+                    Some((index, iflags, attrs, None, Vec::new()))
                 }
             }
         };
 
-        let Some((index, iflags, attrs, sum_head)) = request else {
+        let Some((index, iflags, attrs, sum_head, signatures)) = request else {
             phase_markers += 1;
             if phase_markers > 2 {
                 break;
@@ -3356,18 +3538,23 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             let literal_bytes = if append_verify {
                 write_append_verify_file_tokens_from_path(
                     &mut writer,
-                    RemoteFileChecksum::PlainMd4,
+                    RemoteFinalChecksum::protocol31(),
                     &entry.local_path,
                     append_prefix_len,
+                    compression,
                     Some(&mut file_progress),
                 )?
             } else {
-                write_file_tokens_from_path(
+                write_delta_tokens_from_path(
                     &mut writer,
-                    RemoteFileChecksum::PlainMd4,
+                    checksum,
+                    RemoteFinalChecksum::protocol31(),
                     &entry.local_path,
+                    &signatures,
+                    compression,
                     Some(&mut file_progress),
                 )?
+                .literal_bytes
             };
             writer.flush()?;
             file_progress.finish();
@@ -3396,6 +3583,10 @@ fn request_remote_sender_files<T: Write>(
     selected_indexes: &BTreeSet<usize>,
     index_offset: i32,
     dry_run: bool,
+    dest: &Path,
+    block_size: usize,
+    whole_file: bool,
+    checksum: RemoteFileChecksum,
 ) -> Result<()> {
     for (index, entry) in entries.iter().enumerate() {
         if entry.file_type != WireFileType::File || !selected_indexes.contains(&index) {
@@ -3403,10 +3594,14 @@ fn request_remote_sender_files<T: Write>(
         }
         write_rsync_i32(transport, remote_wire_index(index, index_offset)?)?;
         if !dry_run {
-            write_rsync_i32(transport, 0)?;
-            write_rsync_i32(transport, 32 * 1024)?;
-            write_rsync_i32(transport, 2)?;
-            write_rsync_i32(transport, 0)?;
+            let (sum_head, signatures) = local_basis_signature_request(
+                &dest.join(&entry.path),
+                block_size,
+                checksum,
+                whole_file,
+            )?;
+            write_sum_head(transport, sum_head)?;
+            write_remote_block_signatures(transport, &signatures)?;
         }
     }
     write_rsync_i32(transport, -1)?;
@@ -3419,6 +3614,10 @@ fn request_remote_sender_files_protocol31<T: Write>(
     selected_indexes: &BTreeSet<usize>,
     index_offset: i32,
     dry_run: bool,
+    dest: &Path,
+    block_size: usize,
+    whole_file: bool,
+    checksum: RemoteFileChecksum,
 ) -> Result<()> {
     let mut index_state = RsyncIndexState::default();
     let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
@@ -3438,15 +3637,14 @@ fn request_remote_sender_files_protocol31<T: Write>(
         };
         write_u16_le(&mut writer, iflags)?;
         if !dry_run {
-            write_sum_head(
-                &mut writer,
-                RemoteSumHead {
-                    block_count: 0,
-                    block_len: 32 * 1024,
-                    checksum_len: 2,
-                    remainder: 0,
-                },
+            let (sum_head, signatures) = local_basis_signature_request(
+                &dest.join(&entry.path),
+                block_size,
+                checksum,
+                whole_file,
             )?;
+            write_sum_head(&mut writer, sum_head)?;
+            write_remote_block_signatures(&mut writer, &signatures)?;
         }
     }
     write_rsync_index(&mut writer, &mut index_state, RSYNC_INDEX_DONE)?;
@@ -3465,6 +3663,7 @@ struct RemoteReceiveContext<'a> {
     preserve_times: bool,
     file_write_options: FileWriteOptions,
     append_verify: bool,
+    compression: Option<&'a RemoteCompressionConfig>,
     actions: &'a mut Vec<SyncAction>,
 }
 
@@ -3499,17 +3698,25 @@ fn receive_remote_sender_files<T: Read>(
         let _block_len = read_nonnegative_multiplexed_i32(transport, mux, "block length")?;
         let _checksum_len = read_nonnegative_multiplexed_i32(transport, mux, "checksum length")?;
         let _remainder = read_nonnegative_multiplexed_i32(transport, mux, "remainder length")?;
+        let sum_head = RemoteSumHead {
+            block_count: _block_count,
+            block_len: _block_len,
+            checksum_len: _checksum_len,
+            remainder: _remainder,
+        };
 
         let temp_path = receive_temp_path(&target);
         let mut file_progress =
             FileProgress::start(ctx.progress, "download", &entry.path, Some(entry.len));
-        let bytes = match read_file_tokens_to_path(
+        let bytes = match read_file_tokens_to_path_with_basis(
             transport,
             mux,
-            RemoteFileChecksum::SeededMd4(ctx.checksum_seed),
+            RemoteFinalChecksum::protocol27(ctx.checksum_seed),
             &entry.path,
             &temp_path,
             entry.len,
+            Some((&target, sum_head)),
+            ctx.compression,
             Some(&mut file_progress),
         ) {
             Ok(bytes) => {
@@ -3558,7 +3765,7 @@ fn receive_remote_sender_files_protocol31<T: Read>(
             }
         };
 
-        let Some((index, iflags, _sum_head)) = response else {
+        let Some((index, iflags, sum_head)) = response else {
             break;
         };
         let entry_index = checked_remote_file_index(index, ctx.entries.len(), ctx.index_offset)?;
@@ -3582,13 +3789,15 @@ fn receive_remote_sender_files_protocol31<T: Read>(
         let temp_path = receive_temp_path(&target);
         let mut file_progress =
             FileProgress::start(ctx.progress, "download", &entry.path, Some(entry.len));
-        let bytes = match read_file_tokens_to_path(
+        let bytes = match read_file_tokens_to_path_with_basis(
             transport,
             mux,
-            RemoteFileChecksum::PlainMd4,
+            RemoteFinalChecksum::protocol31(),
             &entry.path,
             &temp_path,
             entry.len,
+            sum_head.map(|sum_head| (target.as_path(), sum_head)),
+            ctx.compression,
             Some(&mut file_progress),
         ) {
             Ok(bytes) => {
@@ -4102,79 +4311,262 @@ fn remote_sum_head_file_len(sum_head: RemoteSumHead) -> Result<usize> {
     }
 }
 
-fn skip_remote_block_signatures<T: Read>(
+fn read_remote_block_signatures_multiplexed<T: Read>(
     transport: &mut T,
     mux: &mut MultiplexReadState,
-    block_count: usize,
-    checksum_len: usize,
-) -> Result<()> {
-    for _ in 0..block_count {
-        let _weak = read_multiplexed_i32(transport, mux)?;
-        let mut strong = vec![0_u8; checksum_len];
-        read_multiplexed_exact(transport, mux, &mut strong)?;
-    }
-    Ok(())
-}
-
-fn skip_remote_block_signatures_from_reader<R: Read>(
-    reader: &mut R,
-    block_count: usize,
-    checksum_len: usize,
-) -> Result<()> {
-    for _ in 0..block_count {
-        let _weak = read_i32_le(reader)?;
-        let mut strong = vec![0_u8; checksum_len];
-        reader.read_exact(&mut strong)?;
-    }
-    Ok(())
-}
-
-fn write_file_tokens_from_path<T: Write>(
-    transport: &mut T,
+    sum_head: RemoteSumHead,
     checksum: RemoteFileChecksum,
+) -> Result<Vec<BlockSignature>> {
+    let mut reader = MultiplexedReader::new(transport, mux);
+    read_remote_block_signatures_from_reader(&mut reader, sum_head, checksum)
+}
+
+fn read_remote_block_signatures_from_reader<R: Read>(
+    reader: &mut R,
+    sum_head: RemoteSumHead,
+    checksum: RemoteFileChecksum,
+) -> Result<Vec<BlockSignature>> {
+    validate_sum_head(sum_head)?;
+    let mut signatures = Vec::with_capacity(sum_head.block_count);
+    for index in 0..sum_head.block_count {
+        let weak = read_i32_le(reader)? as u32;
+        let mut strong = vec![0_u8; sum_head.checksum_len];
+        reader.read_exact(&mut strong)?;
+        let (offset, len) = block_span(&sum_head, index)?;
+        signatures.push(BlockSignature {
+            index,
+            offset,
+            len,
+            weak,
+            strong: normalize_remote_strong_checksum(strong, checksum, sum_head.checksum_len),
+        });
+    }
+    Ok(signatures)
+}
+
+fn normalize_remote_strong_checksum(
+    strong: Vec<u8>,
+    _checksum: RemoteFileChecksum,
+    _checksum_len: usize,
+) -> Vec<u8> {
+    strong
+}
+
+fn write_remote_block_signatures<W: Write>(
+    writer: &mut W,
+    signatures: &[BlockSignature],
+) -> Result<()> {
+    for signature in signatures {
+        write_i32_le(writer, signature.weak as i32)?;
+        writer.write_all(&signature.strong)?;
+    }
+    Ok(())
+}
+
+fn local_basis_signature_request(
     path: &Path,
+    block_size: usize,
+    checksum: RemoteFileChecksum,
+    whole_file: bool,
+) -> Result<(RemoteSumHead, Vec<BlockSignature>)> {
+    let empty = RemoteSumHead {
+        block_count: 0,
+        block_len: block_size,
+        checksum_len: 16,
+        remainder: 0,
+    };
+    if whole_file {
+        return Ok((empty, Vec::new()));
+    }
+    let Ok(metadata) = fs::metadata(to_long_path_safe(path)) else {
+        return Ok((empty, Vec::new()));
+    };
+    if !metadata.is_file() {
+        return Ok((empty, Vec::new()));
+    }
+
+    let basis = read_local_file(path)?;
+    if basis.is_empty() {
+        return Ok((empty, Vec::new()));
+    }
+    let checksum_len = 16;
+    let strong = RsyncStrongChecksum {
+        checksum,
+        checksum_len,
+    };
+    let signatures = rsync_delta::generate_signatures_with(&basis, block_size, &strong)?;
+    let sum_head = RemoteSumHead {
+        block_count: signatures.len(),
+        block_len: block_size,
+        checksum_len,
+        remainder: basis.len() % block_size,
+    };
+    Ok((sum_head, signatures))
+}
+
+fn remote_delta_block_size(plan: &TransferPlan) -> Result<usize> {
+    let block_size = plan.block_size.unwrap_or(32 * 1024);
+    usize::try_from(block_size)
+        .ok()
+        .filter(|value| *value > 0)
+        .context("remote delta block size must fit usize and be greater than zero")
+}
+
+fn write_delta_tokens_from_path<T: Write>(
+    transport: &mut T,
+    block_checksum: RemoteFileChecksum,
+    final_checksum: RemoteFinalChecksum,
+    path: &Path,
+    signatures: &[BlockSignature],
+    compression: Option<&RemoteCompressionConfig>,
     progress: Option<&mut FileProgress>,
-) -> Result<u64> {
-    let mut file = open_local_file(path)?;
-    write_literal_tokens_from_reader_with_checksum(transport, &mut file, checksum, progress)
+) -> Result<RemoteDeltaStats> {
+    let bytes = read_local_file(path)?;
+    write_delta_tokens_from_bytes_with_checksum(
+        transport,
+        &bytes,
+        block_checksum,
+        final_checksum,
+        signatures,
+        compression.map(|compression| compression.level_for_path(path)),
+        progress,
+    )
+}
+
+fn write_delta_tokens_from_bytes_with_checksum<T: Write>(
+    transport: &mut T,
+    bytes: &[u8],
+    block_checksum: RemoteFileChecksum,
+    final_checksum: RemoteFinalChecksum,
+    signatures: &[BlockSignature],
+    compression_level: Option<u32>,
+    mut progress: Option<&mut FileProgress>,
+) -> Result<RemoteDeltaStats> {
+    if signatures.is_empty() {
+        let mut reader = bytes;
+        let literal_bytes = write_literal_tokens_from_reader_with_checksum(
+            transport,
+            &mut reader,
+            final_checksum,
+            compression_level,
+            progress,
+        )?;
+        return Ok(RemoteDeltaStats {
+            literal_bytes,
+            copied_bytes: 0,
+        });
+    }
+
+    let checksum_len = signatures
+        .first()
+        .map(|signature| signature.strong.len())
+        .unwrap_or(16);
+    let strong = RsyncStrongChecksum {
+        checksum: block_checksum,
+        checksum_len,
+    };
+    let tokens = rsync_delta::generate_delta_with(signatures, bytes, &strong);
+    let mut stats = RemoteDeltaStats::default();
+    let final_checksum = remote_final_checksum_for_bytes(final_checksum, bytes);
+    let mut compressor = compression_level.map(RsyncDeflatedTokenWriter::new);
+
+    for token in tokens {
+        match token {
+            DeltaToken::Literal(literal) => {
+                for chunk in literal.chunks(32 * 1024) {
+                    if let Some(compressor) = compressor.as_mut() {
+                        compressor.send_literal(transport, chunk)?;
+                    } else {
+                        write_rsync_i32(transport, chunk.len() as i32)?;
+                        transport.write_all(chunk)?;
+                    }
+                    stats.literal_bytes += chunk.len() as u64;
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.advance(chunk.len() as u64);
+                    }
+                }
+            }
+            DeltaToken::Copy { offset, len } => {
+                let block_index = signatures
+                    .iter()
+                    .find(|signature| signature.offset == offset && signature.len == len)
+                    .map(|signature| signature.index)
+                    .context("delta matcher emitted a copy span without a block signature")?;
+                if let Some(compressor) = compressor.as_mut() {
+                    compressor.send_copy(transport, block_index)?;
+                } else {
+                    let token = block_index_to_copy_token(block_index)?;
+                    write_rsync_i32(transport, token)?;
+                }
+                stats.copied_bytes += len as u64;
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.advance(len as u64);
+                }
+            }
+        }
+    }
+
+    if let Some(compressor) = compressor.as_mut() {
+        compressor.finish(transport)?;
+    } else {
+        write_rsync_i32(transport, 0)?;
+    }
+    transport.write_all(&final_checksum)?;
+    Ok(stats)
 }
 
 fn write_append_verify_file_tokens_from_path<T: Write>(
     transport: &mut T,
-    checksum: RemoteFileChecksum,
+    checksum: RemoteFinalChecksum,
     path: &Path,
     prefix_len: usize,
+    compression: Option<&RemoteCompressionConfig>,
     progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     let mut file = open_local_file(path)?;
     write_append_verify_literal_tokens_from_reader_with_checksum(
-        transport, &mut file, checksum, prefix_len, progress,
+        transport,
+        &mut file,
+        checksum,
+        prefix_len,
+        compression.map(|compression| compression.level_for_path(path)),
+        progress,
     )
 }
 
 fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
     transport: &mut T,
     reader: &mut R,
-    checksum: RemoteFileChecksum,
+    checksum: RemoteFinalChecksum,
+    compression_level: Option<u32>,
     mut progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
-    let mut checksum = remote_file_checksum_builder(checksum);
+    let mut checksum = remote_final_checksum_builder(checksum);
     let mut buf = [0_u8; 32 * 1024];
     let mut total = 0_u64;
+    let mut compressor = compression_level.map(RsyncDeflatedTokenWriter::new);
     loop {
         let read = reader.read(&mut buf)?;
         if read == 0 {
             break;
         }
         checksum.update(&buf[..read]);
-        write_rsync_i32(transport, read as i32)?;
-        transport.write_all(&buf[..read])?;
+        if let Some(compressor) = compressor.as_mut() {
+            compressor.send_literal(transport, &buf[..read])?;
+        } else {
+            write_rsync_i32(transport, read as i32)?;
+            transport.write_all(&buf[..read])?;
+        }
         total += read as u64;
         if let Some(progress) = progress.as_deref_mut() {
             progress.advance(read as u64);
         }
     }
-    write_rsync_i32(transport, 0)?;
+    if let Some(compressor) = compressor.as_mut() {
+        compressor.finish(transport)?;
+    } else {
+        write_rsync_i32(transport, 0)?;
+    }
     transport.write_all(&checksum.finalize())?;
     Ok(total)
 }
@@ -4182,14 +4574,16 @@ fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
 fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
     transport: &mut T,
     reader: &mut R,
-    checksum: RemoteFileChecksum,
+    checksum: RemoteFinalChecksum,
     prefix_len: usize,
+    compression_level: Option<u32>,
     mut progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
-    let mut checksum = remote_file_checksum_builder(checksum);
+    let mut checksum = remote_final_checksum_builder(checksum);
     let mut buf = [0_u8; 32 * 1024];
     let mut remaining_prefix = prefix_len;
     let mut total = 0_u64;
+    let mut compressor = compression_level.map(RsyncDeflatedTokenWriter::new);
     loop {
         let read = reader.read(&mut buf)?;
         if read == 0 {
@@ -4207,8 +4601,12 @@ fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Rea
         } else {
             chunk
         };
-        write_rsync_i32(transport, literal.len() as i32)?;
-        transport.write_all(literal)?;
+        if let Some(compressor) = compressor.as_mut() {
+            compressor.send_literal(transport, literal)?;
+        } else {
+            write_rsync_i32(transport, literal.len() as i32)?;
+            transport.write_all(literal)?;
+        }
         total += literal.len() as u64;
         if let Some(progress) = progress.as_deref_mut() {
             progress.advance(literal.len() as u64);
@@ -4217,7 +4615,11 @@ fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Rea
     if remaining_prefix > 0 {
         bail!("append-verify prefix length exceeds source file length");
     }
-    write_rsync_i32(transport, 0)?;
+    if let Some(compressor) = compressor.as_mut() {
+        compressor.finish(transport)?;
+    } else {
+        write_rsync_i32(transport, 0)?;
+    }
     transport.write_all(&checksum.finalize())?;
     Ok(total)
 }
@@ -4229,21 +4631,204 @@ fn remote_file_checksum_builder(checksum: RemoteFileChecksum) -> RsyncMd4Checksu
     }
 }
 
-fn read_file_tokens_to_path<T: Read>(
+fn remote_checksum_for_bytes(checksum: RemoteFileChecksum, bytes: &[u8]) -> [u8; 16] {
+    let mut checksum = remote_file_checksum_builder(checksum);
+    checksum.update(bytes);
+    checksum.finalize()
+}
+
+fn remote_final_checksum_builder(checksum: RemoteFinalChecksum) -> RsyncMd4Checksum {
+    match checksum {
+        RemoteFinalChecksum::PlainMd4 => RsyncMd4Checksum::plain(),
+        RemoteFinalChecksum::SeededMd4Prefix(seed) => RsyncMd4Checksum::seeded_prefix(seed),
+    }
+}
+
+fn remote_final_checksum_for_bytes(checksum: RemoteFinalChecksum, bytes: &[u8]) -> [u8; 16] {
+    let mut checksum = remote_final_checksum_builder(checksum);
+    checksum.update(bytes);
+    checksum.finalize()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RsyncStrongChecksum {
+    checksum: RemoteFileChecksum,
+    checksum_len: usize,
+}
+
+impl StrongChecksum for RsyncStrongChecksum {
+    fn digest(&self, block: &[u8]) -> Vec<u8> {
+        let checksum = remote_checksum_for_bytes(self.checksum, block);
+        checksum[..self.checksum_len.min(checksum.len())].to_vec()
+    }
+}
+
+fn validate_sum_head(sum_head: RemoteSumHead) -> Result<()> {
+    if sum_head.block_count > 0 && sum_head.block_len == 0 {
+        bail!("remote sum head has a zero block length");
+    }
+    if sum_head.remainder > sum_head.block_len && sum_head.block_count > 0 {
+        bail!("remote sum head has a remainder larger than its block length");
+    }
+    Ok(())
+}
+
+fn block_span(sum_head: &RemoteSumHead, block_index: usize) -> Result<(usize, usize)> {
+    validate_sum_head(*sum_head)?;
+    if block_index >= sum_head.block_count {
+        bail!("copy token references missing basis block {block_index}");
+    }
+    let offset = block_index
+        .checked_mul(sum_head.block_len)
+        .context("basis block offset overflow")?;
+    let is_last = block_index + 1 == sum_head.block_count;
+    let len = if is_last && sum_head.remainder != 0 {
+        sum_head.remainder
+    } else {
+        sum_head.block_len
+    };
+    Ok((offset, len))
+}
+
+fn block_index_to_copy_token(block_index: usize) -> Result<i32> {
+    let token = i32::try_from(block_index).context("basis block index exceeded i32 range")?;
+    token
+        .checked_add(1)
+        .and_then(|value| value.checked_neg())
+        .context("basis block token overflow")
+}
+
+fn copy_token_to_block_index(token: i32) -> Result<usize> {
+    if token >= 0 {
+        bail!("copy token must be negative");
+    }
+    let raw = token
+        .checked_neg()
+        .and_then(|value| value.checked_sub(1))
+        .context("copy token overflow")?;
+    usize::try_from(raw).context("copy token block index did not fit usize")
+}
+
+fn read_file_tokens_to_path_with_basis<T: Read>(
     transport: &mut T,
     mux: &mut MultiplexReadState,
-    checksum: RemoteFileChecksum,
+    checksum: RemoteFinalChecksum,
     path: &Path,
     output_path: &Path,
     expected_len: u64,
+    basis: Option<(&Path, RemoteSumHead)>,
+    compression: Option<&RemoteCompressionConfig>,
     mut progress: Option<&mut FileProgress>,
 ) -> Result<u64> {
     if let Some(parent) = output_path.parent() {
         create_local_dir_all(parent)?;
     }
     let mut output = create_local_file(output_path)?;
+    let basis_bytes = match basis {
+        Some((basis_path, sum_head)) if sum_head.block_count > 0 => {
+            Some((read_local_file(basis_path)?, sum_head))
+        }
+        _ => None,
+    };
     let mut total = 0_u64;
     let mut buf = [0_u8; 32 * 1024];
+
+    if let Some(compression) = compression {
+        let mut token_reader = RsyncDeflatedTokenReader::new(compression.mode);
+        loop {
+            let token = {
+                let mut reader = MultiplexedReader::new(transport, mux);
+                token_reader.next_token(&mut reader)?
+            };
+            match token {
+                RsyncDeflatedToken::Literal(literal) => {
+                    let next_total = total.checked_add(literal.len() as u64).ok_or(
+                        RemoteSessionError::FileLengthExceeded {
+                            path: path.display().to_string(),
+                            expected: expected_len,
+                            actual: u64::MAX,
+                        },
+                    )?;
+                    if next_total > expected_len {
+                        return Err(RemoteSessionError::FileLengthExceeded {
+                            path: path.display().to_string(),
+                            expected: expected_len,
+                            actual: next_total,
+                        }
+                        .into());
+                    }
+                    output.write_all(&literal)?;
+                    total = next_total;
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.advance(literal.len() as u64);
+                    }
+                }
+                RsyncDeflatedToken::Copy { block_index } => {
+                    let Some((basis_bytes, sum_head)) = basis_bytes.as_ref() else {
+                        return Err(RemoteSessionError::UnexpectedToken {
+                            token: block_index_to_copy_token(block_index)?,
+                            path: path.display().to_string(),
+                        }
+                        .into());
+                    };
+                    let (offset, len) = block_span(sum_head, block_index)?;
+                    let end = offset
+                        .checked_add(len)
+                        .context("basis copy token offset overflow")?;
+                    let Some(bytes) = basis_bytes.get(offset..end) else {
+                        bail!(
+                            "remote copy token {} references bytes outside the basis file for {}",
+                            block_index_to_copy_token(block_index)?,
+                            path.display()
+                        );
+                    };
+                    token_reader.observe_copy_data(bytes)?;
+                    let next_total = total.checked_add(bytes.len() as u64).ok_or(
+                        RemoteSessionError::FileLengthExceeded {
+                            path: path.display().to_string(),
+                            expected: expected_len,
+                            actual: u64::MAX,
+                        },
+                    )?;
+                    if next_total > expected_len {
+                        return Err(RemoteSessionError::FileLengthExceeded {
+                            path: path.display().to_string(),
+                            expected: expected_len,
+                            actual: next_total,
+                        }
+                        .into());
+                    }
+                    output.write_all(bytes)?;
+                    total = next_total;
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.advance(bytes.len() as u64);
+                    }
+                }
+                RsyncDeflatedToken::End => {
+                    output.sync_all()?;
+                    drop(output);
+                    if total != expected_len {
+                        return Err(RemoteSessionError::FileLengthShort {
+                            path: path.display().to_string(),
+                            expected: expected_len,
+                            actual: total,
+                        }
+                        .into());
+                    }
+                    let mut remote_checksum = [0_u8; 16];
+                    read_multiplexed_exact(transport, mux, &mut remote_checksum)?;
+                    let local_checksum = remote_file_checksum_for_path(checksum, output_path)?;
+                    if remote_checksum != local_checksum {
+                        return Err(RemoteSessionError::FileChecksumMismatch {
+                            path: path.display().to_string(),
+                        }
+                        .into());
+                    }
+                    return Ok(total);
+                }
+            }
+        }
+    }
 
     loop {
         let token = read_multiplexed_i32(transport, mux)?;
@@ -4299,21 +4884,56 @@ fn read_file_tokens_to_path<T: Read>(
             }
             return Ok(total);
         } else {
-            return Err(RemoteSessionError::UnexpectedToken {
-                token,
-                path: path.display().to_string(),
+            let Some((basis_bytes, sum_head)) = basis_bytes.as_ref() else {
+                return Err(RemoteSessionError::UnexpectedToken {
+                    token,
+                    path: path.display().to_string(),
+                }
+                .into());
+            };
+            let block_index = copy_token_to_block_index(token)?;
+            let (offset, len) = block_span(sum_head, block_index)?;
+            let end = offset
+                .checked_add(len)
+                .context("basis copy token offset overflow")?;
+            let Some(bytes) = basis_bytes.get(offset..end) else {
+                bail!(
+                    "remote copy token {token} references bytes outside the basis file for {}",
+                    path.display()
+                );
+            };
+            let next_total = total.checked_add(bytes.len() as u64).ok_or(
+                RemoteSessionError::FileLengthExceeded {
+                    path: path.display().to_string(),
+                    expected: expected_len,
+                    actual: u64::MAX,
+                },
+            )?;
+            if next_total > expected_len {
+                return Err(RemoteSessionError::FileLengthExceeded {
+                    path: path.display().to_string(),
+                    expected: expected_len,
+                    actual: next_total,
+                }
+                .into());
             }
-            .into());
+            output.write_all(bytes)?;
+            total = next_total;
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.advance(bytes.len() as u64);
+            }
         }
     }
 }
 
-fn remote_file_checksum_for_path(checksum: RemoteFileChecksum, path: &Path) -> Result<[u8; 16]> {
+fn remote_file_checksum_for_path(checksum: RemoteFinalChecksum, path: &Path) -> Result<[u8; 16]> {
     let mut file = open_local_file(path)?;
     match checksum {
-        RemoteFileChecksum::SeededMd4(seed) => rsync_whole_file_checksum_reader(seed, &mut file)
-            .with_context(|| format!("failed to checksum {}", path.display())),
-        RemoteFileChecksum::PlainMd4 => rsync_plain_md4_checksum_reader(&mut file)
+        RemoteFinalChecksum::SeededMd4Prefix(seed) => {
+            rsync_whole_file_checksum_reader(seed, &mut file)
+                .with_context(|| format!("failed to checksum {}", path.display()))
+        }
+        RemoteFinalChecksum::PlainMd4 => rsync_plain_md4_checksum_reader(&mut file)
             .with_context(|| format!("failed to checksum {}", path.display())),
     }
 }
@@ -4506,6 +5126,11 @@ struct TransferPlan {
     max_delete: Option<usize>,
     dry_run: bool,
     whole_file: bool,
+    compress: bool,
+    compress_choice: Option<String>,
+    compress_level: Option<u32>,
+    compress_threads: Option<usize>,
+    skip_compress: Vec<String>,
     verbosity: u8,
     progress: bool,
     human_readable: u8,
@@ -4527,6 +5152,8 @@ struct TransferPlan {
     append_verify: bool,
     append: bool,
     block_size: Option<u64>,
+    checksum_choice: Option<String>,
+    checksum_seed: Option<i32>,
     symlink_mode: SymlinkMode,
     keep_dirlinks: bool,
     hard_links: bool,
@@ -4825,6 +5452,11 @@ impl TransferPlan {
             max_delete: cli.max_delete,
             dry_run: cli.dry_run,
             whole_file: cli.whole_file,
+            compress: cli.compress,
+            compress_choice: cli.compress_choice.clone(),
+            compress_level: cli.compress_level,
+            compress_threads: cli.compress_threads,
+            skip_compress: cli.skip_compress.clone(),
             verbosity: cli.verbosity,
             progress: cli.progress,
             human_readable: cli.human_readable,
@@ -4846,6 +5478,8 @@ impl TransferPlan {
             append_verify: cli.append_verify,
             append: cli.append,
             block_size: cli.block_size,
+            checksum_choice: cli.checksum_choice.clone(),
+            checksum_seed: cli.checksum_seed,
             symlink_mode,
             keep_dirlinks: cli.keep_dirlinks,
             hard_links: cli.hard_links,
@@ -5082,6 +5716,8 @@ fn remote_shell_options_from_cli(
         verbosity: cli.verbosity,
         preserve_permissions: cli_preserve_permissions(cli),
         checksum: cli.checksum,
+        checksum_choice: cli.checksum_choice.clone(),
+        checksum_seed: cli.checksum_seed,
         size_only: direction == TransferDirection::Push && cli.size_only,
         ignore_times: direction == TransferDirection::Push && cli.ignore_times,
         partial: direction == TransferDirection::Push && cli.partial,
@@ -5135,14 +5771,53 @@ fn remote_shell_options_from_cli(
         preserve_specials: (cli.specials || cli.archive) && !cli.no_specials,
         copy_devices: cli.copy_devices,
         write_devices: cli.write_devices,
+        block_size: cli.block_size,
+        compress: cli.compress,
+        compress_choice: remote_compress_choice_for_argv(
+            cli.compress,
+            cli.compress_choice.as_deref(),
+        ),
+        compress_level: cli.compress_level,
+        compress_threads: cli.compress_threads,
+        skip_compress: cli.skip_compress.clone(),
         includes,
         excludes,
         filters,
     }
 }
 
+fn remote_compress_choice_for_argv(compress: bool, choice: Option<&str>) -> Option<String> {
+    if !compress {
+        return None;
+    }
+    RsyncDeflatedTokenMode::from_choice(choice)
+        .map(|mode| mode.remote_choice().to_string())
+        .ok()
+        .or_else(|| choice.map(str::to_string))
+}
+
 fn remote_delete_mode_from_cli(cli: &Cli) -> RemoteDeleteMode {
     remote_delete_mode(cli.delete, cli.delete_mode)
+}
+
+fn protocol31_setup_options_from_plan(plan: &TransferPlan) -> Protocol31SetupOptions {
+    Protocol31SetupOptions {
+        checksum_choices: plan
+            .checksum_choice
+            .as_deref()
+            .map(split_option_list)
+            .unwrap_or_else(|| vec!["md4".to_string()]),
+        checksum_seed: plan.checksum_seed,
+    }
+}
+
+fn split_option_list(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 fn remote_delete_mode(delete: bool, delete_mode: DeleteMode) -> RemoteDeleteMode {
@@ -5681,10 +6356,40 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
         );
     }
 
-    if cli.compress {
-        report.warn(
-            "W_COMPRESS_UNSUPPORTED",
-            "-z/--compress is accepted for rsync CLI compatibility, but compression is not applied yet",
+    if let Some(checksum_choice) = &cli.checksum_choice {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--checksum-choice={checksum_choice} is represented in the execution plan"),
+        );
+    }
+    if let Some(checksum_seed) = cli.checksum_seed {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--checksum-seed={checksum_seed} is represented in the execution plan"),
+        );
+    }
+    if let Some(compress_choice) = &cli.compress_choice {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--compress-choice={compress_choice} is represented in the execution plan"),
+        );
+    }
+    if let Some(compress_level) = cli.compress_level {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--compress-level={compress_level} is represented in the execution plan"),
+        );
+    }
+    if let Some(compress_threads) = cli.compress_threads {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--compress-threads={compress_threads} is represented in the execution plan"),
+        );
+    }
+    for skip in &cli.skip_compress {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--skip-compress={skip} is represented in the execution plan"),
         );
     }
 
@@ -5812,6 +6517,7 @@ fn ensure_remote_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
             "remote-shell execution does not yet support VSS metadata options; run with --plan for diagnostics"
         );
     }
+    let _ = RemoteCompressionConfig::for_plan(plan)?;
 
     Ok(())
 }
@@ -6358,7 +7064,7 @@ mod tests {
         assert!(output.contains("remote direction: upload (local -> remote)"));
         assert!(output.contains("remote ssh argv: ssh -p 10080 root@118.145.32.132"));
         assert!(output.contains("[info] I_REMOTE_SHELL"));
-        assert!(output.contains("[warning] W_COMPRESS_UNSUPPORTED"));
+        assert!(!output.contains("[warning] W_COMPRESS_UNSUPPORTED"));
         assert!(!output.contains("BatchMode=yes"));
         assert!(!output.contains("W_METADATA_OWNER"));
         assert!(!output.contains("W_METADATA_GROUP"));
@@ -6372,7 +7078,8 @@ mod tests {
         let sent = write_literal_tokens_from_reader_with_checksum(
             &mut output,
             &mut input,
-            RemoteFileChecksum::PlainMd4,
+            RemoteFinalChecksum::PlainMd4,
+            None,
             None,
         )
         .unwrap();
@@ -6388,6 +7095,179 @@ mod tests {
     }
 
     #[test]
+    fn delta_token_writer_emits_copy_tokens_for_matching_basis_blocks() {
+        let basis = b"AAAABBBBCCCC";
+        let target = b"AAAAXXXXCCCC";
+        let signatures = test_remote_block_signatures(basis, 4, 16, RemoteFileChecksum::PlainMd4);
+        let mut output = Vec::new();
+
+        let stats = write_delta_tokens_from_bytes_with_checksum(
+            &mut output,
+            target,
+            RemoteFileChecksum::PlainMd4,
+            RemoteFinalChecksum::PlainMd4,
+            &signatures,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(stats.literal_bytes, 4);
+        assert_eq!(stats.copied_bytes, 8);
+        assert_eq!(i32::from_le_bytes(output[0..4].try_into().unwrap()), -1);
+        assert_eq!(i32::from_le_bytes(output[4..8].try_into().unwrap()), 4);
+        assert_eq!(&output[8..12], b"XXXX");
+        assert_eq!(i32::from_le_bytes(output[12..16].try_into().unwrap()), -3);
+        assert_eq!(i32::from_le_bytes(output[16..20].try_into().unwrap()), 0);
+        assert_eq!(
+            &output[20..36],
+            &rsync_protocol::rsync_plain_md4_checksum(target)
+        );
+    }
+
+    #[test]
+    fn delta_token_writer_sends_less_literal_data_for_large_small_edit() {
+        let block_size = 4096;
+        let block_count = 512;
+        let mut basis = Vec::with_capacity(block_size * block_count);
+        for block in 0..block_count {
+            for offset in 0..block_size {
+                basis.push(((block * 31 + offset) % 251) as u8);
+            }
+        }
+        let mut target = basis.clone();
+        let edit_start = 257 * block_size + 128;
+        target[edit_start..edit_start + 256].fill(0x7f);
+        let signatures =
+            test_remote_block_signatures(&basis, block_size, 16, RemoteFileChecksum::PlainMd4);
+        let mut output = Vec::new();
+
+        let stats = write_delta_tokens_from_bytes_with_checksum(
+            &mut output,
+            &target,
+            RemoteFileChecksum::PlainMd4,
+            RemoteFinalChecksum::PlainMd4,
+            &signatures,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stats.literal_bytes <= block_size as u64);
+        assert!(stats.copied_bytes >= (target.len() - block_size) as u64);
+        assert!(stats.literal_bytes < target.len() as u64 / 100, "{stats:?}");
+    }
+
+    #[test]
+    fn delta_token_reader_applies_copy_tokens_from_basis_file() {
+        let root = unique_temp_dir("rsync-cli-delta-token-reader");
+        let basis = root.join("basis.txt");
+        let dest = root.join("dest.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&basis, b"AAAABBBBCCCC").unwrap();
+
+        let mut payload = Vec::new();
+        write_i32_le(&mut payload, -1).unwrap();
+        write_i32_le(&mut payload, 4).unwrap();
+        payload.extend_from_slice(b"XXXX");
+        write_i32_le(&mut payload, -3).unwrap();
+        write_i32_le(&mut payload, 0).unwrap();
+        payload.extend_from_slice(&rsync_protocol::rsync_plain_md4_checksum(b"AAAAXXXXCCCC"));
+        let mut input = Vec::new();
+        append_mux_payload(&mut input, &payload);
+        let mut input = &input[..];
+        let mut mux = MultiplexReadState::default();
+
+        let bytes = read_file_tokens_to_path_with_basis(
+            &mut input,
+            &mut mux,
+            RemoteFinalChecksum::PlainMd4,
+            Path::new("dest.txt"),
+            &dest,
+            12,
+            Some((
+                &basis,
+                RemoteSumHead {
+                    block_count: 3,
+                    block_len: 4,
+                    checksum_len: 16,
+                    remainder: 0,
+                },
+            )),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(bytes, 12);
+        assert_eq!(fs::read(&dest).unwrap(), b"AAAAXXXXCCCC");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compressed_delta_tokens_roundtrip_with_copy_tokens() {
+        let root = unique_temp_dir("rsync-cli-compressed-delta-token-reader");
+        let basis_path = root.join("basis.txt");
+        let dest = root.join("dest.txt");
+        fs::create_dir_all(&root).unwrap();
+        let basis = b"AAAABBBBCCCC";
+        let target = b"AAAAXXXXCCCC";
+        fs::write(&basis_path, basis).unwrap();
+        let signatures = test_remote_block_signatures(basis, 4, 16, RemoteFileChecksum::PlainMd4);
+        let mut payload = Vec::new();
+
+        let stats = write_delta_tokens_from_bytes_with_checksum(
+            &mut payload,
+            target,
+            RemoteFileChecksum::PlainMd4,
+            RemoteFinalChecksum::PlainMd4,
+            &signatures,
+            Some(6),
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.literal_bytes, 4);
+        assert_eq!(stats.copied_bytes, 8);
+
+        let mut input = Vec::new();
+        append_mux_payload(&mut input, &payload);
+        let mut input = &input[..];
+        let mut mux = MultiplexReadState::default();
+        let compression = RemoteCompressionConfig {
+            mode: RsyncDeflatedTokenMode::Zlibx,
+            level: 6,
+            skip_suffixes: Vec::new(),
+        };
+
+        let bytes = read_file_tokens_to_path_with_basis(
+            &mut input,
+            &mut mux,
+            RemoteFinalChecksum::PlainMd4,
+            Path::new("dest.txt"),
+            &dest,
+            12,
+            Some((
+                &basis_path,
+                RemoteSumHead {
+                    block_count: 3,
+                    block_len: 4,
+                    checksum_len: 16,
+                    remainder: 0,
+                },
+            )),
+            Some(&compression),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(bytes, 12);
+        assert_eq!(fs::read(&dest).unwrap(), target);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn append_verify_token_writer_sends_suffix_but_checksums_whole_file() {
         let mut output = Vec::new();
         let mut input = &b"abcdef"[..];
@@ -6395,8 +7275,9 @@ mod tests {
         let sent = write_append_verify_literal_tokens_from_reader_with_checksum(
             &mut output,
             &mut input,
-            RemoteFileChecksum::PlainMd4,
+            RemoteFinalChecksum::PlainMd4,
             3,
+            None,
             None,
         )
         .unwrap();
@@ -6428,13 +7309,17 @@ mod tests {
 
         let mut upload_tokens = Vec::new();
         assert_eq!(
-            write_file_tokens_from_path(
+            write_delta_tokens_from_path(
                 &mut upload_tokens,
                 RemoteFileChecksum::PlainMd4,
+                RemoteFinalChecksum::PlainMd4,
                 &source,
+                &[],
+                None,
                 None
             )
-            .unwrap(),
+            .unwrap()
+            .literal_bytes,
             3
         );
         assert_eq!(
@@ -6453,13 +7338,15 @@ mod tests {
         let mut mux = MultiplexReadState::default();
 
         assert_eq!(
-            read_file_tokens_to_path(
+            read_file_tokens_to_path_with_basis(
                 &mut input,
                 &mut mux,
-                RemoteFileChecksum::PlainMd4,
+                RemoteFinalChecksum::PlainMd4,
                 Path::new("dest.txt"),
                 &dest,
                 3,
+                None,
+                None,
                 None
             )
             .unwrap(),
@@ -8514,6 +9401,29 @@ mod tests {
                     .unwrap()
                     .sidecar
                     .path
+            })
+            .collect()
+    }
+
+    fn test_remote_block_signatures(
+        basis: &[u8],
+        block_size: usize,
+        checksum_len: usize,
+        checksum: RemoteFileChecksum,
+    ) -> Vec<rsync_delta::BlockSignature> {
+        basis
+            .chunks(block_size)
+            .enumerate()
+            .map(|(index, block)| {
+                let mut strong = remote_file_checksum_builder(checksum);
+                strong.update(block);
+                rsync_delta::BlockSignature {
+                    index,
+                    offset: index * block_size,
+                    len: block.len(),
+                    weak: rsync_delta::rolling_checksum(block),
+                    strong: strong.finalize()[..checksum_len].to_vec(),
+                }
             })
             .collect()
     }

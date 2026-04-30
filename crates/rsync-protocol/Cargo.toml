@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 digest = "0.10"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 md4 = "0.10"
 md-5 = "0.10"
 thiserror.workspace = true

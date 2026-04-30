@@ -117,7 +117,6 @@ const fn append_value(
 
 const I: ImplementationStatus = ImplementationStatus::Implemented;
 const P: ImplementationStatus = ImplementationStatus::Planned;
-const D: ImplementationStatus = ImplementationStatus::ExplicitDiagnostic;
 
 static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     spec(
@@ -196,8 +195,8 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("preallocate", None, P),
     flag("dry-run", Some('n'), I),
     flag("whole-file", Some('W'), I),
-    value("checksum-choice", None, P),
-    value("cc", None, P),
+    value("checksum-choice", None, I),
+    value("cc", None, I),
     flag("one-file-system", Some('x'), I),
     value("block-size", Some('B'), I),
     value("rsh", Some('e'), I),
@@ -239,15 +238,15 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     value("compare-dest", None, P),
     value("copy-dest", None, P),
     value("link-dest", None, P),
-    flag("compress", Some('z'), D),
-    value("compression-choice", None, P),
-    value("compress-choice", None, P),
-    value("zc", None, P),
-    value("compress-level", None, P),
-    value("zl", None, P),
-    value("compress-threads", None, P),
-    value("zt", None, P),
-    value("skip-compress", None, P),
+    flag("compress", Some('z'), I),
+    value("compression-choice", None, I),
+    value("compress-choice", None, I),
+    value("zc", None, I),
+    value("compress-level", None, I),
+    value("zl", None, I),
+    value("compress-threads", None, I),
+    value("zt", None, I),
+    value("skip-compress", None, I),
     flag("cvs-exclude", Some('C'), I),
     append_value("filter", Some('f'), I),
     flag("F", Some('F'), I),
@@ -298,7 +297,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     value("read-batch", None, P),
     value("protocol", None, P),
     value("iconv", None, P),
-    value("checksum-seed", None, P),
+    value("checksum-seed", None, I),
     flag("ipv4", Some('4'), P),
     flag("ipv6", Some('6'), P),
     flag("version", Some('V'), I),
@@ -675,6 +674,10 @@ impl Default for Cli {
             delete_mode: DeleteMode::None,
             whole_file: false,
             compress: false,
+            compress_choice: None,
+            compress_level: None,
+            compress_threads: None,
+            skip_compress: Vec::new(),
             quiet: 0,
             human_readable: 0,
             help: false,
@@ -715,6 +718,8 @@ impl Default for Cli {
             files_from: None,
             from0: false,
             checksum: false,
+            checksum_choice: None,
+            checksum_seed: None,
             size_only: false,
             ignore_times: false,
             partial: false,
@@ -1090,6 +1095,10 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         "fake-super" => cli.fake_super = true,
         "dry-run" => cli.dry_run = true,
         "whole-file" => cli.whole_file = true,
+        "checksum-choice" | "cc" => {
+            cli.checksum_choice = Some(required_value(name, value)?.to_string())
+        }
+        "checksum-seed" => cli.checksum_seed = Some(parse_i32(required_value(name, value)?, name)?),
         "one-file-system" => cli.one_file_system = true,
         "block-size" => cli.block_size = Some(parse_size(required_value(name, value)?)?),
         "rsh" => cli.remote_shell = Some(required_value(name, value)?.to_string()),
@@ -1141,6 +1150,19 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         "modify-window" => cli.modify_window = parse_i64(required_value(name, value)?, name)?,
         "temp-dir" => cli.temp_dir = Some(required_value(name, value)?.to_string()),
         "compress" => cli.compress = true,
+        "compression-choice" | "compress-choice" | "zc" => {
+            cli.compress = true;
+            cli.compress_choice = Some(required_value(name, value)?.to_string());
+        }
+        "compress-level" | "zl" => {
+            cli.compress_level = Some(parse_u32(required_value(name, value)?, name)?)
+        }
+        "compress-threads" | "zt" => {
+            cli.compress_threads = Some(parse_usize(required_value(name, value)?, name)?)
+        }
+        "skip-compress" => cli
+            .skip_compress
+            .push(required_value(name, value)?.to_string()),
         "cvs-exclude" => cli.cvs_exclude = true,
         "F" => apply_filter_shorthand(cli),
         "filter" => cli.filters.push(required_value(name, value)?.to_string()),
@@ -1223,7 +1245,13 @@ fn apply_negated_option(cli: &mut Cli, name: &str) -> Result<()> {
             cli.backup_dir = None;
         }
         "checksum" | "c" => cli.checksum = false,
-        "compress" | "z" => cli.compress = false,
+        "compress" | "z" => {
+            cli.compress = false;
+            cli.compress_choice = None;
+            cli.compress_level = None;
+            cli.compress_threads = None;
+            cli.skip_compress.clear();
+        }
         "copy-links" | "L" => cli.copy_links = false,
         "copy-dirlinks" | "k" => cli.copy_dirlinks = false,
         "copy-unsafe-links" => cli.copy_unsafe_links = false,
@@ -1367,6 +1395,24 @@ fn parse_i64(value: &str, option: &str) -> Result<i64> {
     value
         .parse()
         .map_err(|_| anyhow::anyhow!("option --{option} expects an integer"))
+}
+
+fn parse_i32(value: &str, option: &str) -> Result<i32> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("option --{option} expects a 32-bit integer"))
+}
+
+fn parse_u32(value: &str, option: &str) -> Result<u32> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("option --{option} expects a non-negative integer"))
+}
+
+fn parse_usize(value: &str, option: &str) -> Result<usize> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("option --{option} expects a non-negative integer"))
 }
 
 fn parse_max_delete(value: &str) -> Result<usize> {

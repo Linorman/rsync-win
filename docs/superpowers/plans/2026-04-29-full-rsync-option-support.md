@@ -278,7 +278,7 @@
 - [x] Preserve existing truthful Windows diagnostics.
 - [x] Add upstream example tests for chmod forms.
 - [x] Run `cargo test -p rsync-core --all-features chmod`.
-- [ ] Commit: `feat: complete rsync chmod and mode semantics`.
+- [x] Commit: `feat: complete chunk7 metadata support`.
 
 ### Task 15: Implement Owner, Group, and ID Mapping
 
@@ -293,7 +293,7 @@
 - [x] Implement remote peer ID/name list handling where required by protocol.
 - [x] Add Windows sidecar or explicit degradation for local ownership.
 - [x] Run `cargo test --workspace --all-features owner groupmap`.
-- [ ] Commit: `feat: add owner group and id mapping`.
+- [x] Commit: `feat: complete chunk7 metadata support`.
 
 ### Task 16: Implement ACL, Xattr, Fake-Super, and Time Metadata
 
@@ -312,7 +312,7 @@
 - [x] Implement `--omit-link-times` / `-J`.
 - [x] Add tests for sidecar roundtrip and remote POSIX peer transfer.
 - [x] Run `cargo test --workspace --all-features metadata`.
-- [ ] Commit: `feat: add acl xattr fake-super and time metadata`.
+- [x] Commit: `feat: complete chunk7 metadata support`.
 
 ## Chunk 8: Delta Transfer, Checksums, and Compression
 
@@ -324,14 +324,14 @@
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: `crates/rsync-delta/src/lib.rs`
 
-- [ ] Wire rolling checksum signatures into local and remote update paths.
-- [ ] Implement basis file block request and copy-token apply paths.
+- [x] Wire rolling checksum signatures into local and remote update paths.
+- [x] Implement basis file block request and copy-token apply paths.
 - [x] Implement `--block-size` / `-B`.
 - [x] Keep `--whole-file` / `-W` as an explicit bypass.
-- [ ] Add large-file delta tests proving less data is sent for small edits.
+- [x] Add large-file delta tests proving less data is sent for small edits.
 - [x] Run `cargo test -p rsync-delta --all-features`.
 - [x] Run `cargo test -p rsync-cli --all-features delta`.
-- [ ] Commit: `feat: enable rsync delta transfers`.
+- [x] Commit: `feat: complete chunk8 delta checksum compression`.
 
 ### Task 18: Implement Checksum Negotiation Options
 
@@ -341,12 +341,12 @@
 - Modify: `crates/rsync-cli/src/plan.rs`
 - Test: `crates/rsync-protocol/src/session.rs`
 
-- [ ] Implement `--checksum-choice` / `--cc`.
-- [ ] Implement `--checksum-seed`.
+- [x] Implement `--checksum-choice` / `--cc`.
+- [x] Implement `--checksum-seed`.
 - [x] Preserve `--checksum` / `-c` as update predicate behavior.
 - [x] Add tests for negotiation success, unsupported lists, and fallback.
 - [x] Run `cargo test -p rsync-protocol --all-features checksum`.
-- [ ] Commit: `feat: add checksum negotiation options`.
+- [x] Commit: `feat: complete chunk8 delta checksum compression`.
 
 ### Task 19: Implement Compression Options
 
@@ -356,14 +356,14 @@
 - Modify: `crates/rsync-cli/src/plan.rs`
 - Test: `crates/rsync-protocol/src/session.rs`
 
-- [ ] Implement actual `--compress` / `-z`.
-- [ ] Implement `--compress-choice` / `--zc`.
-- [ ] Implement `--compress-level` / `--zl`.
-- [ ] Implement `--compress-threads` / `--zt` if the selected algorithm supports it.
-- [ ] Implement `--skip-compress`.
-- [ ] Add tests for negotiation, compression bypass, and corrupt stream handling.
-- [ ] Run `cargo test -p rsync-protocol --all-features compress`.
-- [ ] Commit: `feat: add rsync compression negotiation`.
+- [x] Implement actual `--compress` / `-z`.
+- [x] Implement `--compress-choice` / `--zc`.
+- [x] Implement `--compress-level` / `--zl`.
+- [x] Implement `--compress-threads` / `--zt` if the selected algorithm supports it.
+- [x] Implement `--skip-compress`.
+- [x] Add tests for negotiation, compression bypass, and corrupt stream handling.
+- [x] Run `cargo test -p rsync-protocol --all-features compress`.
+- [x] Commit: `feat: complete chunk8 delta checksum compression`.
 
 ## Chunk 9: Remote-Shell Completeness
 
