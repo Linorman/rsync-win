@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
+use digest::Digest;
 use rsync_core::{
     archive_mode_components, archive_mode_degradations, metadata_policy_degradations,
     ChmodFileKind, ChmodRules, Diagnostic, MetadataDegradation, MetadataFeature, MetadataPolicy,
@@ -31,8 +32,8 @@ use rsync_protocol::{
     exchange_remote_shell_protocol31_handshake_with_options, read_i32_le, read_multiplexed_i32,
     read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
-    read_vstring, request_module_list, rsync_plain_md4_checksum_reader,
-    rsync_whole_file_checksum_reader, select_daemon_module, write_daemon_args, write_i32_le,
+    read_vstring, request_module_list, rsync_plain_md4_checksum_reader, select_daemon_module,
+    write_daemon_args, write_i32_le,
     write_remote_shell_protected_args, write_rsync27_file_list_with_options,
     write_rsync31_file_list_with_metadata, write_rsync_i32, write_rsync_index,
     write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection, DaemonOperand,
@@ -1073,10 +1074,32 @@ struct Rsync31ItemAttrs {
     xname: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteChecksumAlgorithm {
+    Md4,
+    Md5,
+}
+
+impl RemoteChecksumAlgorithm {
+    fn from_protocol31_choice(choice: Option<&str>) -> Result<Self> {
+        match choice.map(normalize_checksum_choice).as_deref() {
+            None | Some("md4") => Ok(Self::Md4),
+            Some("md5") => Ok(Self::Md5),
+            Some(other) => bail!("unsupported negotiated checksum algorithm `{other}`"),
+        }
+    }
+}
+
+fn normalize_checksum_choice(choice: &str) -> String {
+    choice.trim().to_ascii_lowercase()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RemoteFileChecksum {
     SeededMd4(i32),
     PlainMd4,
+    SeededMd5(i32),
+    PlainMd5,
 }
 
 impl RemoteFileChecksum {
@@ -1087,12 +1110,30 @@ impl RemoteFileChecksum {
             Self::SeededMd4(seed)
         }
     }
+
+    fn protocol31(choice: Option<&str>, seed: i32) -> Result<Self> {
+        Ok(
+            match RemoteChecksumAlgorithm::from_protocol31_choice(choice)? {
+                RemoteChecksumAlgorithm::Md4 => Self::md4_with_seed(seed),
+                RemoteChecksumAlgorithm::Md5 if seed == 0 => Self::PlainMd5,
+                RemoteChecksumAlgorithm::Md5 => Self::SeededMd5(seed),
+            },
+        )
+    }
+
+    fn algorithm(self) -> RemoteChecksumAlgorithm {
+        match self {
+            Self::SeededMd4(_) | Self::PlainMd4 => RemoteChecksumAlgorithm::Md4,
+            Self::SeededMd5(_) | Self::PlainMd5 => RemoteChecksumAlgorithm::Md5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum RemoteFinalChecksum {
     PlainMd4,
     SeededMd4Prefix(i32),
+    PlainMd5,
 }
 
 impl RemoteFinalChecksum {
@@ -1104,8 +1145,17 @@ impl RemoteFinalChecksum {
         }
     }
 
-    fn protocol31() -> Self {
-        Self::PlainMd4
+    fn protocol31(choice: Option<&str>) -> Result<Self> {
+        Ok(Self::protocol31_for_algorithm(
+            RemoteChecksumAlgorithm::from_protocol31_choice(choice)?,
+        ))
+    }
+
+    fn protocol31_for_algorithm(algorithm: RemoteChecksumAlgorithm) -> Self {
+        match algorithm {
+            RemoteChecksumAlgorithm::Md4 => Self::PlainMd4,
+            RemoteChecksumAlgorithm::Md5 => Self::PlainMd5,
+        }
     }
 }
 
@@ -1887,13 +1937,17 @@ fn execute_remote_push_protocol31<T: Read + Write>(
 
     let mut mux = MultiplexReadState::default();
     let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
+    let remote_file_checksum = RemoteFileChecksum::protocol31(
+        handshake.checksum_name.as_deref(),
+        handshake.checksum_seed,
+    )?;
     let stats = serve_remote_receiver_requests_protocol31(
         transport,
         &mut mux,
         &entries,
         plan.dry_run,
         plan.append_verify,
-        RemoteFileChecksum::md4_with_seed(handshake.checksum_seed),
+        remote_file_checksum,
         remote_compression.as_ref(),
         progress,
     )?;
@@ -2036,7 +2090,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
             dest,
             entries: &entries,
             index_offset,
-            checksum_seed: handshake.checksum_seed,
+            final_checksum: RemoteFinalChecksum::protocol27(handshake.checksum_seed),
             dry_run: plan.dry_run,
             progress: ProgressLog::from_cli(cli),
             preserve_times: plan.preserve_times,
@@ -2170,6 +2224,10 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
         }
     }
 
+    let remote_file_checksum = RemoteFileChecksum::protocol31(
+        handshake.checksum_name.as_deref(),
+        handshake.checksum_seed,
+    )?;
     request_remote_sender_files_protocol31(
         transport,
         &entries,
@@ -2179,7 +2237,7 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
         dest,
         remote_delta_block_size(plan)?,
         plan.whole_file,
-        RemoteFileChecksum::md4_with_seed(handshake.checksum_seed),
+        remote_file_checksum,
     )?;
     transport.flush()?;
     let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
@@ -2191,7 +2249,7 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
             dest,
             entries: &entries,
             index_offset,
-            checksum_seed: handshake.checksum_seed,
+            final_checksum: RemoteFinalChecksum::protocol31(handshake.checksum_name.as_deref())?,
             dry_run: plan.dry_run,
             progress: ProgressLog::from_cli(cli),
             preserve_times: plan.preserve_times,
@@ -2269,6 +2327,7 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
             delete: plan.delete,
             delete_mode: plan.delete_mode,
             preserve_mtime: plan.preserve_times,
+            omit_dir_times: plan.omit_dir_times,
             dry_run: plan.dry_run,
             filter_rules: plan.filter_rules.clone(),
             destination_path_preflight: Some(windows_destination_path_preflight),
@@ -3628,7 +3687,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             let literal_bytes = if append_verify {
                 write_append_verify_file_tokens_from_path(
                     &mut writer,
-                    RemoteFinalChecksum::protocol31(),
+                    RemoteFinalChecksum::protocol31_for_algorithm(checksum.algorithm()),
                     &entry.local_path,
                     append_prefix_len,
                     compression,
@@ -3638,7 +3697,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                 write_delta_tokens_from_path(
                     &mut writer,
                     checksum,
-                    RemoteFinalChecksum::protocol31(),
+                    RemoteFinalChecksum::protocol31_for_algorithm(checksum.algorithm()),
                     &entry.local_path,
                     &signatures,
                     compression,
@@ -3749,7 +3808,7 @@ struct RemoteReceiveContext<'a> {
     dest: &'a Path,
     entries: &'a [RsyncFileListEntry],
     index_offset: i32,
-    checksum_seed: i32,
+    final_checksum: RemoteFinalChecksum,
     dry_run: bool,
     progress: ProgressLog,
     preserve_times: bool,
@@ -3803,7 +3862,7 @@ fn receive_remote_sender_files<T: Read>(
         let bytes = match read_file_tokens_to_path_with_basis(
             transport,
             mux,
-            RemoteFinalChecksum::protocol27(ctx.checksum_seed),
+            ctx.final_checksum,
             &entry.path,
             &temp_path,
             entry.len,
@@ -3884,7 +3943,7 @@ fn receive_remote_sender_files_protocol31<T: Read>(
         let bytes = match read_file_tokens_to_path_with_basis(
             transport,
             mux,
-            RemoteFinalChecksum::protocol31(),
+            ctx.final_checksum,
             &entry.path,
             &temp_path,
             entry.len,
@@ -4748,30 +4807,79 @@ fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Rea
     Ok(total)
 }
 
-fn remote_file_checksum_builder(checksum: RemoteFileChecksum) -> RsyncMd4Checksum {
-    match checksum {
-        RemoteFileChecksum::SeededMd4(seed) => RsyncMd4Checksum::seeded(seed),
-        RemoteFileChecksum::PlainMd4 => RsyncMd4Checksum::plain(),
-    }
-}
-
 fn remote_checksum_for_bytes(checksum: RemoteFileChecksum, bytes: &[u8]) -> [u8; 16] {
     let mut checksum = remote_file_checksum_builder(checksum);
     checksum.update(bytes);
     checksum.finalize()
 }
 
-fn remote_final_checksum_builder(checksum: RemoteFinalChecksum) -> RsyncMd4Checksum {
-    match checksum {
-        RemoteFinalChecksum::PlainMd4 => RsyncMd4Checksum::plain(),
-        RemoteFinalChecksum::SeededMd4Prefix(seed) => RsyncMd4Checksum::seeded_prefix(seed),
-    }
-}
-
 fn remote_final_checksum_for_bytes(checksum: RemoteFinalChecksum, bytes: &[u8]) -> [u8; 16] {
     let mut checksum = remote_final_checksum_builder(checksum);
     checksum.update(bytes);
     checksum.finalize()
+}
+
+enum RemoteChecksumBuilder {
+    Md4(RsyncMd4Checksum),
+    Md5 { hasher: md5::Md5, seed: Option<i32> },
+}
+
+impl RemoteChecksumBuilder {
+    fn md5(seed: Option<i32>, prefix_seed: bool) -> Self {
+        let mut hasher = md5::Md5::new();
+        if prefix_seed {
+            if let Some(seed) = seed {
+                hasher.update(seed.to_le_bytes());
+            }
+        }
+        Self::Md5 {
+            hasher,
+            seed: (!prefix_seed).then_some(seed).flatten(),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Md4(checksum) => checksum.update(bytes),
+            Self::Md5 { hasher, .. } => hasher.update(bytes),
+        }
+    }
+
+    fn finalize(self) -> [u8; 16] {
+        match self {
+            Self::Md4(checksum) => checksum.finalize(),
+            Self::Md5 { mut hasher, seed } => {
+                if let Some(seed) = seed {
+                    hasher.update(seed.to_le_bytes());
+                }
+                let digest = hasher.finalize();
+                let mut out = [0_u8; 16];
+                out.copy_from_slice(&digest);
+                out
+            }
+        }
+    }
+}
+
+fn remote_file_checksum_builder(checksum: RemoteFileChecksum) -> RemoteChecksumBuilder {
+    match checksum {
+        RemoteFileChecksum::SeededMd4(seed) => {
+            RemoteChecksumBuilder::Md4(RsyncMd4Checksum::seeded(seed))
+        }
+        RemoteFileChecksum::PlainMd4 => RemoteChecksumBuilder::Md4(RsyncMd4Checksum::plain()),
+        RemoteFileChecksum::SeededMd5(seed) => RemoteChecksumBuilder::md5(Some(seed), false),
+        RemoteFileChecksum::PlainMd5 => RemoteChecksumBuilder::md5(None, false),
+    }
+}
+
+fn remote_final_checksum_builder(checksum: RemoteFinalChecksum) -> RemoteChecksumBuilder {
+    match checksum {
+        RemoteFinalChecksum::PlainMd4 => RemoteChecksumBuilder::Md4(RsyncMd4Checksum::plain()),
+        RemoteFinalChecksum::SeededMd4Prefix(seed) => {
+            RemoteChecksumBuilder::Md4(RsyncMd4Checksum::seeded_prefix(seed))
+        }
+        RemoteFinalChecksum::PlainMd5 => RemoteChecksumBuilder::md5(None, false),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5053,14 +5161,18 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
 
 fn remote_file_checksum_for_path(checksum: RemoteFinalChecksum, path: &Path) -> Result<[u8; 16]> {
     let mut file = open_local_file(path)?;
-    match checksum {
-        RemoteFinalChecksum::SeededMd4Prefix(seed) => {
-            rsync_whole_file_checksum_reader(seed, &mut file)
-                .with_context(|| format!("failed to checksum {}", path.display()))
+    let mut checksum = remote_final_checksum_builder(checksum);
+    let mut buf = [0_u8; 32 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .with_context(|| format!("failed to checksum {}", path.display()))?;
+        if read == 0 {
+            break;
         }
-        RemoteFinalChecksum::PlainMd4 => rsync_plain_md4_checksum_reader(&mut file)
-            .with_context(|| format!("failed to checksum {}", path.display())),
+        checksum.update(&buf[..read]);
     }
+    Ok(checksum.finalize())
 }
 
 fn read_local_file(path: &Path) -> Result<Vec<u8>> {
@@ -7558,6 +7670,26 @@ mod tests {
         assert_eq!(
             &output[11..27],
             &rsync_protocol::rsync_plain_md4_checksum(b"abcdef")
+        );
+    }
+
+    #[test]
+    fn protocol31_checksum_choice_controls_block_and_final_digest_algorithm() {
+        let md5_abc = [
+            0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1,
+            0x7f, 0x72,
+        ];
+        let block_checksum = RemoteFileChecksum::protocol31(Some("md5"), 0).unwrap();
+        let final_checksum = RemoteFinalChecksum::protocol31(Some("md5")).unwrap();
+
+        assert_eq!(remote_checksum_for_bytes(block_checksum, b"abc"), md5_abc);
+        assert_eq!(
+            remote_final_checksum_for_bytes(final_checksum, b"abc"),
+            md5_abc
+        );
+        assert_ne!(
+            remote_checksum_for_bytes(block_checksum, b"abc"),
+            rsync_protocol::rsync_plain_md4_checksum(b"abc")
         );
     }
 

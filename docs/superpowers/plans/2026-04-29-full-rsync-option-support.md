@@ -265,6 +265,8 @@
 
 ## Chunk 7: POSIX and Windows Metadata Fidelity
 
+**Current implementation note (2026-04-30):** Chunk 7 is implemented for parser/planner coverage, remote upload mode/ID mapping, protocol 31 metadata payload framing, fake-super sidecar manifests, and local `--omit-dir-times`. Native Windows restoration of POSIX owner/group/ACL/xattr/time semantics remains sidecar/reporting-only, and ACL payload support is limited to the tested empty payload framing.
+
 ### Task 14: Complete Mode and Chmod Semantics
 
 **Files:**
@@ -315,6 +317,8 @@
 - [x] Commit: `feat: complete chunk7 metadata support`.
 
 ## Chunk 8: Delta Transfer, Checksums, and Compression
+
+**Current implementation note (2026-04-30):** Chunk 8 is implemented for ordinary-file delta tokens, `--block-size`, `--whole-file`, protocol 31 MD4/MD5 checksum selection, final checksum verification, and zlib/zlibx token compression. Remaining limits: local copies are not compressed, `--compress-threads` is parsed/forwarded without a parallel local compressor, and the remote delta path is still the tested non-incremental ordinary-file path.
 
 ### Task 17: Implement Real Delta Transfer
 

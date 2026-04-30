@@ -18,7 +18,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Mode | Current status | Notes |
 | --- | --- | --- |
 | `portable` | Default | Copies ordinary files/directories, compares size, applies mtime where requested, and applies explicit delete/filter behavior in tested paths. |
-| `posix` | Reporting prototype with narrow remote mode mapping | POSIX permissions/executability requests are represented. `--chmod` accepts numeric `600`/`0644` and scoped `F600`/`D755` forms for remote upload mode bits only. `--executability` infers peer execute bits from Windows script/executable extensions; it does not enforce NTFS execute permissions. Owner, group, ACL, xattr, fake-super, and symlink mtime limitations are reported. POSIX ACL/xattr/fake-super storage is not implemented unless a future sidecar says so explicitly. |
+| `posix` | Sidecar/reporting path with remote metadata mapping | POSIX permissions/executability requests are represented. `--chmod` accepts rsync-style symbolic and numeric forms for remote upload mode bits. `--executability` infers peer execute bits from Windows script/executable extensions; it does not enforce NTFS execute permissions. Owner/group mapping, protocol 31 ACL/xattr/time payload framing, fake-super sidecar manifests, and `--omit-dir-times` are implemented in tested paths. Native Windows restoration of POSIX owner/group/ACL/xattr semantics remains sidecar/reporting-only unless a remote POSIX peer applies them. |
 | `ntfs-native` | Narrow local restore path | Writes a parseable sidecar with security descriptor summary, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Local Windows syncs restore the tested readonly/hidden/archive/system attribute subset and copy named alternate data stream payloads. Security descriptor restore, sparse range preservation, arbitrary reparse restore, and cross-platform NTFS restore are degraded. |
 | VSS snapshot mode | Rejected with diagnostics | `--vss` is parsed and reported, but snapshot reads are not implemented. See `docs/VSS-DESIGN.md` for the required source abstraction before any VSS calls are added. |
 
@@ -33,7 +33,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Remote token lengths | Remote pull rejects literal token streams that exceed or undershoot the advertised file-list length and removes temporary receive files on error. |
 | File-list size | Remote file-list readers enforce a 100,000 entry limit and 32 KiB path limit for the current non-incremental receive path. Full incremental recursion is still future work. |
 | Multiplexing | Data frames are streamed; remote error messages are surfaced; unsupported multiplex tags are rejected. |
-| Compression | `-z/--compress` is accepted for CLI compatibility but compression is not applied yet. |
+| Compression | `-z/--compress` negotiates and applies zlib/zlibx token compression on the remote protocol 31 transfer path, including `--compress-choice`, `--compress-level`, and `--skip-compress`. Local Windows-to-Windows copies are not compressed, and `--compress-threads` is parsed/forwarded but does not add a parallel local compressor. |
 | Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow. |
 | Benchmarks | `cargo bench -p rsync-fs --bench local_sync` runs local sync scenarios for a 128-file tree, many small files, and one large ordinary file. |
 

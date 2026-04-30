@@ -301,7 +301,9 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
+ "digest",
  "embed-manifest",
+ "md-5",
  "rsync-core",
  "rsync-delta",
  "rsync-filter",

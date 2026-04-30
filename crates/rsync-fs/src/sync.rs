@@ -13,6 +13,7 @@ pub struct SyncOptions {
     pub delete: bool,
     pub delete_mode: DeleteMode,
     pub preserve_mtime: bool,
+    pub omit_dir_times: bool,
     pub dry_run: bool,
     pub filter_rules: RuleSet,
     pub destination_path_preflight: Option<DestinationPathPreflight>,
@@ -69,6 +70,7 @@ impl Default for SyncOptions {
             delete: false,
             delete_mode: DeleteMode::None,
             preserve_mtime: true,
+            omit_dir_times: false,
             dry_run: true,
             filter_rules: RuleSet::empty(),
             destination_path_preflight: None,
@@ -270,6 +272,7 @@ pub fn sync_tree<F: PortableFileSystem>(
 
     let mut delayed_transfers = Vec::new();
     let mut hardlink_targets = BTreeMap::new();
+    let mut directory_mtimes = Vec::new();
     for (relative, entry) in &source_entries {
         let target = dest.join(relative);
         let result = match entry.metadata.file_type {
@@ -297,6 +300,7 @@ pub fn sync_tree<F: PortableFileSystem>(
                 if !options.dry_run {
                     fs.create_dir_all(&target)?;
                 }
+                directory_mtimes.push((target, entry.clone()));
                 Ok(())
             }
             FileType::File => {
@@ -368,6 +372,8 @@ pub fn sync_tree<F: PortableFileSystem>(
             &mut report,
         )?;
     }
+
+    preserve_directory_mtimes(fs, &directory_mtimes, &options, &mut report)?;
 
     Ok(report)
 }
@@ -940,12 +946,27 @@ fn preserve_transferred_mtime<F: PortableFileSystem>(
     if !options.preserve_mtime {
         return Ok(());
     }
+    if options.omit_dir_times && source.metadata.file_type == FileType::Directory {
+        return Ok(());
+    }
     let Some(modified) = source.metadata.modified else {
         return Ok(());
     };
     report.push(SyncAction::PreserveMtime(target.to_path_buf()));
     if !options.dry_run {
         fs.set_mtime(target, modified)?;
+    }
+    Ok(())
+}
+
+fn preserve_directory_mtimes<F: PortableFileSystem>(
+    fs: &mut F,
+    directories: &[(PathBuf, WalkEntry)],
+    options: &SyncOptions,
+    report: &mut SyncReport,
+) -> Result<(), FsError> {
+    for (target, entry) in directories.iter().rev() {
+        preserve_transferred_mtime(fs, target, entry, options, report)?;
     }
     Ok(())
 }
@@ -1934,6 +1955,54 @@ mod tests {
         assert_eq!(
             fs.metadata(Path::new("dst/a.txt")).unwrap().modified,
             Some(source_mtime)
+        );
+    }
+
+    #[test]
+    fn omit_dir_times_preserves_file_mtimes_but_not_directory_mtimes() {
+        let source_file_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_200);
+        let source_dir_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_300);
+        let old_dest_dir_mtime = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let mut fs = MemoryFileSystem::new();
+        fs.add_dir("src/sub").unwrap();
+        fs.add_file("src/sub/file.txt", b"content").unwrap();
+        fs.add_dir("dst/sub").unwrap();
+        fs.set_mtime(Path::new("src/sub"), source_dir_mtime)
+            .unwrap();
+        fs.set_mtime(Path::new("src/sub/file.txt"), source_file_mtime)
+            .unwrap();
+        fs.set_mtime(Path::new("dst/sub"), old_dest_dir_mtime)
+            .unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                dry_run: false,
+                preserve_mtime: true,
+                omit_dir_times: true,
+                update_mode: UpdateMode::IgnoreTimes,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report
+            .actions()
+            .contains(&SyncAction::PreserveMtime(PathBuf::from(
+                "dst/sub/file.txt"
+            ))));
+        assert!(!report
+            .actions()
+            .contains(&SyncAction::PreserveMtime(PathBuf::from("dst/sub"))));
+        assert_eq!(
+            fs.metadata(Path::new("dst/sub/file.txt")).unwrap().modified,
+            Some(source_file_mtime)
+        );
+        assert_ne!(
+            fs.metadata(Path::new("dst/sub")).unwrap().modified,
+            Some(source_dir_mtime)
         );
     }
 
