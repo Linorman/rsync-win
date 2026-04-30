@@ -545,6 +545,7 @@ pub enum RemoteDeleteMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteShellOptions {
+    pub rsync_path: String,
     pub direction: TransferDirection,
     pub recursive: bool,
     pub preserve_times: bool,
@@ -595,6 +596,7 @@ pub struct RemoteShellOptions {
     pub compress_level: Option<u32>,
     pub compress_threads: Option<usize>,
     pub skip_compress: Vec<String>,
+    pub remote_options: Vec<String>,
     pub includes: Vec<String>,
     pub excludes: Vec<String>,
     pub filters: Vec<String>,
@@ -603,6 +605,7 @@ pub struct RemoteShellOptions {
 impl Default for RemoteShellOptions {
     fn default() -> Self {
         Self {
+            rsync_path: "rsync".to_string(),
             direction: TransferDirection::Push,
             recursive: false,
             preserve_times: false,
@@ -653,6 +656,7 @@ impl Default for RemoteShellOptions {
             compress_level: None,
             compress_threads: None,
             skip_compress: Vec::new(),
+            remote_options: Vec::new(),
             includes: Vec::new(),
             excludes: Vec::new(),
             filters: Vec::new(),
@@ -809,7 +813,7 @@ pub fn build_remote_shell_argv_for_paths(
     options: &RemoteShellOptions,
     paths: &[&Path],
 ) -> Result<Vec<String>, SessionError> {
-    let mut argv = vec!["rsync".to_string(), "--server".to_string()];
+    let mut argv = vec![options.rsync_path.clone(), "--server".to_string()];
     if matches!(options.direction, TransferDirection::Pull) {
         argv.push("--sender".to_string());
     }
@@ -850,7 +854,7 @@ pub fn build_remote_shell_protocol31_argv_for_paths(
     options: &RemoteShellOptions,
     paths: &[&Path],
 ) -> Result<Vec<String>, SessionError> {
-    let mut argv = vec!["rsync".to_string(), "--server".to_string()];
+    let mut argv = vec![options.rsync_path.clone(), "--server".to_string()];
     if matches!(options.direction, TransferDirection::Pull) {
         argv.push("--sender".to_string());
     }
@@ -911,6 +915,7 @@ fn append_remote_delete_option(argv: &mut Vec<String>, mode: RemoteDeleteMode) {
 }
 
 fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShellOptions) {
+    argv.extend(options.remote_options.iter().cloned());
     if options.checksum {
         argv.push("--checksum".to_string());
     }
@@ -1571,6 +1576,28 @@ mod tests {
                 "dest",
             ]
         );
+    }
+
+    #[test]
+    fn builds_server_argv_with_custom_rsync_path_and_remote_options() {
+        let options = RemoteShellOptions {
+            rsync_path: "sudo rsync".to_string(),
+            remote_options: vec![
+                "--fake-super".to_string(),
+                "--log-file=/tmp/remote rsync.log".to_string(),
+            ],
+            ..RemoteShellOptions::default()
+        };
+
+        for argv in [
+            build_remote_shell_argv(&options, Path::new("dest path")).unwrap(),
+            build_remote_shell_protocol31_argv(&options, Path::new("dest path")).unwrap(),
+        ] {
+            assert_eq!(argv[0], "sudo rsync");
+            assert!(argv.contains(&"--fake-super".to_string()));
+            assert!(argv.contains(&"--log-file=/tmp/remote rsync.log".to_string()));
+            assert_eq!(argv.last().map(String::as_str), Some("dest path"));
+        }
     }
 
     #[test]

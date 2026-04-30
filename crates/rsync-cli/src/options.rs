@@ -200,7 +200,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("one-file-system", Some('x'), I),
     value("block-size", Some('B'), I),
     value("rsh", Some('e'), I),
-    value("rsync-path", None, P),
+    value("rsync-path", None, I),
     flag("existing", None, I),
     flag("ignore-non-existing", None, I),
     flag("ignore-existing", None, I),
@@ -256,15 +256,15 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     append_value("include-from", None, I),
     value("files-from", None, I),
     flag("from0", Some('0'), I),
-    flag("old-args", None, P),
-    flag("secluded-args", Some('s'), P),
-    flag("protect-args", None, P),
-    flag("trust-sender", None, P),
+    flag("old-args", None, I),
+    flag("secluded-args", Some('s'), I),
+    flag("protect-args", None, I),
+    flag("trust-sender", None, I),
     value("copy-as", None, P),
     value("address", None, P),
     value("port", None, P),
     value("sockopts", None, P),
-    flag("blocking-io", None, P),
+    flag("blocking-io", None, I),
     value("outbuf", None, P),
     flag("stats", None, I),
     flag("8-bit-output", Some('8'), P),
@@ -298,8 +298,8 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     value("protocol", None, P),
     value("iconv", None, P),
     value("checksum-seed", None, I),
-    flag("ipv4", Some('4'), P),
-    flag("ipv6", Some('6'), P),
+    flag("ipv4", Some('4'), I),
+    flag("ipv6", Some('6'), I),
     flag("version", Some('V'), I),
     flag("help", None, I),
 ];
@@ -771,6 +771,13 @@ impl Default for Cli {
             write_devices: false,
             block_size: None,
             remote_options: Vec::new(),
+            rsync_path: None,
+            blocking_io: false,
+            old_args: false,
+            secluded_args: false,
+            trust_sender: false,
+            ipv4: false,
+            ipv6: false,
             accepted_unsupported_options: Vec::new(),
             paths: Vec::new(),
         }
@@ -935,7 +942,10 @@ fn apply_short_option(cli: &mut Cli, option: char, value: Option<&str>) -> Resul
         'f' => cli.filters.push(value.expect("value checked").to_string()),
         'F' => apply_filter_shorthand(cli),
         '0' => cli.from0 = true,
-        's' => remember_unsupported(cli, "--secluded-args"),
+        's' => {
+            cli.secluded_args = true;
+            cli.old_args = false;
+        }
         '8' => remember_unsupported(cli, "--8-bit-output"),
         'h' => cli.human_readable = cli.human_readable.saturating_add(1),
         'P' => {
@@ -946,8 +956,14 @@ fn apply_short_option(cli: &mut Cli, option: char, value: Option<&str>) -> Resul
         'M' => cli
             .remote_options
             .push(value.expect("value checked").to_string()),
-        '4' => remember_unsupported(cli, "--ipv4"),
-        '6' => remember_unsupported(cli, "--ipv6"),
+        '4' => {
+            cli.ipv4 = true;
+            cli.ipv6 = false;
+        }
+        '6' => {
+            cli.ipv6 = true;
+            cli.ipv4 = false;
+        }
         'V' => cli.version = true,
         other => bail!("unknown option -{other}"),
     }
@@ -1102,6 +1118,7 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         "one-file-system" => cli.one_file_system = true,
         "block-size" => cli.block_size = Some(parse_size(required_value(name, value)?)?),
         "rsh" => cli.remote_shell = Some(required_value(name, value)?.to_string()),
+        "rsync-path" => cli.rsync_path = Some(required_value(name, value)?.to_string()),
         "existing" => cli.existing = true,
         "ignore-non-existing" => cli.existing = true,
         "ignore-existing" => cli.ignore_existing = true,
@@ -1176,6 +1193,20 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
             .push(PathBuf::from(required_value(name, value)?)),
         "files-from" => cli.files_from = Some(PathBuf::from(required_value(name, value)?)),
         "from0" => cli.from0 = true,
+        "old-args" => {
+            cli.old_args = true;
+            cli.secluded_args = false;
+        }
+        "secluded-args" => {
+            cli.secluded_args = true;
+            cli.old_args = false;
+        }
+        "protect-args" => {
+            cli.secluded_args = true;
+            cli.old_args = false;
+        }
+        "trust-sender" => cli.trust_sender = true,
+        "blocking-io" => cli.blocking_io = true,
         "human-readable" => cli.human_readable = cli.human_readable.saturating_add(1),
         "progress" => cli.progress = true,
         "P" => {
@@ -1186,6 +1217,14 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         "remote-option" => cli
             .remote_options
             .push(required_value(name, value)?.to_string()),
+        "ipv4" => {
+            cli.ipv4 = true;
+            cli.ipv6 = false;
+        }
+        "ipv6" => {
+            cli.ipv6 = true;
+            cli.ipv4 = false;
+        }
         "password-file" => cli.password_file = Some(PathBuf::from(required_value(name, value)?)),
         "list-only" => cli.list_only = true,
         "stats" => cli.stats = true,
@@ -1222,8 +1261,13 @@ fn apply_standalone_no_prefixed_or_compat_alias(cli: &mut Cli, name: &str) -> Re
             cli.implied_dirs = false;
             Ok(true)
         }
+        "protect-args" => {
+            cli.secluded_args = true;
+            cli.old_args = false;
+            Ok(true)
+        }
         "no-motd" | "msgs2stderr" | "no-msgs2stderr" | "inc-recursive" | "i-r"
-        | "no-inc-recursive" | "no-i-r" | "protect-args" | "no-detach" => {
+        | "no-inc-recursive" | "no-i-r" | "no-detach" => {
             if find_long_spec(name).is_none() {
                 bail!("unknown option --{name}");
             }
@@ -1337,9 +1381,13 @@ fn apply_negated_option(cli: &mut Cli, name: &str) -> Result<()> {
             cli.no_group = true;
         }
         "human-readable" | "h" => cli.human_readable = 0,
-        "old-args" | "secluded-args" | "s" | "protect-args" | "super" | "iconv" | "blocking-io" => {
-            remember_unsupported(cli, &format!("--no-{name}"));
-        }
+        "old-args" => cli.old_args = false,
+        "secluded-args" | "s" | "protect-args" => cli.secluded_args = false,
+        "blocking-io" => cli.blocking_io = false,
+        "trust-sender" => cli.trust_sender = false,
+        "ipv4" | "4" => cli.ipv4 = false,
+        "ipv6" | "6" => cli.ipv6 = false,
+        "super" | "iconv" => remember_unsupported(cli, &format!("--no-{name}")),
         "perms" | "p" => {
             cli.preserve_permissions = false;
             cli.no_permissions = true;

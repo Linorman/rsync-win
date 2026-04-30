@@ -44,8 +44,9 @@ use rsync_protocol::{
     REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
 };
 use rsync_transport::remote_shell::{
-    build_custom_remote_shell_command, build_ssh_remote_command, default_ssh_program,
-    spawn_ssh_remote_command, SshRemoteCommand,
+    build_custom_remote_shell_command_with_options, build_ssh_remote_command_with_options,
+    default_ssh_program, spawn_ssh_remote_command, RemoteShellCommandOptions, SshAddressFamily,
+    SshRemoteCommand,
 };
 use rsync_transport::tcp::TcpTransport;
 use rsync_winfs::{
@@ -429,6 +430,27 @@ pub struct Cli {
     remote_options: Vec<String>,
 
     #[arg(skip)]
+    rsync_path: Option<String>,
+
+    #[arg(skip)]
+    blocking_io: bool,
+
+    #[arg(skip)]
+    old_args: bool,
+
+    #[arg(skip)]
+    secluded_args: bool,
+
+    #[arg(skip)]
+    trust_sender: bool,
+
+    #[arg(skip)]
+    ipv4: bool,
+
+    #[arg(skip)]
+    ipv6: bool,
+
+    #[arg(skip)]
     accepted_unsupported_options: Vec<String>,
 
     #[arg(help = "Source and destination operands")]
@@ -638,6 +660,26 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
         output.push_str(&format!("backup-dir: {}\n", backup_dir.display()));
     }
     output.push_str(&format!("backup suffix: {}\n", plan.backup_suffix));
+    if let Some(rsync_path) = &plan.rsync_path {
+        output.push_str(&format!("remote rsync path: {rsync_path}\n"));
+    }
+    if plan.blocking_io {
+        output.push_str("remote shell blocking io: true\n");
+    }
+    if plan.old_args {
+        output.push_str("old args: true\n");
+    }
+    if plan.secluded_args {
+        output.push_str("secluded args: true\n");
+    }
+    if plan.trust_sender {
+        output.push_str("trust sender: true\n");
+    }
+    if plan.ipv4 {
+        output.push_str("address family: ipv4\n");
+    } else if plan.ipv6 {
+        output.push_str("address family: ipv6\n");
+    }
     if !plan.remote_options.is_empty() {
         output.push_str("remote options:");
         for option in &plan.remote_options {
@@ -1483,6 +1525,10 @@ fn build_protocol27_fallback_command(
     let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
     let argv = build_remote_shell_argv_for_paths(
         &RemoteShellOptions {
+            rsync_path: plan
+                .rsync_path
+                .clone()
+                .unwrap_or_else(|| "rsync".to_string()),
             direction,
             recursive: plan.recursive,
             preserve_times: plan.preserve_times,
@@ -1566,6 +1612,7 @@ fn build_protocol27_fallback_command(
             compress_level: plan.compress_level,
             compress_threads: plan.compress_threads,
             skip_compress: plan.skip_compress.clone(),
+            remote_options: plan.remote_options.clone(),
             includes,
             excludes,
             filters,
@@ -1580,19 +1627,36 @@ fn build_remote_transport_command(
     host: &str,
     remote_server_argv: &[String],
 ) -> Result<SshRemoteCommand> {
+    let options = remote_shell_command_options_from_cli(cli);
     if let Some(remote_shell) = &cli.remote_shell {
-        return Ok(build_custom_remote_shell_command(
+        return Ok(build_custom_remote_shell_command_with_options(
             remote_shell,
             host,
             remote_server_argv,
+            options,
         )?);
     }
 
-    Ok(build_ssh_remote_command(
+    Ok(build_ssh_remote_command_with_options(
         default_ssh_program().into_os_string(),
         host,
         remote_server_argv,
+        options,
     ))
+}
+
+fn remote_shell_command_options_from_cli(cli: &Cli) -> RemoteShellCommandOptions {
+    let address_family = if cli.ipv4 {
+        Some(SshAddressFamily::Ipv4)
+    } else if cli.ipv6 {
+        Some(SshAddressFamily::Ipv6)
+    } else {
+        None
+    };
+    RemoteShellCommandOptions {
+        address_family,
+        blocking_io: cli.blocking_io,
+    }
 }
 
 fn should_fallback_to_protocol27(err: &anyhow::Error) -> bool {
@@ -1877,6 +1941,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
     sort_remote_entries_for_sender_indexes(&mut entries);
     validate_remote_file_list_paths(&entries)?;
     let files_from = load_files_from(cli)?;
+    validate_remote_sender_claims(plan, &entries, files_from.as_deref())?;
     let selected_indexes =
         selected_remote_entry_indexes(&entries, &plan.filter_rules, files_from.as_deref());
     let selected_entries = selected_remote_entries(&entries, &selected_indexes);
@@ -2035,6 +2100,7 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
     sort_remote_entries_for_sender_indexes(&mut entries);
     validate_remote_file_list_paths(&entries)?;
     let files_from = load_files_from(cli)?;
+    validate_remote_sender_claims(plan, &entries, files_from.as_deref())?;
     let selected_indexes =
         selected_remote_entry_indexes(&entries, &plan.filter_rules, files_from.as_deref());
     let selected_entries = selected_remote_entries(&entries, &selected_indexes);
@@ -3428,6 +3494,7 @@ fn serve_remote_receiver_requests<T: Read + Write>(
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
     transport: &mut T,
     mux: &mut MultiplexReadState,
@@ -3577,6 +3644,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request_remote_sender_files<T: Write>(
     transport: &mut T,
     entries: &[RsyncFileListEntry],
@@ -3608,6 +3676,7 @@ fn request_remote_sender_files<T: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request_remote_sender_files_protocol31<T: Write>(
     transport: &mut T,
     entries: &[RsyncFileListEntry],
@@ -4173,6 +4242,38 @@ fn remote_source_path_is_filtered(
     false
 }
 
+fn remote_receiver_path_is_filtered(
+    rules: &RuleSet,
+    relative: &Path,
+    file_type: WireFileType,
+) -> bool {
+    let mut current = PathBuf::new();
+    let mut components = relative.components().peekable();
+
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return true;
+        };
+        current.push(name);
+
+        let kind = if components.peek().is_some() {
+            EntryKind::Directory
+        } else {
+            entry_kind_from_wire(file_type)
+        };
+        if matches!(
+            rules
+                .decide_for_side(&filter_path(&current), kind, RuleSide::Receiver)
+                .action(),
+            RuleAction::Exclude | RuleAction::Protect
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn delete_is_protected(rules: &RuleSet, relative: &Path, file_type: FileType) -> bool {
     let mut current = PathBuf::new();
     let mut components = relative.components().peekable();
@@ -4709,6 +4810,7 @@ fn copy_token_to_block_index(token: i32) -> Result<usize> {
     usize::try_from(raw).context("copy token block index did not fit usize")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_file_tokens_to_path_with_basis<T: Read>(
     transport: &mut T,
     mux: &mut MultiplexReadState,
@@ -5108,6 +5210,75 @@ fn validate_remote_file_list_paths(entries: &[RsyncFileListEntry]) -> Result<()>
     Ok(())
 }
 
+fn validate_remote_sender_claims(
+    plan: &TransferPlan,
+    entries: &[RsyncFileListEntry],
+    files_from: Option<&[PathBuf]>,
+) -> Result<()> {
+    if plan.trust_sender {
+        return Ok(());
+    }
+    let allowed_single_file_sources = remote_single_file_source_basenames(plan);
+    for entry in entries {
+        if remote_entry_is_top_dir(entry) {
+            continue;
+        }
+        if !remote_entry_matches_single_file_sources(&entry.path, &allowed_single_file_sources) {
+            bail!(
+                "remote sender sent unrequested path `{}`; use --trust-sender to accept remote file-list names",
+                entry.path.display()
+            );
+        }
+        if remote_source_path_is_filtered(&plan.filter_rules, &entry.path, entry.file_type)
+            || remote_receiver_path_is_filtered(&plan.filter_rules, &entry.path, entry.file_type)
+        {
+            bail!(
+                "remote sender sent filtered path `{}`; use --trust-sender to accept remote file-list names",
+                entry.path.display()
+            );
+        }
+        if files_from.is_some_and(|files_from| !files_from_matches(&entry.path, files_from)) {
+            bail!(
+                "remote sender sent path `{}` outside --files-from selection; use --trust-sender to accept remote file-list names",
+                entry.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remote_single_file_source_basenames(plan: &TransferPlan) -> Vec<String> {
+    if plan.remote_direction != Some(TransferDirection::Pull) {
+        return Vec::new();
+    }
+    plan.remote_operands
+        .iter()
+        .filter_map(|operand| remote_single_file_source_basename(&operand.path))
+        .collect()
+}
+
+fn remote_single_file_source_basename(path: &str) -> Option<String> {
+    if path.ends_with('/') || path.ends_with('\\') {
+        return None;
+    }
+    let normalized = path.replace('\\', "/");
+    let basename = normalized.rsplit('/').next()?.trim();
+    if basename.is_empty() || !basename.contains('.') {
+        return None;
+    }
+    Some(basename.to_string())
+}
+
+fn remote_entry_matches_single_file_sources(relative: &Path, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    allowed
+        .iter()
+        .any(|basename| relative == *basename || relative.starts_with(&format!("{basename}/")))
+}
+
 #[derive(Debug)]
 struct TransferPlan {
     transfer_mode: TransferMode,
@@ -5183,6 +5354,13 @@ struct TransferPlan {
     backup_dir: Option<PathBuf>,
     backup_suffix: String,
     remote_options: Vec<String>,
+    rsync_path: Option<String>,
+    blocking_io: bool,
+    old_args: bool,
+    secluded_args: bool,
+    trust_sender: bool,
+    ipv4: bool,
+    ipv6: bool,
     remote_server_argv: Option<Vec<String>>,
     remote_ssh_argv: Option<Vec<String>>,
     remote_ssh_command: Option<SshRemoteCommand>,
@@ -5516,6 +5694,13 @@ impl TransferPlan {
                 }
             }),
             remote_options: cli.remote_options.clone(),
+            rsync_path: cli.rsync_path.clone(),
+            blocking_io: cli.blocking_io,
+            old_args: cli.old_args,
+            secluded_args: cli.secluded_args,
+            trust_sender: cli.trust_sender,
+            ipv4: cli.ipv4,
+            ipv6: cli.ipv6,
             remote_server_argv,
             remote_ssh_argv,
             remote_ssh_command,
@@ -5707,6 +5892,10 @@ fn remote_shell_options_from_cli(
 ) -> RemoteShellOptions {
     let (includes, excludes, filters) = remote_receiver_filter_args_from_cli(cli, direction);
     RemoteShellOptions {
+        rsync_path: cli
+            .rsync_path
+            .clone()
+            .unwrap_or_else(|| "rsync".to_string()),
         direction,
         recursive,
         preserve_times,
@@ -5780,6 +5969,7 @@ fn remote_shell_options_from_cli(
         compress_level: cli.compress_level,
         compress_threads: cli.compress_threads,
         skip_compress: cli.skip_compress.clone(),
+        remote_options: cli.remote_options.clone(),
         includes,
         excludes,
         filters,
@@ -6397,6 +6587,46 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
         report.info(
             "I_REMOTE_SHELL",
             format!("-e/--rsh remote shell command: {remote_shell}"),
+        );
+    }
+    if let Some(rsync_path) = &cli.rsync_path {
+        report.info(
+            "I_REMOTE_RSYNC_PATH",
+            format!("--rsync-path remote program: {rsync_path}"),
+        );
+    }
+    if cli.blocking_io {
+        report.info(
+            "I_REMOTE_BLOCKING_IO",
+            "--blocking-io requested; child process transport uses blocking stdio",
+        );
+    }
+    if cli.old_args {
+        report.info(
+            "I_REMOTE_ARGS",
+            "--old-args requested; remote argv remains shell-quoted for compatibility",
+        );
+    }
+    if cli.secluded_args {
+        report.info(
+            "I_REMOTE_ARGS",
+            "--secluded-args requested; remote argv is shell-quoted before transport launch",
+        );
+    }
+    if cli.trust_sender {
+        report.info(
+            "I_TRUST_SENDER",
+            "--trust-sender disables strict sender file-list claim validation but keeps destination path safety checks",
+        );
+    }
+    if cli.ipv4 || cli.ipv6 {
+        report.info(
+            "I_REMOTE_ADDRESS_FAMILY",
+            if cli.ipv4 {
+                "--ipv4 selects ssh -4 for remote-shell transport"
+            } else {
+                "--ipv6 selects ssh -6 for remote-shell transport"
+            },
         );
     }
 
@@ -8234,6 +8464,137 @@ mod tests {
     }
 
     #[test]
+    fn trust_sender_default_rejects_remote_filter_violations() {
+        let root = unique_temp_dir("rsync-cli-trust-sender-filter-default");
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let cli = options::parse_cli(vec![
+            "rsync-win".to_string(),
+            "--dry-run".to_string(),
+            "--exclude".to_string(),
+            "*.tmp".to_string(),
+            "host:/tmp/source/".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_dry_run_input_with_entries(
+            &[
+                test_remote_entry(".", WireFileType::Directory),
+                test_remote_entry("skip.tmp", WireFileType::File),
+                test_remote_entry("file.txt", WireFileType::File),
+            ],
+            2,
+        ));
+
+        let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(
+            err.to_string().contains("remote sender sent filtered path"),
+            "{err:#}"
+        );
+        assert!(fs::read_dir(&dest).unwrap().next().is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trust_sender_default_rejects_unrequested_single_file_entries() {
+        let root = unique_temp_dir("rsync-cli-trust-sender-extra-source-default");
+        let dest = root.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let cli = options::parse_cli(vec![
+            "rsync-win".to_string(),
+            "--dry-run".to_string(),
+            "host:/tmp/allowed.txt".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_dry_run_input_with_entries(
+            &[
+                test_remote_entry(".", WireFileType::Directory),
+                test_remote_entry("other.txt", WireFileType::File),
+            ],
+            1,
+        ));
+
+        let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("remote sender sent unrequested path"),
+            "{err:#}"
+        );
+        assert!(fs::read_dir(&dest).unwrap().next().is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trust_sender_keeps_destination_path_validation_strict() {
+        for (label, entries, expected) in [
+            (
+                "parent",
+                vec![
+                    test_remote_entry(".", WireFileType::Directory),
+                    test_remote_entry("../escape.txt", WireFileType::File),
+                ],
+                "not a portable relative rsync path",
+            ),
+            (
+                "absolute",
+                vec![
+                    test_remote_entry(".", WireFileType::Directory),
+                    test_remote_entry("/escape.txt", WireFileType::File),
+                ],
+                "not a portable relative rsync path",
+            ),
+            (
+                "reserved",
+                vec![
+                    test_remote_entry(".", WireFileType::Directory),
+                    test_remote_entry("CON.txt", WireFileType::File),
+                ],
+                "not a portable relative rsync path",
+            ),
+            (
+                "case-collision",
+                vec![
+                    test_remote_entry(".", WireFileType::Directory),
+                    test_remote_entry("Report.txt", WireFileType::File),
+                    test_remote_entry("report.txt", WireFileType::File),
+                ],
+                "case/normalization collision",
+            ),
+        ] {
+            let root = unique_temp_dir(&format!("rsync-cli-trust-sender-{label}"));
+            let dest = root.join("dest");
+            fs::create_dir_all(&root).unwrap();
+
+            let cli = options::parse_cli(vec![
+                "rsync-win".to_string(),
+                "--trust-sender".to_string(),
+                "host:/tmp/source/".to_string(),
+                dest.to_string_lossy().into_owned(),
+            ])
+            .unwrap();
+            let plan = TransferPlan::from_cli(&cli);
+            let mut transport =
+                TestTransport::with_input(remote_pull_file_list_only_input(&entries));
+
+            let err = execute_remote_pull(&cli, &plan, &mut transport).unwrap_err();
+
+            assert!(err.to_string().contains(expected), "{label}: {err:#}");
+            assert!(!dest.exists(), "{label}: destination directory was created");
+
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn remote_pull_rejects_security_oversized_literal_stream_without_final_file() {
         let root = unique_temp_dir("rsync-cli-remote-pull-oversize");
         let dest = root.join("dest");
@@ -8322,15 +8683,17 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
         fs::write(dest.join("skip.tmp"), b"local").unwrap();
 
-        let cli = Cli::parse_from(vec![
+        let cli = options::parse_cli(vec![
             "rsync-win".to_string(),
             "--dry-run".to_string(),
+            "--trust-sender".to_string(),
             "--delete".to_string(),
             "--exclude".to_string(),
             "*.tmp".to_string(),
             "host:/tmp/source".to_string(),
             dest.to_string_lossy().into_owned(),
-        ]);
+        ])
+        .unwrap();
         let plan = TransferPlan::from_cli(&cli);
         let mut transport = TestTransport::with_input(remote_pull_filter_dry_run_input());
 

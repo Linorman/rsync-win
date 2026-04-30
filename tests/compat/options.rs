@@ -339,15 +339,8 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
         "--i-r",
         "--no-inc-recursive",
         "--no-i-r",
-        "--protect-args",
         "--compression-choice=zlib",
         "--time-limit=1",
-        "--secluded-args",
-        "--no-s",
-        "--old-args",
-        "--no-old-args",
-        "--blocking-io",
-        "--no-blocking-io",
         "--ignore-non-existing",
         "src",
         "dst",
@@ -364,14 +357,7 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
         "--i-r",
         "--no-inc-recursive",
         "--no-i-r",
-        "--protect-args",
         "--time-limit",
-        "--secluded-args",
-        "--no-s",
-        "--old-args",
-        "--no-old-args",
-        "--blocking-io",
-        "--no-blocking-io",
     ] {
         assert!(
             output.contains(option),
@@ -445,6 +431,46 @@ fn parser_exposes_structured_parsed_options() {
     assert_eq!(parsed.verbosity(), 2);
     assert_eq!(parsed.operands(), ["src", "host:/dst"]);
     assert_eq!(parsed.remote_options(), ["--fake-super"]);
+}
+
+#[test]
+fn parser_routes_chunk9_remote_shell_transport_options() {
+    let output = parse_and_render([
+        "rsync-win",
+        "--plan",
+        "--rsync-path",
+        "sudo rsync",
+        "--remote-option=--fake-super",
+        "--blocking-io",
+        "--secluded-args",
+        "--trust-sender",
+        "--ipv4",
+        "src dir",
+        "host:/dst path;name",
+    ]);
+
+    assert!(output.contains("remote rsync path: sudo rsync"), "{output}");
+    assert!(
+        output.contains("remote shell blocking io: true"),
+        "{output}"
+    );
+    assert!(output.contains("secluded args: true"), "{output}");
+    assert!(output.contains("trust sender: true"), "{output}");
+    assert!(output.contains("address family: ipv4"), "{output}");
+    assert!(output.contains("remote options: --fake-super"), "{output}");
+    assert!(
+        output.contains("remote --server argv: sudo rsync --server"),
+        "{output}"
+    );
+    assert!(
+        output.contains("remote ssh argv: ssh -o BatchMode=yes -o ConnectTimeout=10 -4 host"),
+        "{output}"
+    );
+    assert!(
+        output.contains("sudo rsync --server") && output.contains("'/dst path;name'"),
+        "{output}"
+    );
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
 }
 
 #[test]

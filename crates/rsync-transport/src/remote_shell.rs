@@ -6,6 +6,18 @@ use thiserror::Error;
 
 const DEFAULT_SSH_OPTIONS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteShellCommandOptions {
+    pub address_family: Option<SshAddressFamily>,
+    pub blocking_io: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshRemoteCommand {
     pub program: OsString,
@@ -30,11 +42,26 @@ pub fn build_ssh_remote_command(
     host: &str,
     remote_server_argv: &[String],
 ) -> SshRemoteCommand {
+    build_ssh_remote_command_with_options(
+        ssh_program,
+        host,
+        remote_server_argv,
+        RemoteShellCommandOptions::default(),
+    )
+}
+
+pub fn build_ssh_remote_command_with_options(
+    ssh_program: impl Into<OsString>,
+    host: &str,
+    remote_server_argv: &[String],
+    options: RemoteShellCommandOptions,
+) -> SshRemoteCommand {
     build_remote_shell_command(
         ssh_program,
         DEFAULT_SSH_OPTIONS.iter().copied().map(OsString::from),
         host,
         remote_server_argv,
+        options,
     )
 }
 
@@ -43,12 +70,27 @@ pub fn build_custom_remote_shell_command(
     host: &str,
     remote_server_argv: &[String],
 ) -> Result<SshRemoteCommand, RemoteShellCommandParseError> {
+    build_custom_remote_shell_command_with_options(
+        shell_command,
+        host,
+        remote_server_argv,
+        RemoteShellCommandOptions::default(),
+    )
+}
+
+pub fn build_custom_remote_shell_command_with_options(
+    shell_command: &str,
+    host: &str,
+    remote_server_argv: &[String],
+    options: RemoteShellCommandOptions,
+) -> Result<SshRemoteCommand, RemoteShellCommandParseError> {
     let (program, args) = parse_remote_shell_command(shell_command)?;
     Ok(build_remote_shell_command(
         program,
         args,
         host,
         remote_server_argv,
+        options,
     ))
 }
 
@@ -57,21 +99,34 @@ fn build_remote_shell_command(
     args: impl IntoIterator<Item = OsString>,
     host: &str,
     remote_server_argv: &[String],
+    options: RemoteShellCommandOptions,
 ) -> SshRemoteCommand {
-    let remote_command = remote_server_argv
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let remote_command = remote_server_command(remote_server_argv);
+    let mut args: Vec<OsString> = args.into_iter().collect();
+    match options.address_family {
+        Some(SshAddressFamily::Ipv4) => args.push(OsString::from("-4")),
+        Some(SshAddressFamily::Ipv6) => args.push(OsString::from("-6")),
+        None => {}
+    }
+    args.extend([OsString::from(host), OsString::from(remote_command.clone())]);
 
     SshRemoteCommand {
         program: program.into(),
-        args: args
-            .into_iter()
-            .chain([OsString::from(host), OsString::from(remote_command.clone())])
-            .collect(),
+        args,
         remote_command,
     }
+}
+
+fn remote_server_command(remote_server_argv: &[String]) -> String {
+    let Some((program, args)) = remote_server_argv.split_first() else {
+        return String::new();
+    };
+    let mut command = program.clone();
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    command
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -223,6 +278,42 @@ mod tests {
             ]
         );
         assert_eq!(command.args[4], OsString::from("root@example.test"));
+    }
+
+    #[test]
+    fn builds_ssh_command_with_ipv4_and_raw_remote_program_prefix() {
+        let command = build_ssh_remote_command_with_options(
+            "ssh",
+            "user@example.test",
+            &[
+                "sudo rsync".to_string(),
+                "--server".to_string(),
+                ".".to_string(),
+                "path with spaces".to_string(),
+                "path;name".to_string(),
+            ],
+            RemoteShellCommandOptions {
+                address_family: Some(SshAddressFamily::Ipv4),
+                blocking_io: true,
+            },
+        );
+
+        assert_eq!(
+            command.args,
+            vec![
+                OsString::from("-o"),
+                OsString::from("BatchMode=yes"),
+                OsString::from("-o"),
+                OsString::from("ConnectTimeout=10"),
+                OsString::from("-4"),
+                OsString::from("user@example.test"),
+                OsString::from("sudo rsync --server . 'path with spaces' 'path;name'"),
+            ]
+        );
+        assert_eq!(
+            command.remote_command,
+            "sudo rsync --server . 'path with spaces' 'path;name'"
+        );
     }
 
     #[test]

@@ -375,14 +375,15 @@
 - Modify: `crates/rsync-cli/src/plan.rs`
 - Test: `crates/rsync-cli/src/lib.rs`
 
-- [ ] Implement `--rsync-path`.
+- [x] Implement `--rsync-path`.
 - [x] Implement `--remote-option` / `-M`.
-- [ ] Implement `--blocking-io`.
-- [ ] Implement `--old-args` and `--secluded-args` / `-s`.
-- [ ] Implement `--ipv4` / `-4` and `--ipv6` / `-6` where transport supports it.
+- [x] Implement `--blocking-io`.
+- [x] Implement `--old-args` and `--secluded-args` / `-s`.
+- [x] Implement `--ipv4` / `-4` and `--ipv6` / `-6` where transport supports it.
 - [x] Add command-construction tests with paths containing spaces and shell metacharacters.
 - [x] Run `cargo test -p rsync-cli --all-features remote_shell`.
-- [ ] Commit: `feat: add remote-shell transport options`.
+- [x] Run SSH smoke against `root@192.168.100.181:/root/rsync-test/` with `--rsync-path`, `--blocking-io`, `--ipv4`, `--trust-sender`, and `--secluded-args`; cleaned remote and local test directories.
+- [x] Commit: `feat: add remote-shell transport options and trust-sender gating` (combined chunk9 commit).
 
 ### Task 21: Harden Remote Peer Trust Semantics
 
@@ -391,11 +392,11 @@
 - Modify: `crates/rsync-protocol/src/flist.rs`
 - Test: `crates/rsync-cli/src/lib.rs`
 
-- [ ] Implement `--trust-sender`.
+- [x] Implement `--trust-sender`.
 - [x] Keep strict default remote file-list validation.
-- [ ] Add malicious peer tests for extra source args, filter violations, absolute paths, parent escapes, reserved Windows names, and case collisions.
-- [ ] Run `cargo test --workspace --all-features trust_sender`.
-- [ ] Commit: `feat: add trust-sender gating`.
+- [x] Add malicious peer tests for extra source args, filter violations, absolute paths, parent escapes, reserved Windows names, and case collisions.
+- [x] Run `cargo test --workspace --all-features trust_sender`.
+- [x] Commit: `feat: add remote-shell transport options and trust-sender gating` (combined chunk9 commit).
 
 ## Chunk 10: Daemon Client and Daemon Server
 
