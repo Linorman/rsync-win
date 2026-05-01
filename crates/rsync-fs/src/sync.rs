@@ -52,6 +52,13 @@ pub struct SyncOptions {
     pub preserve_devices: bool,
     pub preserve_specials: bool,
     pub fail_on_metadata_loss: bool,
+    // Chunk 12
+    pub compare_dest: Vec<PathBuf>,
+    pub copy_dest: Vec<PathBuf>,
+    pub link_dest: Vec<PathBuf>,
+    pub sparse: bool,
+    pub preallocate: bool,
+    pub fuzzy: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +116,12 @@ impl Default for SyncOptions {
             preserve_devices: false,
             preserve_specials: false,
             fail_on_metadata_loss: false,
+            compare_dest: Vec::new(),
+            copy_dest: Vec::new(),
+            link_dest: Vec::new(),
+            sparse: false,
+            preallocate: false,
+            fuzzy: false,
         }
     }
 }
@@ -668,6 +681,111 @@ fn transfer_file<F: PortableFileSystem>(
         }
     }
 
+    // Chunk 12: check comparison / basis directories before transfer
+    let has_alt_dirs = !options.compare_dest.is_empty()
+        || !options.copy_dest.is_empty()
+        || !options.link_dest.is_empty();
+    if has_alt_dirs {
+        if let Some(basis_action) = check_basis_dirs(
+            fs,
+            context.dest_root,
+            relative,
+            entry,
+            &options.compare_dest,
+            &options.copy_dest,
+            &options.link_dest,
+        ) {
+            match basis_action {
+                BasisMatchAction::Skip => {
+                    // compare-dest: file exists identical in basis dir, skip transfer
+                    report.push(SyncAction::Warn {
+                        path: target.to_path_buf(),
+                        message: "file exists in --compare-dest basis directory, skipping"
+                            .to_string(),
+                    });
+                    return Ok(());
+                }
+                BasisMatchAction::CopyFrom(basis_file) => {
+                    report.push(SyncAction::WriteFile {
+                        path: target.to_path_buf(),
+                        len: action_len(entry.metadata.len)?,
+                    });
+                    if !options.dry_run {
+                        backup_receiver_file(
+                            fs,
+                            context.dest_root,
+                            target,
+                            relative,
+                            options,
+                            report,
+                        )?;
+                        remove_existing_file_before_hardlink(fs, target)?;
+                        fs.copy_file_with_options(
+                            &basis_file,
+                            target,
+                            &file_write_options(options),
+                        )?;
+                    }
+                    preserve_transferred_mtime(fs, target, entry, options, report)?;
+                    return Ok(());
+                }
+                BasisMatchAction::LinkFrom(basis_file) => {
+                    report.push(SyncAction::CreateHardLink {
+                        from: basis_file.clone(),
+                        to: target.to_path_buf(),
+                    });
+                    if !options.dry_run {
+                        backup_receiver_file(
+                            fs,
+                            context.dest_root,
+                            target,
+                            relative,
+                            options,
+                            report,
+                        )?;
+                        remove_existing_file_before_hardlink(fs, target)?;
+                        match fs.create_hard_link(&basis_file, target) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                report.push(SyncAction::Warn {
+                                    path: target.to_path_buf(),
+                                    message: format!(
+                                        "--link-dest hardlink failed, falling back to copy: {err}"
+                                    ),
+                                });
+                                fs.copy_file_with_options(
+                                    &basis_file,
+                                    target,
+                                    &file_write_options(options),
+                                )?;
+                            }
+                        }
+                    }
+                    preserve_transferred_mtime(fs, target, entry, options, report)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Chunk 12: fuzzy basis search
+    if options.fuzzy && !options.dry_run {
+        let dest_exists = fs.metadata(target).is_ok();
+        if !dest_exists {
+            if let Some(basis) = find_fuzzy_basis(fs, entry, target) {
+                report.push(SyncAction::Warn {
+                    path: target.to_path_buf(),
+                    message: format!(
+                        "--fuzzy: using {} as basis for delta transfer",
+                        basis.display()
+                    ),
+                });
+                fs.copy_file_with_options(&basis, target, &file_write_options(options))?;
+                // Then apply the actual file copy which should be delta-efficient
+            }
+        }
+    }
+
     if options.append_verify {
         if let Some(offset) = append_verify_offset(fs, &entry.path, target, entry.metadata.len)? {
             let suffix_len = entry.metadata.len - offset;
@@ -742,6 +860,7 @@ fn remove_existing_file_before_hardlink<F: PortableFileSystem>(
     match fs.metadata(target) {
         Ok(metadata) if metadata.file_type != FileType::Directory => fs.remove_file(target),
         Ok(_) | Err(FsError::NotFound(_)) => Ok(()),
+        Err(FsError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -879,6 +998,8 @@ fn file_write_options(options: &SyncOptions) -> FileWriteOptions {
         partial_dir: options.partial_dir.clone(),
         temp_dir: options.temp_dir.clone(),
         fsync: options.fsync,
+        sparse: options.sparse,
+        preallocate: options.preallocate,
     }
 }
 
@@ -889,6 +1010,8 @@ fn delayed_file_write_options(options: &SyncOptions) -> FileWriteOptions {
         partial_dir: options.partial_dir.clone(),
         temp_dir: None,
         fsync: options.fsync,
+        sparse: options.sparse,
+        preallocate: options.preallocate,
     }
 }
 
@@ -969,6 +1092,133 @@ fn preserve_directory_mtimes<F: PortableFileSystem>(
         preserve_transferred_mtime(fs, target, entry, options, report)?;
     }
     Ok(())
+}
+
+// Chunk 12: Destination comparison option helpers
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BasisMatchAction {
+    Skip,
+    CopyFrom(PathBuf),
+    LinkFrom(PathBuf),
+}
+
+fn check_basis_dirs<F: PortableFileSystem>(
+    fs: &F,
+    dest_root: &Path,
+    relative: &Path,
+    source_entry: &WalkEntry,
+    compare_dirs: &[PathBuf],
+    copy_dirs: &[PathBuf],
+    link_dirs: &[PathBuf],
+) -> Option<BasisMatchAction> {
+    // Check link-dest first (prefer hardlinking)
+    for basis_dir in link_dirs {
+        let basis_file = basis_file_path(dest_root, basis_dir, relative);
+        if let Ok(basis_meta) = fs.metadata(&basis_file) {
+            if basis_files_match(source_entry, &basis_meta) {
+                return Some(BasisMatchAction::LinkFrom(basis_file));
+            }
+        }
+    }
+    // Check copy-dest next
+    for basis_dir in copy_dirs {
+        let basis_file = basis_file_path(dest_root, basis_dir, relative);
+        if let Ok(basis_meta) = fs.metadata(&basis_file) {
+            if basis_files_match(source_entry, &basis_meta) {
+                return Some(BasisMatchAction::CopyFrom(basis_file));
+            }
+        }
+    }
+    // Check compare-dest last
+    for basis_dir in compare_dirs {
+        let basis_file = basis_file_path(dest_root, basis_dir, relative);
+        if let Ok(basis_meta) = fs.metadata(&basis_file) {
+            if basis_files_match(source_entry, &basis_meta) {
+                return Some(BasisMatchAction::Skip);
+            }
+        }
+    }
+    None
+}
+
+fn basis_file_path(dest_root: &Path, basis_dir: &Path, relative: &Path) -> PathBuf {
+    if basis_dir.is_absolute() {
+        basis_dir.join(relative)
+    } else {
+        dest_root.join(basis_dir).join(relative)
+    }
+}
+
+fn basis_files_match(source: &WalkEntry, basis: &PortableMetadata) -> bool {
+    if basis.file_type != FileType::File {
+        return false;
+    }
+    if basis.len != source.metadata.len {
+        return false;
+    }
+    // When neither file has an mtime, consider them matching if sizes match.
+    match source.metadata.modified.zip(basis.modified) {
+        Some((sm, bm)) => sm == bm,
+        None => true,
+    }
+}
+
+fn find_fuzzy_basis<F: PortableFileSystem>(
+    fs: &F,
+    source_entry: &WalkEntry,
+    dest: &Path,
+) -> Option<PathBuf> {
+    let source_name = source_entry.path.file_name()?.to_str()?;
+    let parent = dest.parent()?;
+
+    let entries = fs.list(parent).ok()?;
+    let mut best: Option<(PathBuf, usize)> = None;
+
+    for entry in entries {
+        if entry.metadata.file_type != FileType::File {
+            continue;
+        }
+        let Some(candidate_name) = entry.path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let score = name_similarity_score(source_name, candidate_name);
+        let is_better = match best.as_ref() {
+            Some((_, best_score)) => score > *best_score,
+            None => true,
+        };
+        if score > 0 && is_better {
+            best = Some((entry.path.clone(), score));
+        }
+    }
+
+    best.and_then(|(path, _score)| {
+        if path != source_entry.path {
+            Some(path)
+        } else {
+            None
+        }
+    })
+}
+
+fn name_similarity_score(a: &str, b: &str) -> usize {
+    // Simple common-prefix and common-suffix heuristic
+    let common_prefix = a
+        .chars()
+        .zip(b.chars())
+        .take_while(|(ac, bc)| ac == bc)
+        .count();
+    let common_suffix = a
+        .chars()
+        .rev()
+        .zip(b.chars().rev())
+        .take_while(|(ac, bc)| ac == bc)
+        .count();
+
+    if common_prefix == 0 && common_suffix == 0 {
+        return 0;
+    }
+    common_prefix + common_suffix
 }
 
 fn file_needs_update<F: PortableFileSystem>(
@@ -3747,5 +3997,323 @@ mod tests {
                 .any(|other| path.starts_with(other));
             Ok(root_is_other == path_is_other)
         }
+    }
+
+    // Chunk 12: Destination comparison option tests
+
+    #[test]
+    fn check_basis_dirs_finds_matching_file() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/a.txt", b"hello world").unwrap();
+        let src_meta = fs.metadata(Path::new("src/a.txt")).unwrap();
+        fs.add_file("basis/a.txt", b"hello world").unwrap();
+        // MemoryFileSystem creates files with modified=None, which is treated as matching.
+
+        let src_entry = WalkEntry {
+            path: PathBuf::from("src/a.txt"),
+            metadata: src_meta,
+        };
+
+        let result = check_basis_dirs(
+            &fs,
+            Path::new(""),
+            Path::new("a.txt"),
+            &src_entry,
+            &[PathBuf::from("basis")],
+            &[],
+            &[],
+        );
+        assert!(
+            matches!(result, Some(BasisMatchAction::Skip)),
+            "expected Skip, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_basis_dirs_no_match_when_mtime_differs() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/a.txt", b"hello world").unwrap();
+        fs.set_mtime(
+            Path::new("src/a.txt"),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000),
+        )
+        .unwrap();
+        fs.add_file("basis/a.txt", b"hello world").unwrap();
+        fs.set_mtime(
+            Path::new("basis/a.txt"),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(2000),
+        )
+        .unwrap();
+
+        let src_entry = WalkEntry {
+            path: PathBuf::from("src/a.txt"),
+            metadata: fs.metadata(Path::new("src/a.txt")).unwrap(),
+        };
+
+        let result = check_basis_dirs(
+            &fs,
+            Path::new(""),
+            Path::new("a.txt"),
+            &src_entry,
+            &[PathBuf::from("basis")],
+            &[],
+            &[],
+        );
+        assert!(
+            result.is_none(),
+            "expected no match when mtimes differ: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn compare_dest_skips_identical_file() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/a.txt", b"hello world").unwrap();
+        fs.add_dir("dst").unwrap();
+        fs.add_file("dst/basis/a.txt", b"hello world").unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                compare_dest: vec![PathBuf::from("basis")],
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.warnings().any(
+            |a| matches!(a, SyncAction::Warn { message, .. } if message.contains("--compare-dest"))
+        ));
+        assert!(!fs.exists(Path::new("dst/a.txt")));
+    }
+
+    #[test]
+    fn relative_compare_dest_is_resolved_against_destination_root() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/a.txt", b"hello world").unwrap();
+        fs.add_file("dst/basis/a.txt", b"hello world").unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                compare_dest: vec![PathBuf::from("basis")],
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.warnings().any(
+            |a| matches!(a, SyncAction::Warn { message, .. } if message.contains("--compare-dest"))
+        ));
+        assert!(!fs.exists(Path::new("dst/a.txt")));
+    }
+
+    #[test]
+    fn absolute_copy_dest_uses_basis_without_destination_prefix() {
+        let root = unique_temp_dir("rsync-fs-absolute-copy-dest");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        let basis = root.join("basis");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::create_dir_all(&basis).unwrap();
+        fs::write(source.join("a.txt"), b"hello world").unwrap();
+        fs::write(basis.join("a.txt"), b"hello world").unwrap();
+
+        let modified = UNIX_EPOCH + Duration::from_secs(1_700_000_001);
+        filetime::set_file_mtime(
+            source.join("a.txt"),
+            filetime::FileTime::from_system_time(modified),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            basis.join("a.txt"),
+            filetime::FileTime::from_system_time(modified),
+        )
+        .unwrap();
+
+        let mut local = LocalFileSystem;
+        let report = sync_tree(
+            &mut local,
+            &source,
+            &dest,
+            SyncOptions {
+                copy_dest: vec![basis.clone()],
+                dry_run: false,
+                preserve_mtime: false,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.actions().iter().any(|a| matches!(a,
+            SyncAction::WriteFile { path, len: 11 } if path == &dest.join("a.txt")
+        )));
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"hello world");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_dest_copies_from_basis() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/a.txt", b"hello world").unwrap();
+        fs.add_dir("dst").unwrap();
+        fs.add_file("dst/basis/a.txt", b"hello world").unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                copy_dest: vec![PathBuf::from("basis")],
+                dry_run: false,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.actions().iter().any(|a| matches!(a,
+            SyncAction::WriteFile { path, len: 11 } if path == &PathBuf::from("dst/a.txt")
+        )));
+        assert_eq!(
+            fs.read_file(Path::new("dst/a.txt")).unwrap(),
+            b"hello world"
+        );
+    }
+
+    #[test]
+    fn link_dest_creates_hardlink_from_basis() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/a.txt", b"hello world").unwrap();
+        fs.add_dir("dst").unwrap();
+        fs.add_file("dst/basis/a.txt", b"hello world").unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                link_dest: vec![PathBuf::from("basis")],
+                dry_run: false,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report.actions().iter().any(|a| matches!(a,
+            SyncAction::CreateHardLink { from, to }
+            if from == &PathBuf::from("dst/basis/a.txt")
+            && to == &PathBuf::from("dst/a.txt")
+        )));
+    }
+
+    #[test]
+    fn link_dest_preferred_over_copy_dest() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/a.txt", b"hello world").unwrap();
+        fs.add_dir("dst").unwrap();
+        fs.add_file("dst/basis_link/a.txt", b"hello world").unwrap();
+        fs.add_file("dst/basis_copy/a.txt", b"hello world").unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                link_dest: vec![PathBuf::from("basis_link")],
+                copy_dest: vec![PathBuf::from("basis_copy")],
+                // dry_run: true is fine for action-only assertions
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        // link-dest should be preferred over copy-dest
+        assert!(report
+            .actions()
+            .iter()
+            .any(|a| matches!(a, SyncAction::CreateHardLink { .. })));
+    }
+
+    #[test]
+    fn sparse_flag_passed_to_sync_options() {
+        let opts = SyncOptions {
+            sparse: true,
+            ..SyncOptions::default()
+        };
+        assert!(opts.sparse);
+        assert!(!opts.preallocate);
+    }
+
+    #[test]
+    fn preallocate_flag_passed_to_sync_options() {
+        let opts = SyncOptions {
+            preallocate: true,
+            ..SyncOptions::default()
+        };
+        assert!(opts.preallocate);
+        assert!(!opts.sparse);
+    }
+
+    #[test]
+    fn fuzzy_uses_similar_destination_file_as_basis_before_transfer() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/report-final.txt", b"new report").unwrap();
+        fs.add_file("dst/report-old.txt", b"old report").unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                fuzzy: true,
+                dry_run: false,
+                preserve_mtime: false,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(report
+            .warnings()
+            .any(|a| matches!(a, SyncAction::Warn { message, .. } if message.contains("--fuzzy"))));
+        assert_eq!(
+            fs.read_file(Path::new("dst/report-final.txt")).unwrap(),
+            b"new report"
+        );
+    }
+
+    #[test]
+    fn compare_dest_no_match_does_not_skip() {
+        let mut fs = MemoryFileSystem::new();
+        fs.add_file("src/a.txt", b"new content").unwrap();
+        fs.add_dir("dst").unwrap();
+        fs.add_file("dst/basis/a.txt", b"different content")
+            .unwrap();
+
+        let report = sync_tree(
+            &mut fs,
+            Path::new("src"),
+            Path::new("dst"),
+            SyncOptions {
+                compare_dest: vec![PathBuf::from("basis")],
+                dry_run: false,
+                ..SyncOptions::default()
+            },
+        )
+        .unwrap();
+
+        // Basis file has different content/size, so normal transfer should occur.
+        assert!(report.actions().iter().any(|a| matches!(a,
+            SyncAction::WriteFile { path, len } if path == &PathBuf::from("dst/a.txt") && *len == 11
+        )));
+        assert_eq!(
+            fs.read_file(Path::new("dst/a.txt")).unwrap(),
+            b"new content"
+        );
     }
 }

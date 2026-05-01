@@ -189,10 +189,10 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("crtimes", Some('N'), I),
     flag("omit-dir-times", Some('O'), I),
     flag("omit-link-times", Some('J'), I),
-    flag("super", None, P),
+    flag("super", None, I),
     flag("fake-super", None, I),
-    flag("sparse", Some('S'), P),
-    flag("preallocate", None, P),
+    flag("sparse", Some('S'), I),
+    flag("preallocate", None, I),
     flag("dry-run", Some('n'), I),
     flag("whole-file", Some('W'), I),
     value("checksum-choice", None, I),
@@ -234,10 +234,10 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("size-only", None, I),
     value("modify-window", Some('@'), I),
     value("temp-dir", Some('T'), I),
-    flag("fuzzy", Some('y'), P),
-    value("compare-dest", None, P),
-    value("copy-dest", None, P),
-    value("link-dest", None, P),
+    flag("fuzzy", Some('y'), I),
+    append_value("compare-dest", None, I),
+    append_value("copy-dest", None, I),
+    append_value("link-dest", None, I),
     flag("compress", Some('z'), I),
     value("compression-choice", None, I),
     value("compress-choice", None, I),
@@ -260,7 +260,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("secluded-args", Some('s'), I),
     flag("protect-args", None, I),
     flag("trust-sender", None, I),
-    value("copy-as", None, P),
+    value("copy-as", None, I),
     value("address", None, I),
     value("port", None, I),
     value("sockopts", None, I),
@@ -292,9 +292,9 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     value("time-limit", None, P),
     value("stop-at", None, P),
     flag("fsync", None, I),
-    value("write-batch", None, P),
-    value("only-write-batch", None, P),
-    value("read-batch", None, P),
+    value("write-batch", None, I),
+    value("only-write-batch", None, I),
+    value("read-batch", None, I),
     value("protocol", None, P),
     value("iconv", None, P),
     value("checksum-seed", None, I),
@@ -799,6 +799,18 @@ impl Default for Cli {
             ipv4: false,
             ipv6: false,
             accepted_unsupported_options: Vec::new(),
+            // Chunk 12
+            compare_dest: Vec::new(),
+            copy_dest: Vec::new(),
+            link_dest: Vec::new(),
+            sparse: false,
+            preallocate: false,
+            fuzzy: false,
+            copy_as: None,
+            super_flag: false,
+            write_batch: None,
+            only_write_batch: None,
+            read_batch: None,
             paths: Vec::new(),
         }
     }
@@ -947,7 +959,7 @@ fn apply_short_option(cli: &mut Cli, option: char, value: Option<&str>) -> Resul
         'N' => cli.crtimes = true,
         'O' => cli.omit_dir_times = true,
         'J' => cli.omit_link_times = true,
-        'S' => remember_unsupported(cli, "--sparse"),
+        'S' => cli.sparse = true,
         'n' => cli.dry_run = true,
         'W' => cli.whole_file = true,
         'x' => cli.one_file_system = true,
@@ -956,7 +968,7 @@ fn apply_short_option(cli: &mut Cli, option: char, value: Option<&str>) -> Resul
         'I' => cli.ignore_times = true,
         '@' => cli.modify_window = parse_i64(value.expect("value checked"), "--modify-window")?,
         'T' => cli.temp_dir = Some(value.expect("value checked").to_string()),
-        'y' => remember_unsupported(cli, "--fuzzy"),
+        'y' => cli.fuzzy = true,
         'z' => cli.compress = true,
         'C' => cli.cvs_exclude = true,
         'f' => cli.filters.push(value.expect("value checked").to_string()),
@@ -1315,6 +1327,26 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         }
         "out-format" => cli.out_format = Some(required_value(name, value)?.to_string()),
         "8-bit-output" => cli.eight_bit_output = true,
+        // Chunk 12
+        "compare-dest" => cli
+            .compare_dest
+            .push(required_value(name, value)?.to_string()),
+        "copy-dest" => cli.copy_dest.push(required_value(name, value)?.to_string()),
+        "link-dest" => cli.link_dest.push(required_value(name, value)?.to_string()),
+        "sparse" => cli.sparse = true,
+        "preallocate" => cli.preallocate = true,
+        "fuzzy" => cli.fuzzy = true,
+        "copy-as" => cli.copy_as = Some(required_value(name, value)?.to_string()),
+        "super" => cli.super_flag = true,
+        "write-batch" => {
+            cli.write_batch = Some(PathBuf::from(required_value(name, value)?));
+        }
+        "only-write-batch" => {
+            cli.only_write_batch = Some(PathBuf::from(required_value(name, value)?));
+        }
+        "read-batch" => {
+            cli.read_batch = Some(PathBuf::from(required_value(name, value)?));
+        }
         other => remember_unsupported(cli, &format!("--{other}")),
     }
 
@@ -1472,7 +1504,11 @@ fn apply_negated_option(cli: &mut Cli, name: &str) -> Result<()> {
         "trust-sender" => cli.trust_sender = false,
         "ipv4" | "4" => cli.ipv4 = false,
         "ipv6" | "6" => cli.ipv6 = false,
-        "super" | "iconv" => remember_unsupported(cli, &format!("--no-{name}")),
+        "iconv" => remember_unsupported(cli, &format!("--no-{name}")),
+        "sparse" | "S" => cli.sparse = false,
+        "preallocate" => cli.preallocate = false,
+        "fuzzy" | "y" => cli.fuzzy = false,
+        "super" => cli.super_flag = false,
         "perms" | "p" => {
             cli.preserve_permissions = false;
             cli.no_permissions = true;

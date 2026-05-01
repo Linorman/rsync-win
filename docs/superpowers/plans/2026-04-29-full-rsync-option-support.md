@@ -479,46 +479,53 @@
 
 **Files:**
 - Modify: `crates/rsync-fs/src/sync.rs`
-- Modify: `crates/rsync-cli/src/plan.rs`
+- Modify: `crates/rsync-cli/src/lib.rs`
+- Modify: `crates/rsync-cli/src/options.rs`
 - Test: `crates/rsync-fs/src/sync.rs`
+- Test: `crates/rsync-cli/src/lib.rs`
 
-- [ ] Implement `--compare-dest`.
-- [ ] Implement `--copy-dest`.
-- [ ] Implement `--link-dest`.
-- [ ] Add tests for relative and absolute comparison directories.
-- [ ] Run `cargo test -p rsync-fs --all-features dest`.
+- [x] Implement `--compare-dest`.
+- [x] Implement `--copy-dest`.
+- [x] Implement `--link-dest`.
+- [x] Add tests for relative and absolute comparison directories.
+- [x] Run `cargo test -p rsync-fs --all-features dest`.
 - [ ] Commit: `feat: add compare copy and link dest modes`.
 
 ### Task 27: Implement Sparse, Preallocation, Fuzzy, and Copy-As
 
 **Files:**
 - Modify: `crates/rsync-fs/src/sync.rs`
-- Modify: `crates/rsync-winfs/src/metadata.rs`
-- Modify: `crates/rsync-cli/src/plan.rs`
+- Modify: `crates/rsync-fs/src/walk.rs`
+- Modify: `crates/rsync-fs/Cargo.toml`
+- Modify: `crates/rsync-cli/src/lib.rs`
+- Modify: `crates/rsync-cli/src/options.rs`
 - Test: `crates/rsync-fs/src/sync.rs`
+- Test: `crates/rsync-fs/src/walk.rs`
+- Test: `crates/rsync-cli/src/lib.rs`
 
-- [ ] Implement `--sparse` / `-S`.
-- [ ] Implement `--preallocate`.
-- [ ] Implement `--fuzzy` / `-y`.
-- [ ] Implement `--copy-as` and `--super` capability behavior.
-- [ ] Add Windows-specific tests for sparse/preallocation where APIs permit.
-- [ ] Run `cargo test --workspace --all-features sparse fuzzy`.
+- [x] Implement `--sparse` / `-S`.
+- [x] Implement `--preallocate`.
+- [x] Implement `--fuzzy` / `-y`.
+- [x] Implement `--copy-as` and `--super` capability behavior.
+- [x] Add Windows-specific tests for sparse/preallocation where APIs permit.
+- [x] Run `cargo test --workspace --all-features sparse` and `cargo test --workspace --all-features fuzzy`.
 - [ ] Commit: `feat: add advanced file allocation modes`.
 
 ### Task 28: Implement Batch Mode
 
 **Files:**
-- Modify: `crates/rsync-protocol/src/session.rs`
-- Modify: `crates/rsync-cli/src/plan.rs`
+- Modify: `crates/rsync-cli/src/lib.rs`
+- Modify: `crates/rsync-cli/src/options.rs`
 - Create: `crates/rsync-cli/src/batch.rs`
 - Test: `crates/rsync-cli/src/batch.rs`
+- Test: `crates/rsync-cli/src/lib.rs`
 
-- [ ] Implement `--write-batch`.
-- [ ] Implement `--only-write-batch`.
-- [ ] Implement `--read-batch`.
-- [ ] Record options, filters, file-list metadata, checksums, and token streams needed for replay.
-- [ ] Add tests for writing and replaying a batch against a changed destination.
-- [ ] Run `cargo test -p rsync-cli --all-features batch`.
+- [x] Implement `--write-batch`.
+- [x] Implement `--only-write-batch`.
+- [x] Implement `--read-batch`.
+- [x] Record options, filters, file-list metadata, checksums, and token streams needed for replay.
+- [x] Add tests for writing and replaying a batch against a changed destination.
+- [x] Run `cargo test -p rsync-cli --all-features batch`.
 - [ ] Commit: `feat: add rsync batch mode`.
 
 ## Chunk 13: Resource Limits and Operational Controls

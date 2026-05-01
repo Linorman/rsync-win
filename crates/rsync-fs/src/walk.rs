@@ -25,6 +25,8 @@ pub struct FileWriteOptions {
     pub partial_dir: Option<PathBuf>,
     pub temp_dir: Option<PathBuf>,
     pub fsync: bool,
+    pub sparse: bool,
+    pub preallocate: bool,
 }
 
 impl Default for FileWriteOptions {
@@ -35,6 +37,8 @@ impl Default for FileWriteOptions {
             partial_dir: None,
             temp_dir: None,
             fsync: false,
+            sparse: false,
+            preallocate: false,
         }
     }
 }
@@ -679,11 +683,21 @@ impl PortableFileSystem for LocalFileSystem {
     }
 
     fn write_file_atomic(&mut self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
-        self.write_file_atomic_to_temp(path, bytes, None, false, true)
+        let options = FileWriteOptions {
+            mode: FileWriteMode::Atomic,
+            fsync: true,
+            ..Default::default()
+        };
+        self.write_file_atomic_with_options(path, bytes, &options)
     }
 
     fn write_file_direct(&mut self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
-        self.write_file_direct_with_fsync(path, bytes, true)
+        let options = FileWriteOptions {
+            mode: FileWriteMode::InPlace,
+            fsync: true,
+            ..Default::default()
+        };
+        self.write_file_direct_with_options(path, bytes, &options)
     }
 
     fn write_file_with_options(
@@ -693,17 +707,8 @@ impl PortableFileSystem for LocalFileSystem {
         options: &FileWriteOptions,
     ) -> Result<(), FsError> {
         match options.mode {
-            FileWriteMode::Atomic => self.write_file_atomic_to_temp(
-                path,
-                bytes,
-                options
-                    .temp_dir
-                    .as_deref()
-                    .or(options.partial_dir.as_deref()),
-                options.keep_partial || options.partial_dir.is_some(),
-                options.fsync,
-            ),
-            FileWriteMode::InPlace => self.write_file_direct_with_fsync(path, bytes, options.fsync),
+            FileWriteMode::Atomic => self.write_file_atomic_with_options(path, bytes, options),
+            FileWriteMode::InPlace => self.write_file_direct_with_options(path, bytes, options),
         }
     }
 
@@ -728,17 +733,8 @@ impl PortableFileSystem for LocalFileSystem {
         options: &FileWriteOptions,
     ) -> Result<u64, FsError> {
         match options.mode {
-            FileWriteMode::Atomic => self.copy_file_atomic_to_temp(
-                source,
-                dest,
-                options
-                    .temp_dir
-                    .as_deref()
-                    .or(options.partial_dir.as_deref()),
-                options.keep_partial || options.partial_dir.is_some(),
-                options.fsync,
-            ),
-            FileWriteMode::InPlace => self.copy_file_direct_with_fsync(source, dest, options.fsync),
+            FileWriteMode::Atomic => self.copy_file_atomic_with_options(source, dest, options),
+            FileWriteMode::InPlace => self.copy_file_direct_with_options(source, dest, options),
         }
     }
 
@@ -838,44 +834,51 @@ impl PortableFileSystem for LocalFileSystem {
 }
 
 impl LocalFileSystem {
-    fn write_file_direct_with_fsync(
+    fn write_file_direct_with_options(
         &mut self,
         path: &Path,
         bytes: &[u8],
-        fsync: bool,
+        options: &FileWriteOptions,
     ) -> Result<(), FsError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(local_os_path(parent))?;
         }
 
         let mut file = File::create(local_os_path(path))?;
+        apply_sparse_and_preallocate(&file, path, bytes.len() as u64, options)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         file.write_all(bytes)?;
-        if fsync {
+        if options.fsync {
             file.sync_all()?;
         }
         Ok(())
     }
 
-    fn write_file_atomic_to_temp(
+    fn write_file_atomic_with_options(
         &mut self,
         path: &Path,
         bytes: &[u8],
-        partial_dir: Option<&Path>,
-        keep_partial: bool,
-        fsync: bool,
+        options: &FileWriteOptions,
     ) -> Result<(), FsError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(local_os_path(parent))?;
         }
 
+        let partial_dir = options
+            .temp_dir
+            .as_deref()
+            .or(options.partial_dir.as_deref());
+        let keep_partial = options.keep_partial || options.partial_dir.is_some();
         let temp_path = temp_path_for(path, partial_dir);
         if let Some(parent) = temp_path.parent() {
             fs::create_dir_all(local_os_path(parent))?;
         }
-        let write_result = (|| {
+        let write_result = (|| -> io::Result<()> {
             let mut file = File::create(local_os_path(&temp_path))?;
+            apply_sparse_and_preallocate(&file, &temp_path, bytes.len() as u64, options)
+                .map_err(|e| io::Error::other(e.to_string()))?;
             file.write_all(bytes)?;
-            if fsync {
+            if options.fsync {
                 file.sync_all()?;
             }
             replace_file(&temp_path, path)
@@ -888,51 +891,48 @@ impl LocalFileSystem {
         write_result.map_err(FsError::Io)
     }
 
-    fn copy_file_direct(&mut self, source: &Path, dest: &Path) -> Result<u64, FsError> {
-        self.copy_file_direct_with_fsync(source, dest, true)
-    }
-
-    fn copy_file_direct_with_fsync(
+    fn copy_file_direct_with_options(
         &mut self,
         source: &Path,
         dest: &Path,
-        fsync: bool,
+        options: &FileWriteOptions,
     ) -> Result<u64, FsError> {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(local_os_path(parent))?;
         }
 
+        let source_len = fs::metadata(local_os_path(source))?.len();
         let mut input = File::open(local_os_path(source))?;
         let mut output = File::create(local_os_path(dest))?;
+        apply_sparse_and_preallocate(&output, dest, source_len, options)?;
         let copied = copy_stream_bounded(&mut input, &mut output)?;
-        if fsync {
+        if options.fsync {
             output.sync_all()?;
         }
         Ok(copied)
     }
 
-    fn copy_file_atomic_to_temp(
+    fn copy_file_atomic_with_options(
         &mut self,
         source: &Path,
         dest: &Path,
-        partial_dir: Option<&Path>,
-        keep_partial: bool,
-        fsync: bool,
+        options: &FileWriteOptions,
     ) -> Result<u64, FsError> {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(local_os_path(parent))?;
         }
 
+        let partial_dir = options
+            .temp_dir
+            .as_deref()
+            .or(options.partial_dir.as_deref());
+        let keep_partial = options.keep_partial || options.partial_dir.is_some();
         let temp_path = temp_path_for(dest, partial_dir);
         if let Some(parent) = temp_path.parent() {
             fs::create_dir_all(local_os_path(parent))?;
         }
         let write_result = (|| {
-            let copied = if fsync {
-                self.copy_file_direct(source, &temp_path)?
-            } else {
-                copy_file_direct_without_fsync(source, &temp_path)?
-            };
+            let copied = self.copy_file_direct_with_options(source, &temp_path, options)?;
             replace_file(&temp_path, dest)?;
             Ok(copied)
         })();
@@ -945,14 +945,73 @@ impl LocalFileSystem {
     }
 }
 
-fn copy_file_direct_without_fsync(source: &Path, dest: &Path) -> Result<u64, FsError> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(local_os_path(parent))?;
+#[cfg(windows)]
+fn apply_sparse_and_preallocate(
+    file: &File,
+    _path: &Path,
+    file_len: u64,
+    options: &FileWriteOptions,
+) -> Result<(), FsError> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileAllocationInfo, SetFileInformationByHandle, FILE_ALLOCATION_INFO,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+
+    if options.sparse && file_len > 0 {
+        let mut _unused: u32 = 0;
+        let result = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle() as _,
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut _unused,
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            return Err(FsError::Io(io::Error::last_os_error()));
+        }
     }
 
-    let mut input = File::open(local_os_path(source))?;
-    let mut output = File::create(local_os_path(dest))?;
-    Ok(copy_stream_bounded(&mut input, &mut output)?)
+    if options.preallocate && !options.sparse && file_len > 0 {
+        let alloc_info = FILE_ALLOCATION_INFO {
+            AllocationSize: file_len as i64,
+        };
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as _,
+                FileAllocationInfo,
+                &alloc_info as *const _ as _,
+                size_of::<FILE_ALLOCATION_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(FsError::Io(io::Error::last_os_error()));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn apply_sparse_and_preallocate(
+    _file: &File,
+    _path: &Path,
+    _file_len: u64,
+    _options: &FileWriteOptions,
+) -> Result<(), FsError> {
+    // Non-Windows platforms: sparse and preallocate are no-ops at the
+    // PortableFileSystem trait level.  Platform-specific filesystem
+    // crates can implement these via sidecar metadata.
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1509,6 +1568,53 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn local_sparse_write_marks_file_sparse() {
+        let root = unique_temp_dir("rsync-fs-sparse");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sparse.bin");
+
+        let mut fs_adapter = LocalFileSystem;
+        fs_adapter
+            .write_file_with_options(
+                &path,
+                &[0; 4096],
+                &FileWriteOptions {
+                    sparse: true,
+                    ..FileWriteOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert!(file_has_sparse_attribute(&path));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_preallocate_write_preserves_file_length() {
+        let root = unique_temp_dir("rsync-fs-preallocate");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("preallocated.bin");
+
+        let mut fs_adapter = LocalFileSystem;
+        fs_adapter
+            .write_file_with_options(
+                &path,
+                b"preallocated",
+                &FileWriteOptions {
+                    preallocate: true,
+                    ..FileWriteOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().len(), 12);
+        assert_eq!(fs::read(&path).unwrap(), b"preallocated");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn local_filesystem_handles_windows_long_paths_without_leaking_verbatim_prefixes() {
         let root = unique_temp_dir("rsync-fs-long-path");
         let mut long_dir = root.clone();
@@ -1629,5 +1735,24 @@ mod tests {
             .unwrap_or_default();
         path.push(format!("{prefix}-{}-{nanos}", std::process::id()));
         path
+    }
+
+    #[cfg(windows)]
+    fn file_has_sparse_attribute(path: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileAttributesW, FILE_ATTRIBUTE_SPARSE_FILE,
+        };
+
+        let os_path = local_os_path(path);
+        let wide: Vec<u16> = os_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        assert_ne!(attrs, u32::MAX);
+        attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0
     }
 }

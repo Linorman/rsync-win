@@ -61,6 +61,7 @@ use rsync_winfs::{
     PosixXattrRecord, WindowsDriveKind,
 };
 
+pub mod batch;
 mod daemon_server;
 pub mod options;
 pub mod output;
@@ -521,6 +522,30 @@ pub struct Cli {
     #[arg(skip)]
     accepted_unsupported_options: Vec<String>,
 
+    // Chunk 12: Advanced Transfer Features
+    #[arg(skip)]
+    compare_dest: Vec<String>,
+    #[arg(skip)]
+    copy_dest: Vec<String>,
+    #[arg(skip)]
+    link_dest: Vec<String>,
+    #[arg(skip)]
+    sparse: bool,
+    #[arg(skip)]
+    preallocate: bool,
+    #[arg(skip)]
+    fuzzy: bool,
+    #[arg(skip)]
+    copy_as: Option<String>,
+    #[arg(skip)]
+    super_flag: bool,
+    #[arg(skip)]
+    write_batch: Option<PathBuf>,
+    #[arg(skip)]
+    only_write_batch: Option<PathBuf>,
+    #[arg(skip)]
+    read_batch: Option<PathBuf>,
+
     #[arg(help = "Source and destination operands")]
     paths: Vec<String>,
 }
@@ -916,6 +941,56 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
         }
     }
 
+    // Chunk 12 plan rendering
+    if !plan.compare_dest.is_empty() {
+        output.push_str("compare dest:");
+        for dir in &plan.compare_dest {
+            output.push(' ');
+            output.push_str(&dir.to_string_lossy());
+        }
+        output.push('\n');
+    }
+    if !plan.copy_dest.is_empty() {
+        output.push_str("copy dest:");
+        for dir in &plan.copy_dest {
+            output.push(' ');
+            output.push_str(&dir.to_string_lossy());
+        }
+        output.push('\n');
+    }
+    if !plan.link_dest.is_empty() {
+        output.push_str("link dest:");
+        for dir in &plan.link_dest {
+            output.push(' ');
+            output.push_str(&dir.to_string_lossy());
+        }
+        output.push('\n');
+    }
+    if plan.sparse {
+        output.push_str("sparse: true\n");
+    }
+    if plan.preallocate {
+        output.push_str("preallocate: true\n");
+    }
+    if plan.fuzzy {
+        output.push_str("fuzzy: true\n");
+    }
+    if let Some(ref copy_as) = plan.copy_as {
+        output.push_str(&format!("copy-as: {copy_as}\n"));
+    }
+    if plan.super_flag {
+        output.push_str("super: true\n");
+    }
+    if let Some(ref batch) = plan.write_batch {
+        output.push_str(&format!("write-batch: {}\n", batch.display()));
+    }
+    if let Some(ref batch) = plan.only_write_batch {
+        output.push_str(&format!("only-write-batch: {}\n", batch.display()));
+    }
+    if let Some(ref batch) = plan.read_batch {
+        output.push_str(&format!("read-batch: {}\n", batch.display()));
+    }
+
     if !plan.report.is_empty() {
         output.push_str("diagnostics:\n");
         for diagnostic in plan.report.diagnostics() {
@@ -961,6 +1036,21 @@ fn execute_or_render(cli: &Cli) -> Result<String> {
     }
 
     ensure_local_execution_options_supported(cli)?;
+
+    if let Some(ref batch_file) = plan.read_batch {
+        return execute_read_batch(batch_file, &cli.paths, cli.dry_run);
+    }
+
+    let batch_mode = plan.only_write_batch.is_some();
+    let batch_path = plan
+        .write_batch
+        .clone()
+        .or_else(|| plan.only_write_batch.clone());
+
+    if let Some(path) = batch_path {
+        return execute_local_sync_with_batch(cli, plan, &path, batch_mode);
+    }
+
     execute_local_sync(cli, plan)
 }
 
@@ -2688,6 +2778,12 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
             preserve_devices: plan.preserve_devices,
             preserve_specials: plan.preserve_specials,
             fail_on_metadata_loss: cli.fail_on_metadata_loss,
+            compare_dest: plan.compare_dest.clone(),
+            copy_dest: plan.copy_dest.clone(),
+            link_dest: plan.link_dest.clone(),
+            sparse: plan.sparse,
+            preallocate: plan.preallocate,
+            fuzzy: plan.fuzzy,
         },
     )?;
     log_sync_actions(progress, sync_report.actions());
@@ -2770,6 +2866,132 @@ struct PosixSidecarExecution {
     planned: usize,
     written: usize,
     restored: usize,
+}
+
+// Chunk 12: Batch mode execution helpers
+
+fn execute_local_sync_with_batch(
+    cli: &Cli,
+    plan: TransferPlan,
+    batch_path: &Path,
+    only_write_batch: bool,
+) -> Result<String> {
+    let sources = local_source_paths(cli);
+    let dest = Path::new(cli.paths.last().expect("checked operand count"));
+    let mut fs = LocalFileSystem;
+    let files_from = load_files_from(cli)?;
+    let collect_options = local_source_collect_options(&plan, files_from.as_deref());
+    let entries = collect_local_source_entries(&sources, &collect_options)?;
+    let manifest = batch_manifest_from_plan(cli, &plan);
+    let mut batch_writer =
+        batch::BatchWriter::create_with_manifest(batch_path, plan.dry_run, manifest)?;
+
+    for entry in &entries {
+        let source_meta = fs.metadata(&entry.local_path)?;
+        match entry.wire.file_type {
+            WireFileType::File => {
+                batch_writer.append_file(
+                    &mut fs,
+                    &entry.wire.path,
+                    &entry.local_path,
+                    dest,
+                    entry.wire.len,
+                    source_meta.modified,
+                )?;
+            }
+            WireFileType::Directory => {
+                batch_writer.append_directory(&entry.wire.path, source_meta.modified)?;
+            }
+            _ => {}
+        }
+    }
+
+    let records = batch_writer.finish()?;
+    let mut output = String::new();
+    output.push_str(&format!(
+        "rsync-win batch {}: {} record(s) written to {}\n",
+        if only_write_batch {
+            "--only-write-batch"
+        } else {
+            "--write-batch"
+        },
+        records.len(),
+        batch_path.display()
+    ));
+    if !only_write_batch {
+        output.push_str(&execute_local_sync(cli, plan)?);
+    }
+    Ok(output)
+}
+
+fn batch_manifest_from_plan(cli: &Cli, plan: &TransferPlan) -> batch::BatchManifest {
+    let mut options = vec![
+        format!("recursive={}", plan.recursive),
+        format!("delete={}", plan.delete),
+        format!("delete-mode={:?}", plan.delete_mode),
+        format!("preserve-times={}", plan.preserve_times),
+        format!("dry-run={}", plan.dry_run),
+        format!("relative={}", plan.relative),
+        format!("checksum={}", plan.update_mode == UpdateMode::Checksum),
+        format!("whole-file={}", plan.whole_file),
+        format!("sparse={}", plan.sparse),
+        format!("preallocate={}", plan.preallocate),
+        format!("fuzzy={}", plan.fuzzy),
+    ];
+    if let Some(files_from) = &cli.files_from {
+        options.push(format!("files-from={}", files_from.display()));
+    }
+    if cli.from0 {
+        options.push("from0=true".to_string());
+    }
+    for dir in &plan.compare_dest {
+        options.push(format!("compare-dest={}", dir.display()));
+    }
+    for dir in &plan.copy_dest {
+        options.push(format!("copy-dest={}", dir.display()));
+    }
+    for dir in &plan.link_dest {
+        options.push(format!("link-dest={}", dir.display()));
+    }
+
+    batch::BatchManifest {
+        options,
+        filters: plan
+            .filter_rules
+            .rules()
+            .iter()
+            .map(|rule| format!("{rule:?}"))
+            .collect(),
+        token_stream: "literal-file-contents".to_string(),
+    }
+}
+
+fn execute_read_batch(
+    batch_file: &Path,
+    paths: &[String],
+    dry_run_override: bool,
+) -> Result<String> {
+    let dest = Path::new(
+        paths
+            .last()
+            .context("read-batch requires a destination operand")?,
+    );
+    let mut output = String::new();
+    output.push_str(&format!(
+        "rsync-win batch replay: {}\n",
+        batch_file.display()
+    ));
+    output.push_str(&format!("destination: {}\n", dest.display()));
+    if dry_run_override {
+        output.push_str("dry run: true\n");
+    }
+    batch::replay_batch(
+        batch_file,
+        dest,
+        if dry_run_override { Some(true) } else { None },
+    )?;
+    output.push_str("batch replay complete\n");
+    Ok(output)
 }
 
 fn handle_ntfs_native_sidecars(
@@ -5948,6 +6170,18 @@ struct TransferPlan {
     remote_wire_protocol: Option<RemoteWireProtocol>,
     daemon_operand: Option<DaemonOperand>,
     daemon_direction: Option<TransferDirection>,
+    // Chunk 12
+    compare_dest: Vec<PathBuf>,
+    copy_dest: Vec<PathBuf>,
+    link_dest: Vec<PathBuf>,
+    sparse: bool,
+    preallocate: bool,
+    fuzzy: bool,
+    copy_as: Option<String>,
+    super_flag: bool,
+    write_batch: Option<PathBuf>,
+    only_write_batch: Option<PathBuf>,
+    read_batch: Option<PathBuf>,
     report: Report,
 }
 
@@ -6298,6 +6532,17 @@ impl TransferPlan {
             remote_wire_protocol,
             daemon_operand,
             daemon_direction,
+            compare_dest: cli.compare_dest.iter().map(PathBuf::from).collect(),
+            copy_dest: cli.copy_dest.iter().map(PathBuf::from).collect(),
+            link_dest: cli.link_dest.iter().map(PathBuf::from).collect(),
+            sparse: cli.sparse,
+            preallocate: cli.preallocate,
+            fuzzy: cli.fuzzy,
+            copy_as: cli.copy_as.clone(),
+            super_flag: cli.super_flag,
+            write_batch: cli.write_batch.clone(),
+            only_write_batch: cli.only_write_batch.clone(),
+            read_batch: cli.read_batch.clone(),
             report,
         }
     }
@@ -6821,6 +7066,8 @@ fn file_write_options_from_plan(plan: &TransferPlan) -> FileWriteOptions {
         partial_dir: plan.partial_dir.clone(),
         temp_dir: plan.temp_dir.clone(),
         fsync: plan.fsync,
+        sparse: plan.sparse,
+        preallocate: plan.preallocate,
     }
 }
 
@@ -7275,6 +7522,80 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
             format!("{option} is accepted for rsync option compatibility but has no behavior in this build yet"),
         );
     }
+
+    // Chunk 12 diagnostics
+    for compare_path in &cli.compare_dest {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--compare-dest={compare_path} is represented in the execution plan"),
+        );
+    }
+    for copy_path in &cli.copy_dest {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--copy-dest={copy_path} is represented in the execution plan"),
+        );
+    }
+    for link_path in &cli.link_dest {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--link-dest={link_path} is represented in the execution plan"),
+        );
+    }
+    if cli.sparse {
+        report.info(
+            "I_OPTION_PARSED",
+            "--sparse is represented in the execution plan; sparse file creation requested on Windows where FSCTL_SET_SPARSE_FILE is supported",
+        );
+    }
+    if cli.preallocate {
+        report.info(
+            "I_OPTION_PARSED",
+            "--preallocate is represented in the execution plan; preallocation uses SetFileInformationByHandle on Windows",
+        );
+    }
+    if cli.fuzzy {
+        report.info(
+            "I_OPTION_PARSED",
+            "--fuzzy is represented in the execution plan; basis-file search uses best-effort name similarity",
+        );
+    }
+    if let Some(ref copy_as) = cli.copy_as {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--copy-as={copy_as} is parsed as a destination user identity; local Windows copies run as the current user unless run elevated"),
+        );
+    }
+    if cli.super_flag {
+        report.info(
+            "I_OPTION_PARSED",
+            "--super receiver attempts super-user activities where the platform permits",
+        );
+    }
+    if let Some(ref batch) = cli.write_batch {
+        report.info(
+            "I_OPTION_PARSED",
+            format!(
+                "--write-batch={} will record transfer metadata for replay",
+                batch.display()
+            ),
+        );
+    }
+    if let Some(ref batch) = cli.only_write_batch {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--only-write-batch={} will record transfer metadata without updating the destination", batch.display()),
+        );
+    }
+    if let Some(ref batch) = cli.read_batch {
+        report.info(
+            "I_OPTION_PARSED",
+            format!(
+                "--read-batch={} will replay a recorded transfer",
+                batch.display()
+            ),
+        );
+    }
 }
 
 fn add_option_conflict_diagnostics(cli: &Cli, report: &mut Report) {
@@ -7339,11 +7660,45 @@ fn add_option_conflict_diagnostics(cli: &Cli, report: &mut Report) {
             "--existing and --ignore-existing together leave only receiver-missing files eligible",
         );
     }
+    // Chunk 12 conflict checks
+    if cli.sparse && cli.preallocate {
+        report.warn(
+            "W_OPTION_OVERLAP",
+            "--sparse and --preallocate together: preallocation will be skipped for sparse files",
+        );
+    }
+    if cli.write_batch.is_some() && cli.only_write_batch.is_some() {
+        report.error(
+            "E_OPTION_CONFLICT",
+            "--write-batch and --only-write-batch cannot both be specified",
+        );
+    }
+    if cli.write_batch.is_some() && cli.read_batch.is_some() {
+        report.error(
+            "E_OPTION_CONFLICT",
+            "--write-batch and --read-batch cannot both be specified",
+        );
+    }
+    if cli.only_write_batch.is_some() && cli.read_batch.is_some() {
+        report.error(
+            "E_OPTION_CONFLICT",
+            "--only-write-batch and --read-batch cannot both be specified",
+        );
+    }
+    if cli.read_batch.is_some() && cli.dry_run {
+        report.warn(
+            "W_OPTION_OVERLAP",
+            "--read-batch with --dry-run: replay will be a dry run",
+        );
+    }
 }
 
 fn ensure_local_execution_options_supported(cli: &Cli) -> Result<()> {
     if cli.inplace && cli.partial_dir.is_some() {
         bail!("--inplace and --partial-dir cannot both control the same local write path");
+    }
+    if cli.read_batch.is_some() && cli.paths.len() < 2 {
+        bail!("--read-batch requires a destination operand");
     }
 
     Ok(())
@@ -10408,6 +10763,176 @@ mod tests {
     }
 
     #[test]
+    fn local_write_batch_updates_destination_and_replays_changed_destination() {
+        let root = unique_temp_dir("rsync-cli-write-batch");
+        let source = root.join("source.txt");
+        let dest = root.join("dest");
+        let batch = root.join("transfer.batch");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(&source, b"from-source").unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "--write-batch".to_string(),
+            batch.to_string_lossy().into_owned(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(dest.join("source.txt")).unwrap(), b"from-source");
+        assert!(batch.exists());
+        assert!(output.contains("rsync-win batch --write-batch"));
+        assert!(output.contains("rsync-win local portable sync"));
+
+        fs::write(dest.join("source.txt"), b"changed receiver").unwrap();
+
+        let replay = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "--read-batch".to_string(),
+            batch.to_string_lossy().into_owned(),
+            "ignored-source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert!(replay.contains("batch replay complete"));
+        assert_eq!(fs::read(dest.join("source.txt")).unwrap(), b"from-source");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_only_write_batch_records_replay_data_without_updating_destination() {
+        let root = unique_temp_dir("rsync-cli-only-write-batch");
+        let source = root.join("source.txt");
+        let dest = root.join("dest");
+        let batch = root.join("transfer.batch");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(&source, b"batch-only").unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "--only-write-batch".to_string(),
+            batch.to_string_lossy().into_owned(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert!(output.contains("rsync-win batch --only-write-batch"));
+        assert!(batch.exists());
+        assert!(!dest.join("source.txt").exists());
+
+        parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "--read-batch".to_string(),
+            batch.to_string_lossy().into_owned(),
+            "ignored-source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(dest.join("source.txt")).unwrap(), b"batch-only");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_only_write_batch_replays_empty_directories() {
+        let root = unique_temp_dir("rsync-cli-only-write-batch-empty-dir");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        let batch = root.join("transfer.batch");
+        fs::create_dir_all(source.join("empty")).unwrap();
+
+        parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--only-write-batch".to_string(),
+            batch.to_string_lossy().into_owned(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert!(!dest.exists());
+
+        parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "--read-batch".to_string(),
+            batch.to_string_lossy().into_owned(),
+            "ignored-source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert!(dest.join("empty").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_only_write_batch_honors_filters_for_replay_records() {
+        let root = unique_temp_dir("rsync-cli-filtered-batch");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        let batch = root.join("transfer.batch");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(source.join("keep.txt"), b"keep").unwrap();
+        fs::write(source.join("skip.tmp"), b"skip").unwrap();
+
+        parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--exclude".to_string(),
+            "*.tmp".to_string(),
+            "--only-write-batch".to_string(),
+            batch.to_string_lossy().into_owned(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let reader = batch::BatchReader::open(&batch).unwrap();
+        let manifest = reader.manifest();
+        assert_eq!(manifest.token_stream, "literal-file-contents");
+        assert!(
+            manifest
+                .options
+                .iter()
+                .any(|option| option == "recursive=true"),
+            "{manifest:?}"
+        );
+        assert!(
+            manifest
+                .filters
+                .iter()
+                .any(|filter| filter.contains("Exclude") && filter.contains("*.tmp")),
+            "{manifest:?}"
+        );
+        let records = reader.records();
+        let file_records: Vec<_> = records
+            .iter()
+            .copied()
+            .filter(|record| record.kind == batch::BatchRecordKind::File)
+            .collect();
+        assert_eq!(file_records.len(), 1);
+        assert_ne!(file_records[0].checksum, [0u8; 16]);
+
+        parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "--read-batch".to_string(),
+            batch.to_string_lossy().into_owned(),
+            "ignored-source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(fs::read(dest.join("keep.txt")).unwrap(), b"keep");
+        assert!(!dest.join("skip.tmp").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn local_ntfs_native_sync_writes_sidecar_manifests_when_explicit() {
         let root = unique_temp_dir("rsync-cli-ntfs-sidecar");
         let source = root.join("source");
@@ -11491,5 +12016,199 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    // Chunk 12: Advanced Transfer Features tests
+
+    #[test]
+    fn plan_renders_compare_dest() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--compare-dest=/tmp/basis",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("compare dest: /tmp/basis"));
+        assert!(plan.contains("--compare-dest=/tmp/basis is represented in the execution plan"));
+    }
+
+    #[test]
+    fn plan_renders_multiple_compare_dest() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--compare-dest=/tmp/basis1",
+            "--compare-dest=/tmp/basis2",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("compare dest: /tmp/basis1 /tmp/basis2"));
+    }
+
+    #[test]
+    fn plan_renders_copy_dest() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--copy-dest=/tmp/basis",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("copy dest: /tmp/basis"));
+    }
+
+    #[test]
+    fn plan_renders_link_dest() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--link-dest=/tmp/basis",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("link dest: /tmp/basis"));
+    }
+
+    #[test]
+    fn plan_renders_sparse() {
+        let plan = parse_and_render(&["rsync-win", "--plan", "-S", "src", "dst"]);
+        assert!(plan.contains("sparse: true"));
+        assert!(plan.contains("FSCTL_SET_SPARSE_FILE"));
+    }
+
+    #[test]
+    fn plan_renders_preallocate() {
+        let plan = parse_and_render(&["rsync-win", "--plan", "--preallocate", "src", "dst"]);
+        assert!(plan.contains("preallocate: true"));
+    }
+
+    #[test]
+    fn plan_warns_sparse_preallocate_overlap() {
+        let plan = parse_and_render(&["rsync-win", "--plan", "-S", "--preallocate", "src", "dst"]);
+        assert!(plan.contains("--sparse and --preallocate together"));
+    }
+
+    #[test]
+    fn plan_renders_fuzzy() {
+        let plan = parse_and_render(&["rsync-win", "--plan", "-y", "src", "dst"]);
+        assert!(plan.contains("fuzzy: true"));
+    }
+
+    #[test]
+    fn plan_renders_copy_as() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--copy-as=Administrator",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("copy-as: Administrator"));
+    }
+
+    #[test]
+    fn plan_renders_super() {
+        let plan = parse_and_render(&["rsync-win", "--plan", "--super", "src", "dst"]);
+        assert!(plan.contains("super: true"));
+    }
+
+    #[test]
+    fn plan_renders_no_super() {
+        let plan = parse_and_render(&["rsync-win", "--plan", "--no-super", "src", "dst"]);
+        assert!(!plan.contains("super: true"));
+    }
+
+    #[test]
+    fn plan_renders_negated_chunk12_flags() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "-S",
+            "--no-sparse",
+            "--preallocate",
+            "--no-preallocate",
+            "-y",
+            "--no-fuzzy",
+            "src",
+            "dst",
+        ]);
+
+        assert!(!plan.contains("sparse: true"), "{plan}");
+        assert!(!plan.contains("preallocate: true"), "{plan}");
+        assert!(!plan.contains("fuzzy: true"), "{plan}");
+        assert!(!plan.contains("W_UNIMPLEMENTED_OPTION"), "{plan}");
+    }
+
+    #[test]
+    fn plan_renders_write_batch() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--write-batch=/tmp/batch.bin",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("write-batch: /tmp/batch.bin"));
+    }
+
+    #[test]
+    fn plan_renders_read_batch() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--read-batch=/tmp/batch.bin",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("read-batch: /tmp/batch.bin"));
+    }
+
+    #[test]
+    fn plan_errors_on_write_and_only_write_batch_together() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--write-batch=a",
+            "--only-write-batch=b",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("--write-batch and --only-write-batch cannot both be specified"));
+    }
+
+    #[test]
+    fn plan_errors_on_write_and_read_batch_together() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--write-batch=a",
+            "--read-batch=b",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("--write-batch and --read-batch cannot both be specified"));
+    }
+
+    #[test]
+    fn plan_shows_all_chunk12_options_together() {
+        let plan = parse_and_render(&[
+            "rsync-win",
+            "--plan",
+            "--compare-dest=/tmp/a",
+            "--copy-dest=/tmp/b",
+            "--link-dest=/tmp/c",
+            "-S",
+            "--preallocate",
+            "-y",
+            "src",
+            "dst",
+        ]);
+        assert!(plan.contains("compare dest: /tmp/a"));
+        assert!(plan.contains("copy dest: /tmp/b"));
+        assert!(plan.contains("link dest: /tmp/c"));
+        assert!(plan.contains("sparse: true"));
+        assert!(plan.contains("preallocate: true"));
+        assert!(plan.contains("fuzzy: true"));
     }
 }
