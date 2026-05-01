@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rsync_fs::DeleteMode;
 
 use crate::{Cli, CliMetadataPolicy};
@@ -28,12 +28,13 @@ pub enum OptionScope {
     Project,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImplementationStatus {
-    Implemented,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OptionSupport {
+    Full,
+    Partial,
+    DiagnosticOnly,
+    ParsedOnly,
     Planned,
-    CapabilityGated,
-    ExplicitDiagnostic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +47,7 @@ pub struct OptionSpec {
     pub negatable: bool,
     pub scope: OptionScope,
     pub notes: &'static str,
-    pub status: ImplementationStatus,
+    pub support: OptionSupport,
 }
 
 const fn spec(
@@ -56,7 +57,7 @@ const fn spec(
     repeat: RepeatBehavior,
     negatable: bool,
     scope: OptionScope,
-    status: ImplementationStatus,
+    support: OptionSupport,
 ) -> OptionSpec {
     OptionSpec {
         long,
@@ -67,11 +68,11 @@ const fn spec(
         negatable,
         scope,
         notes: "",
-        status,
+        support,
     }
 }
 
-const fn flag(long: &'static str, short: Option<char>, status: ImplementationStatus) -> OptionSpec {
+const fn flag(long: &'static str, short: Option<char>, support: OptionSupport) -> OptionSpec {
     spec(
         long,
         short,
@@ -79,15 +80,11 @@ const fn flag(long: &'static str, short: Option<char>, status: ImplementationSta
         RepeatBehavior::LastWins,
         true,
         OptionScope::Client,
-        status,
+        support,
     )
 }
 
-const fn value(
-    long: &'static str,
-    short: Option<char>,
-    status: ImplementationStatus,
-) -> OptionSpec {
+const fn value(long: &'static str, short: Option<char>, support: OptionSupport) -> OptionSpec {
     spec(
         long,
         short,
@@ -95,14 +92,14 @@ const fn value(
         RepeatBehavior::LastWins,
         false,
         OptionScope::Client,
-        status,
+        support,
     )
 }
 
 const fn append_value(
     long: &'static str,
     short: Option<char>,
-    status: ImplementationStatus,
+    support: OptionSupport,
 ) -> OptionSpec {
     spec(
         long,
@@ -111,12 +108,15 @@ const fn append_value(
         RepeatBehavior::Append,
         false,
         OptionScope::Client,
-        status,
+        support,
     )
 }
 
-const I: ImplementationStatus = ImplementationStatus::Implemented;
-const P: ImplementationStatus = ImplementationStatus::Planned;
+const F: OptionSupport = OptionSupport::Full;
+const I: OptionSupport = OptionSupport::Partial;
+const D: OptionSupport = OptionSupport::DiagnosticOnly;
+const C: OptionSupport = OptionSupport::ParsedOnly;
+const P: OptionSupport = OptionSupport::Planned;
 
 static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     spec(
@@ -126,13 +126,13 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::Count,
         true,
         OptionScope::Client,
-        I,
+        F,
     ),
-    append_value("info", None, I),
-    append_value("debug", None, I),
-    value("stderr", None, I),
-    flag("msgs2stderr", None, I),
-    flag("no-msgs2stderr", None, I),
+    append_value("info", None, F),
+    append_value("debug", None, F),
+    value("stderr", None, F),
+    flag("msgs2stderr", None, F),
+    flag("no-msgs2stderr", None, F),
     spec(
         "quiet",
         Some('q'),
@@ -140,7 +140,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::Count,
         true,
         OptionScope::Client,
-        I,
+        F,
     ),
     flag("no-motd", None, I),
     flag("checksum", Some('c'), I),
@@ -185,7 +185,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("D", Some('D'), I),
     flag("times", Some('t'), I),
     flag("atimes", Some('U'), I),
-    flag("open-noatime", None, P),
+    flag("open-noatime", None, D),
     flag("crtimes", Some('N'), I),
     flag("omit-dir-times", Some('O'), I),
     flag("omit-link-times", Some('J'), I),
@@ -219,7 +219,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     value("max-delete", None, I),
     value("max-size", None, I),
     value("min-size", None, I),
-    value("max-alloc", None, P),
+    value("max-alloc", None, I),
     flag("partial", None, I),
     value("partial-dir", None, I),
     flag("delay-updates", None, I),
@@ -228,7 +228,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     append_value("usermap", None, I),
     append_value("groupmap", None, I),
     value("chown", None, I),
-    value("timeout", None, P),
+    value("timeout", None, I),
     value("contimeout", None, I),
     flag("ignore-times", Some('I'), I),
     flag("size-only", None, I),
@@ -244,8 +244,8 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     value("zc", None, I),
     value("compress-level", None, I),
     value("zl", None, I),
-    value("compress-threads", None, I),
-    value("zt", None, I),
+    value("compress-threads", None, C),
+    value("zt", None, C),
     value("skip-compress", None, I),
     flag("cvs-exclude", Some('C'), I),
     append_value("filter", Some('f'), I),
@@ -260,14 +260,14 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("secluded-args", Some('s'), I),
     flag("protect-args", None, I),
     flag("trust-sender", None, I),
-    value("copy-as", None, I),
+    value("copy-as", None, D),
     value("address", None, I),
     value("port", None, I),
     value("sockopts", None, I),
-    flag("blocking-io", None, I),
-    value("outbuf", None, P),
-    flag("stats", None, I),
-    flag("8-bit-output", Some('8'), I),
+    flag("blocking-io", None, D),
+    value("outbuf", None, I),
+    flag("stats", None, F),
+    flag("8-bit-output", Some('8'), F),
     spec(
         "human-readable",
         Some('h'),
@@ -275,33 +275,33 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::Count,
         true,
         OptionScope::Client,
-        I,
+        F,
     ),
-    flag("progress", None, I),
-    flag("P", Some('P'), I),
-    flag("itemize-changes", Some('i'), I),
+    flag("progress", None, F),
+    flag("P", Some('P'), F),
+    flag("itemize-changes", Some('i'), F),
     append_value("remote-option", Some('M'), I),
-    value("out-format", None, I),
-    value("log-file", None, I),
-    value("log-file-format", None, I),
+    value("out-format", None, F),
+    value("log-file", None, F),
+    value("log-file-format", None, F),
     value("password-file", None, I),
-    value("early-input", None, P),
+    value("early-input", None, I),
     flag("list-only", None, I),
-    value("bwlimit", None, P),
-    value("stop-after", None, P),
-    value("time-limit", None, P),
-    value("stop-at", None, P),
+    value("bwlimit", None, I),
+    value("stop-after", None, I),
+    value("time-limit", None, I),
+    value("stop-at", None, I),
     flag("fsync", None, I),
     value("write-batch", None, I),
     value("only-write-batch", None, I),
     value("read-batch", None, I),
-    value("protocol", None, P),
-    value("iconv", None, P),
+    value("protocol", None, I),
+    value("iconv", None, D),
     value("checksum-seed", None, I),
     flag("ipv4", Some('4'), I),
     flag("ipv6", Some('6'), I),
-    flag("version", Some('V'), I),
-    flag("help", None, I),
+    flag("version", Some('V'), F),
+    flag("help", None, F),
 ];
 
 static DAEMON_OPTIONS: &[OptionSpec] = &[
@@ -811,6 +811,18 @@ impl Default for Cli {
             write_batch: None,
             only_write_batch: None,
             read_batch: None,
+            // Chunk 13
+            bwlimit: None,
+            timeout_secs: None,
+            stop_after_minutes: None,
+            time_limit_minutes: None,
+            stop_at: None,
+            max_alloc: None,
+            early_input: None,
+            outbuf: None,
+            protocol_version: None,
+            iconv: None,
+            open_noatime: false,
             paths: Vec::new(),
         }
     }
@@ -1283,7 +1295,12 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
             cli.daemon_log_file_format = Some(fmt.clone());
             cli.client_log_file_format = Some(fmt);
         }
-        "bwlimit" => cli.daemon_bwlimit = Some(required_value(name, value)?.to_string()),
+        "bwlimit" => {
+            let val = required_value(name, value)?.to_string();
+            parse_bwlimit_value(&val)?;
+            cli.daemon_bwlimit = Some(val.clone());
+            cli.bwlimit = Some(val);
+        }
         "list-only" => cli.list_only = true,
         "stats" => cli.stats = true,
         "fsync" => cli.fsync = true,
@@ -1347,6 +1364,49 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         "read-batch" => {
             cli.read_batch = Some(PathBuf::from(required_value(name, value)?));
         }
+        // Chunk 13: Resource Limits and Operational Controls
+        "timeout" => {
+            let val = required_value(name, value)?;
+            cli.timeout_secs = Some(val.parse::<u64>().with_context(|| {
+                format!("--timeout value `{val}` is not a valid number of seconds")
+            })?);
+        }
+        "stop-after" => {
+            let val = required_value(name, value)?;
+            cli.stop_after_minutes = Some(val.parse::<u64>().with_context(|| {
+                format!("--stop-after value `{val}` is not a valid number of minutes")
+            })?);
+        }
+        "time-limit" => {
+            let val = required_value(name, value)?;
+            cli.time_limit_minutes = Some(val.parse::<u64>().with_context(|| {
+                format!("--time-limit value `{val}` is not a valid number of minutes")
+            })?);
+        }
+        "stop-at" => {
+            let val = required_value(name, value)?.to_string();
+            validate_stop_at_value(&val)?;
+            cli.stop_at = Some(val);
+        }
+        "max-alloc" => {
+            let val = required_value(name, value)?.to_string();
+            parse_max_alloc_value(&val)?;
+            cli.max_alloc = Some(val);
+        }
+        "early-input" => cli.early_input = Some(required_value(name, value)?.to_string()),
+        "outbuf" => cli.outbuf = Some(parse_outbuf_value(required_value(name, value)?)?),
+        "protocol" => {
+            let val = required_value(name, value)?;
+            let protocol = val.parse::<u32>().with_context(|| {
+                format!("--protocol value `{val}` is not a valid protocol version")
+            })?;
+            if protocol != 27 && protocol != 31 {
+                bail!("--protocol={protocol} is not supported by this build; supported execution protocols are 27 and 31");
+            }
+            cli.protocol_version = Some(protocol);
+        }
+        "iconv" => cli.iconv = Some(required_value(name, value)?.to_string()),
+        "open-noatime" => cli.open_noatime = true,
         other => remember_unsupported(cli, &format!("--{other}")),
     }
 
@@ -1504,7 +1564,8 @@ fn apply_negated_option(cli: &mut Cli, name: &str) -> Result<()> {
         "trust-sender" => cli.trust_sender = false,
         "ipv4" | "4" => cli.ipv4 = false,
         "ipv6" | "6" => cli.ipv6 = false,
-        "iconv" => remember_unsupported(cli, &format!("--no-{name}")),
+        "iconv" => cli.iconv = None,
+        "open-noatime" => cli.open_noatime = false,
         "sparse" | "S" => cli.sparse = false,
         "preallocate" => cli.preallocate = false,
         "fuzzy" | "y" => cli.fuzzy = false,
@@ -1625,6 +1686,102 @@ fn parse_size(value: &str) -> Result<u64> {
         _ => bail!("invalid size suffix in `{value}`"),
     };
     Ok(number.saturating_mul(multiplier))
+}
+
+fn parse_bwlimit_value(value: &str) -> Result<Option<u64>> {
+    let bytes = parse_scaled_number(value, 1024.0, "--bwlimit")?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn parse_max_alloc_value(value: &str) -> Result<Option<u64>> {
+    let bytes = parse_scaled_number(value, 1.0, "--max-alloc")?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn parse_scaled_number(value: &str, default_multiplier: f64, option: &str) -> Result<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{option} value cannot be empty");
+    }
+    let split = trimmed
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(split);
+    if digits.is_empty() || digits == "." {
+        bail!("{option} value `{value}` is not a valid size");
+    }
+    let number = digits
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("{option} value `{value}` is not a valid size"))?;
+    if !number.is_finite() || number < 0.0 {
+        bail!("{option} value `{value}` must be non-negative");
+    }
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" => default_multiplier,
+        "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "p" | "pb" | "pib" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => bail!("{option} value `{value}` has an unsupported size suffix"),
+    };
+    let bytes = (number * multiplier).round();
+    if bytes > u64::MAX as f64 {
+        bail!("{option} value `{value}` exceeds the supported range");
+    }
+    Ok(bytes as u64)
+}
+
+fn parse_outbuf_value(value: &str) -> Result<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "n" | "none" | "unbuffered" => Ok("N".to_string()),
+        "l" | "line" => Ok("L".to_string()),
+        "b" | "block" | "full" => Ok("B".to_string()),
+        _ => bail!("--outbuf expects N, L, or B"),
+    }
+}
+
+fn validate_stop_at_value(value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("--stop-at value cannot be empty");
+    }
+    let time = trimmed.rsplit_once('T').map_or(trimmed, |(_, time)| time);
+    if time.contains(':') {
+        validate_stop_at_time(time)?;
+    }
+    Ok(())
+}
+
+fn validate_stop_at_time(value: &str) -> Result<()> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        bail!("--stop-at time must use HH:MM or HH:MM:SS");
+    }
+    let hour = parts[0]
+        .parse::<u8>()
+        .map_err(|_| anyhow::anyhow!("--stop-at hour is not valid"))?;
+    let minute = parts[1]
+        .parse::<u8>()
+        .map_err(|_| anyhow::anyhow!("--stop-at minute is not valid"))?;
+    let second = if parts.len() == 3 {
+        parts[2]
+            .parse::<u8>()
+            .map_err(|_| anyhow::anyhow!("--stop-at second is not valid"))?
+    } else {
+        0
+    };
+    if hour > 23 || minute > 59 || second > 59 {
+        bail!("--stop-at time is outside the valid clock range");
+    }
+    Ok(())
 }
 
 fn remember_unsupported(cli: &mut Cli, option: &str) {

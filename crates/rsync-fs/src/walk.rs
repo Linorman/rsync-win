@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use filetime::FileTime;
 use thiserror::Error;
@@ -27,6 +27,9 @@ pub struct FileWriteOptions {
     pub fsync: bool,
     pub sparse: bool,
     pub preallocate: bool,
+    pub bwlimit: Option<u64>,
+    pub max_alloc: Option<u64>,
+    pub stop_deadline: Option<Instant>,
 }
 
 impl Default for FileWriteOptions {
@@ -39,6 +42,9 @@ impl Default for FileWriteOptions {
             fsync: false,
             sparse: false,
             preallocate: false,
+            bwlimit: None,
+            max_alloc: None,
+            stop_deadline: None,
         }
     }
 }
@@ -905,7 +911,13 @@ impl LocalFileSystem {
         let mut input = File::open(local_os_path(source))?;
         let mut output = File::create(local_os_path(dest))?;
         apply_sparse_and_preallocate(&output, dest, source_len, options)?;
-        let copied = copy_stream_bounded(&mut input, &mut output)?;
+        let copied = copy_stream_bounded_with_limits(
+            &mut input,
+            &mut output,
+            options.max_alloc,
+            options.bwlimit,
+            options.stop_deadline,
+        )?;
         if options.fsync {
             output.sync_all()?;
         }
@@ -1120,15 +1132,78 @@ fn streams_equal_for_len<L: Read, R: Read>(
 }
 
 fn copy_stream_bounded<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<u64> {
+    copy_stream_bounded_with_limits(input, output, None, None, None)
+}
+
+fn copy_stream_bounded_with_limits<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    max_alloc: Option<u64>,
+    bwlimit: Option<u64>,
+    stop_deadline: Option<Instant>,
+) -> io::Result<u64> {
     let mut buf = [0_u8; LOCAL_COPY_BUFFER_SIZE];
+    let copy_len = bounded_copy_buffer_len(max_alloc);
+    let mut limiter = bwlimit
+        .filter(|bytes_per_second| *bytes_per_second > 0)
+        .map(LocalCopyLimiter::new);
     let mut total = 0_u64;
     loop {
-        let read = input.read(&mut buf)?;
+        check_copy_deadline(stop_deadline)?;
+        let read = input.read(&mut buf[..copy_len])?;
         if read == 0 {
             return Ok(total);
         }
         output.write_all(&buf[..read])?;
+        if let Some(limiter) = limiter.as_mut() {
+            limiter.throttle(read as u64);
+        }
         total += read as u64;
+    }
+}
+
+fn check_copy_deadline(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "transfer stop deadline reached",
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_copy_buffer_len(max_alloc: Option<u64>) -> usize {
+    max_alloc
+        .and_then(|limit| usize::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit.min(LOCAL_COPY_BUFFER_SIZE))
+        .unwrap_or(LOCAL_COPY_BUFFER_SIZE)
+}
+
+#[derive(Debug)]
+struct LocalCopyLimiter {
+    bytes_per_second: u64,
+    started: Instant,
+    transferred: u64,
+}
+
+impl LocalCopyLimiter {
+    fn new(bytes_per_second: u64) -> Self {
+        Self {
+            bytes_per_second,
+            started: Instant::now(),
+            transferred: 0,
+        }
+    }
+
+    fn throttle(&mut self, bytes: u64) {
+        self.transferred = self.transferred.saturating_add(bytes);
+        let target =
+            Duration::from_secs_f64(self.transferred as f64 / self.bytes_per_second.max(1) as f64);
+        let delay = target.saturating_sub(self.started.elapsed());
+        if delay > Duration::ZERO {
+            std::thread::sleep(delay);
+        }
     }
 }
 
@@ -1699,6 +1774,25 @@ mod tests {
             output[LOCAL_COPY_BUFFER_SIZE],
             (LOCAL_COPY_BUFFER_SIZE as u64 % 251) as u8
         );
+    }
+
+    #[test]
+    fn max_alloc_limits_local_copy_read_request_size() {
+        let total_len = (LOCAL_COPY_BUFFER_SIZE * 2 + 17) as u64;
+        let mut reader = TrackingReader {
+            remaining: total_len,
+            position: 0,
+            max_read_request: 0,
+        };
+        let mut output = Vec::new();
+
+        let copied =
+            copy_stream_bounded_with_limits(&mut reader, &mut output, Some(1024), None, None)
+                .unwrap();
+
+        assert_eq!(copied, total_len);
+        assert_eq!(output.len() as u64, total_len);
+        assert!(reader.max_read_request <= 1024);
     }
 
     struct TrackingReader {

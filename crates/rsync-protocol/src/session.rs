@@ -597,6 +597,7 @@ pub struct RemoteShellOptions {
     pub compress_level: Option<u32>,
     pub compress_threads: Option<usize>,
     pub skip_compress: Vec<String>,
+    pub outbuf: Option<String>,
     pub remote_options: Vec<String>,
     pub includes: Vec<String>,
     pub excludes: Vec<String>,
@@ -658,6 +659,7 @@ impl Default for RemoteShellOptions {
             compress_level: None,
             compress_threads: None,
             skip_compress: Vec::new(),
+            outbuf: None,
             remote_options: Vec::new(),
             includes: Vec::new(),
             excludes: Vec::new(),
@@ -1096,6 +1098,9 @@ fn append_remote_shell_long_options(argv: &mut Vec<String>, options: &RemoteShel
     }
     for skip in &options.skip_compress {
         argv.push(format!("--skip-compress={skip}"));
+    }
+    if let Some(outbuf) = &options.outbuf {
+        argv.push(format!("--outbuf={outbuf}"));
     }
     for pattern in &options.includes {
         argv.push(format!("--include={pattern}"));

@@ -50,6 +50,7 @@ pub const RSYNC_DIRECTORY_MODE: u32 = S_IFDIR | 0o755;
 pub const RSYNC_SYMLINK_MODE: u32 = S_IFLNK | 0o777;
 pub const DEFAULT_MAX_FILE_LIST_ENTRIES: usize = 100_000;
 pub const DEFAULT_MAX_FILE_LIST_PATH_LEN: usize = 32 * 1024;
+const FILE_LIST_ENTRY_ALLOC_OVERHEAD: usize = std::mem::size_of::<RsyncFileListEntry>() + 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireFileType {
@@ -110,6 +111,66 @@ pub struct RsyncFileListMetadata {
 pub struct RsyncXattrPayload {
     pub name: String,
     pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocationBudget {
+    max_alloc: Option<u64>,
+}
+
+impl AllocationBudget {
+    pub fn new(max_alloc: Option<u64>) -> Self {
+        Self { max_alloc }
+    }
+
+    pub fn check(self, label: &'static str, bytes: usize) -> Result<(), FileListError> {
+        if let Some(limit) = self.max_alloc.filter(|limit| *limit > 0) {
+            if bytes as u64 > limit {
+                return Err(FileListError::Io(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{label} would require a {bytes} byte allocation, exceeding --max-alloc={limit}"),
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn check_rsync_file_list_budget(
+    entries: &[RsyncFileListEntry],
+    max_alloc: Option<u64>,
+) -> Result<(), FileListError> {
+    let budget = AllocationBudget::new(max_alloc);
+    let mut total = 0_usize;
+    for entry in entries {
+        total = total
+            .checked_add(estimated_file_list_entry_alloc(entry))
+            .ok_or_else(|| {
+                FileListError::Io(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "file-list allocation estimate overflow",
+                ))
+            })?;
+        budget.check("file-list entries", total)?;
+    }
+    Ok(())
+}
+
+fn estimated_file_list_entry_alloc(entry: &RsyncFileListEntry) -> usize {
+    let mut total = FILE_LIST_ENTRY_ALLOC_OVERHEAD
+        .saturating_add(entry.path.as_os_str().to_string_lossy().len());
+    if let Some(user_name) = &entry.metadata.user_name {
+        total = total.saturating_add(user_name.len());
+    }
+    if let Some(group_name) = &entry.metadata.group_name {
+        total = total.saturating_add(group_name.len());
+    }
+    for xattr in &entry.metadata.xattrs {
+        total = total
+            .saturating_add(xattr.name.len())
+            .saturating_add(xattr.value.len());
+    }
+    total
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

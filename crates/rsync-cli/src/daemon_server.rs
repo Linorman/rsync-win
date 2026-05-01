@@ -2,8 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Component, Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use rsync_core::ChmodRules;
@@ -29,10 +28,10 @@ use crate::{
     selected_remote_transfer_indexes, sort_remote_entries_for_sender_indexes,
     validate_remote_file_list_paths, windows_destination_path_preflight,
     write_delta_tokens_from_path, write_rsync31_done, write_rsync31_index,
-    write_rsync31_optional_item_attrs, write_sum_head, Cli, LocalSourceCollectOptions, ProgressLog,
-    RemoteCompressionConfig, RemoteExecutionStats, RemoteFileChecksum, RemoteFinalChecksum,
-    RemoteReceiveContext, RemoteSessionError, RemoteSourceEntry, RSYNC31_MUX_FRAME_SIZE,
-    RSYNC_ITEM_TRANSFER,
+    write_rsync31_optional_item_attrs, write_sum_head, Cli, DeltaWriteRuntime,
+    LocalSourceCollectOptions, ProgressLog, RemoteCompressionConfig, RemoteExecutionStats,
+    RemoteFileChecksum, RemoteFinalChecksum, RemoteReceiveContext, RemoteSessionError,
+    RemoteSourceEntry, RSYNC31_MUX_FRAME_SIZE, RSYNC_ITEM_TRANSFER,
 };
 
 #[derive(Debug, Clone)]
@@ -69,75 +68,7 @@ struct DaemonTransferArgs {
     delete: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BandwidthLimit {
-    bytes_per_second: u64,
-}
-
-#[derive(Debug)]
-struct BandwidthLimiter {
-    limit: BandwidthLimit,
-    started: Instant,
-    written: u64,
-}
-
-impl BandwidthLimiter {
-    fn new(limit: BandwidthLimit, started: Instant) -> Self {
-        Self {
-            limit,
-            started,
-            written: 0,
-        }
-    }
-
-    fn delay_after_write(&mut self, bytes: u64, now: Instant) -> Duration {
-        self.written = self.written.saturating_add(bytes);
-        let target = Duration::from_secs_f64(
-            self.written as f64 / self.limit.bytes_per_second.max(1) as f64,
-        );
-        target.saturating_sub(now.saturating_duration_since(self.started))
-    }
-
-    fn throttle(&mut self, bytes: u64) {
-        let delay = self.delay_after_write(bytes, Instant::now());
-        if delay > Duration::ZERO {
-            thread::sleep(delay);
-        }
-    }
-}
-
-#[derive(Debug)]
-struct BandwidthLimitedStream<S> {
-    inner: S,
-    limiter: BandwidthLimiter,
-}
-
-impl<S> BandwidthLimitedStream<S> {
-    fn new(inner: S, limit: BandwidthLimit) -> Self {
-        Self {
-            inner,
-            limiter: BandwidthLimiter::new(limit, Instant::now()),
-        }
-    }
-}
-
-impl<S: Read> Read for BandwidthLimitedStream<S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
-    }
-}
-
-impl<S: Write> Write for BandwidthLimitedStream<S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buf)?;
-        self.limiter.throttle(written as u64);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
+use rsync_transport::{BandwidthLimit, BandwidthLimitedStream};
 
 #[derive(Debug)]
 enum DaemonConnection {
@@ -565,6 +496,8 @@ fn serve_daemon_receiver_protocol31<T: Read + Write>(
         transfer.block_size,
         transfer.whole_file,
         RemoteFileChecksum::PlainMd4,
+        None,
+        None,
     )?;
     stream.flush()?;
     receive_remote_sender_files_protocol31(
@@ -582,6 +515,8 @@ fn serve_daemon_receiver_protocol31<T: Read + Write>(
             file_write_options: transfer.file_write_options.clone(),
             append_verify: transfer.append_verify,
             compression: transfer.compression.as_ref(),
+            max_alloc: None,
+            stop_deadline: None,
             actions: &mut actions,
         },
     )?;
@@ -651,6 +586,7 @@ fn serve_daemon_sender_requests_protocol31<T: Read + Write>(
                         &mut reader,
                         sum_head,
                         RemoteFileChecksum::PlainMd4,
+                        None,
                     )?;
                     Some((index, iflags, attrs, Some(sum_head), signatures))
                 } else {
@@ -706,8 +642,12 @@ fn serve_daemon_sender_requests_protocol31<T: Read + Write>(
                 RemoteFinalChecksum::PlainMd4,
                 &entry.local_path,
                 &signatures,
-                transfer.compression.as_ref(),
-                None,
+                DeltaWriteRuntime {
+                    compression: transfer.compression.as_ref(),
+                    progress: None,
+                    max_alloc: None,
+                    stop_deadline: None,
+                },
             )?;
             writer.flush()?;
             stats.bytes += delta_stats.literal_bytes;
@@ -1137,9 +1077,7 @@ fn parse_daemon_bwlimit(value: &str) -> Result<BandwidthLimit> {
     if bytes_per_second < 1.0 || bytes_per_second > u64::MAX as f64 {
         bail!("daemon --bwlimit rate `{value}` is outside the supported range");
     }
-    Ok(BandwidthLimit {
-        bytes_per_second: bytes_per_second as u64,
-    })
+    Ok(BandwidthLimit::new(bytes_per_second as u64))
 }
 
 fn normalize_key(key: &str) -> String {
@@ -1306,11 +1244,9 @@ mod tests {
 
     #[test]
     fn daemon_bandwidth_limiter_computes_required_delay() {
-        let limit = BandwidthLimit {
-            bytes_per_second: 1024,
-        };
+        let limit = BandwidthLimit::new(1024);
         let start = std::time::Instant::now();
-        let mut limiter = BandwidthLimiter::new(limit, start);
+        let mut limiter = rsync_transport::BandwidthLimiter::new(limit, start);
 
         assert_eq!(
             limiter.delay_after_write(512, start),

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,7 +16,9 @@ use rsync_core::{
     ChmodFileKind, ChmodRules, Diagnostic, MetadataDegradation, MetadataFeature, MetadataPolicy,
     NtfsNativeMetadataRequest, PosixMetadataRequest, Report, Severity,
 };
-use rsync_delta::{BlockSignature, DeltaToken, StrongChecksum};
+#[cfg(test)]
+use rsync_delta::DeltaToken;
+use rsync_delta::{rolling_checksum, BlockSignature, StrongChecksum};
 use rsync_filter::{
     normalize_files_from_records, parse_files_from_bytes, EntryKind, Rule, RuleAction, RuleSet,
     RuleSide,
@@ -29,21 +31,21 @@ use rsync_fs::{
 use rsync_protocol::{
     authenticate_daemon_module, build_remote_shell_argv_for_paths,
     build_remote_shell_invocation_for_paths, build_remote_shell_protocol31_argv_for_paths,
-    build_remote_shell_protocol31_invocation_for_paths, exchange_daemon_greeting,
-    exchange_protocol31_setup_with_options, exchange_remote_shell_mvp_handshake,
-    exchange_remote_shell_protocol31_handshake_with_options, read_i32_le, read_multiplexed_i32,
-    read_multiplexed_long, read_rsync27_file_list_with_options,
+    build_remote_shell_protocol31_invocation_for_paths, check_rsync_file_list_budget,
+    exchange_daemon_greeting, exchange_protocol31_setup_with_options,
+    exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake_with_options,
+    read_i32_le, read_multiplexed_i32, read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_metadata, read_rsync_index, read_u16_le, read_u8, read_varlong,
     read_vstring, request_module_list, rsync_plain_md4_checksum_reader, select_daemon_module,
     write_daemon_args, write_i32_le, write_remote_shell_protected_args,
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_metadata, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
     DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter,
-    Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError, RemoteShellOperand,
-    RemoteShellOptions, RsyncDeflatedToken, RsyncDeflatedTokenMode, RsyncDeflatedTokenReader,
-    RsyncDeflatedTokenWriter, RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions,
-    RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection,
-    WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
+    Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError, RemoteShellInvocation,
+    RemoteShellOperand, RemoteShellOptions, RsyncDeflatedToken, RsyncDeflatedTokenMode,
+    RsyncDeflatedTokenReader, RsyncDeflatedTokenWriter, RsyncFileListEntry, RsyncFileListMetadata,
+    RsyncFileListOptions, RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError,
+    TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
     MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
     REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
 };
@@ -54,6 +56,7 @@ use rsync_transport::remote_shell::{
     SshRemoteCommand,
 };
 use rsync_transport::tcp::{TcpAddressFamily, TcpConnectOptions, TcpSocketOptions, TcpTransport};
+use rsync_transport::{BandwidthLimit, BandwidthLimitedStream};
 use rsync_winfs::{
     capture_ntfs_native_sidecar, copy_alternate_data_streams,
     parse_posix_fake_super_sidecar_manifest, read_windows_metadata,
@@ -546,6 +549,30 @@ pub struct Cli {
     #[arg(skip)]
     read_batch: Option<PathBuf>,
 
+    // Chunk 13: Resource limits and operational controls
+    #[arg(skip)]
+    bwlimit: Option<String>,
+    #[arg(skip)]
+    timeout_secs: Option<u64>,
+    #[arg(skip)]
+    stop_after_minutes: Option<u64>,
+    #[arg(skip)]
+    time_limit_minutes: Option<u64>,
+    #[arg(skip)]
+    stop_at: Option<String>,
+    #[arg(skip)]
+    max_alloc: Option<String>,
+    #[arg(skip)]
+    early_input: Option<String>,
+    #[arg(skip)]
+    outbuf: Option<String>,
+    #[arg(skip)]
+    protocol_version: Option<u32>,
+    #[arg(skip)]
+    iconv: Option<String>,
+    #[arg(skip)]
+    open_noatime: bool,
+
     #[arg(help = "Source and destination operands")]
     paths: Vec<String>,
 }
@@ -991,6 +1018,41 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
         output.push_str(&format!("read-batch: {}\n", batch.display()));
     }
 
+    // Chunk 13 rendering
+    if let Some(ref bwlimit) = plan.bwlimit_display {
+        output.push_str(&format!("bwlimit: {bwlimit}\n"));
+    }
+    if let Some(timeout) = plan.timeout_secs {
+        output.push_str(&format!("timeout: {timeout}s\n"));
+    }
+    if let Some(stop_after) = plan.stop_after_minutes {
+        output.push_str(&format!("stop after: {stop_after} minutes\n"));
+    }
+    if let Some(time_limit) = plan.time_limit_minutes {
+        output.push_str(&format!("time limit: {time_limit} minutes\n"));
+    }
+    if let Some(ref stop_at) = plan.stop_at {
+        output.push_str(&format!("stop at: {stop_at}\n"));
+    }
+    if let Some(ref max_alloc) = plan.max_alloc_display {
+        output.push_str(&format!("max alloc: {max_alloc}\n"));
+    }
+    if let Some(ref early_input) = plan.early_input {
+        output.push_str(&format!("early input: {early_input}\n"));
+    }
+    if let Some(ref outbuf) = plan.outbuf {
+        output.push_str(&format!("outbuf: {outbuf}\n"));
+    }
+    if let Some(protocol) = plan.protocol_version {
+        output.push_str(&format!("protocol: {protocol}\n"));
+    }
+    if let Some(ref iconv) = plan.iconv {
+        output.push_str(&format!("iconv: {iconv}\n"));
+    }
+    if plan.open_noatime {
+        output.push_str("open noatime: true\n");
+    }
+
     if !plan.report.is_empty() {
         output.push_str("diagnostics:\n");
         for diagnostic in plan.report.diagnostics() {
@@ -1220,6 +1282,50 @@ impl RemoteWireProtocol {
     }
 }
 
+fn remote_wire_protocol_from_cli(cli: &Cli, report: &mut Report) -> RemoteWireProtocol {
+    match cli.protocol_version {
+        Some(27) => RemoteWireProtocol::Compat27,
+        Some(31) | None => RemoteWireProtocol::Modern31,
+        Some(protocol) => {
+            report.error(
+                "E_UNSUPPORTED_PROTOCOL",
+                format!(
+                    "--protocol={protocol} is not supported by this build; supported execution protocols are 27 and 31"
+                ),
+            );
+            RemoteWireProtocol::Modern31
+        }
+    }
+}
+
+fn build_remote_shell_invocation_for_wire_protocol(
+    protocol: RemoteWireProtocol,
+    options: &RemoteShellOptions,
+    paths: &[&Path],
+) -> Result<RemoteShellInvocation, SessionError> {
+    match protocol {
+        RemoteWireProtocol::Compat27 => build_remote_shell_invocation_for_paths(options, paths),
+        RemoteWireProtocol::Modern31 => {
+            build_remote_shell_protocol31_invocation_for_paths(options, paths)
+        }
+    }
+}
+
+fn add_remote_protocol_diagnostic(report: &mut Report, protocol: RemoteWireProtocol) {
+    match protocol {
+        RemoteWireProtocol::Modern31 => report.info(
+            "I_REMOTE_PROTOCOL31_MVP",
+            format!(
+                "remote-shell execution tries protocol {REMOTE_SHELL_MODERN_PROTOCOL} first for the ordinary-file MVP"
+            ),
+        ),
+        RemoteWireProtocol::Compat27 => report.info(
+            "I_REMOTE_PROTOCOL",
+            format!("remote-shell execution uses {}", protocol.label()),
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransferMode {
     Local,
@@ -1360,6 +1466,32 @@ struct RemoteDeltaStats {
     copied_bytes: u64,
 }
 
+struct RemoteTransferRuntime<'a> {
+    compression: Option<&'a RemoteCompressionConfig>,
+    progress: ProgressLog,
+    max_alloc: Option<u64>,
+    stop_deadline: Option<Instant>,
+}
+
+struct DeltaWriteRuntime<'a> {
+    compression: Option<&'a RemoteCompressionConfig>,
+    progress: Option<&'a mut FileProgress>,
+    max_alloc: Option<u64>,
+    stop_deadline: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RemoteDeltaChecksums {
+    block: RemoteFileChecksum,
+    final_file: RemoteFinalChecksum,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransferLimits {
+    max_alloc: Option<u64>,
+    stop_deadline: Option<Instant>,
+}
+
 #[derive(Debug, Clone)]
 struct RemoteCompressionConfig {
     mode: RsyncDeflatedTokenMode,
@@ -1448,7 +1580,12 @@ fn execute_daemon_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         TcpTransport::connect_with_options((daemon.host.as_str(), daemon.port), &tcp_options)
             .with_context(|| format!("failed to connect to {}:{}", daemon.host, daemon.port))?
     };
-    execute_daemon_sync_with_transport(cli, &plan, &mut transport)
+    if let Some(limit) = bandwidth_limit_from_plan(&plan) {
+        let mut limited = BandwidthLimitedStream::new(&mut transport, limit);
+        execute_daemon_sync_with_transport(cli, &plan, &mut limited)
+    } else {
+        execute_daemon_sync_with_transport(cli, &plan, &mut transport)
+    }
 }
 
 fn execute_daemon_sync_with_connect_prog(
@@ -1461,7 +1598,12 @@ fn execute_daemon_sync_with_connect_prog(
     let (program, args) = shell_command_for_connect_prog(&command);
     let mut transport = ChildTransport::spawn(&program, args.iter())
         .with_context(|| format!("failed to spawn RSYNC_CONNECT_PROG command `{command}`"))?;
-    let session_result = execute_daemon_sync_with_transport(cli, plan, &mut transport);
+    let session_result = if let Some(limit) = bandwidth_limit_from_plan(plan) {
+        let mut limited = BandwidthLimitedStream::new(&mut transport, limit);
+        execute_daemon_sync_with_transport(cli, plan, &mut limited)
+    } else {
+        execute_daemon_sync_with_transport(cli, plan, &mut transport)
+    };
     transport.finish_input();
     let child_report = transport
         .wait_with_diagnostics()
@@ -1506,8 +1648,12 @@ fn daemon_tcp_connect_options(cli: &Cli) -> Result<TcpConnectOptions> {
     } else {
         None
     };
+    let timeout_secs = cli
+        .daemon_connect_timeout_secs
+        .or(cli.timeout_secs)
+        .unwrap_or(30);
     Ok(TcpConnectOptions {
-        timeout: Duration::from_secs(cli.daemon_connect_timeout_secs.unwrap_or(30)),
+        timeout: Duration::from_secs(timeout_secs),
         bind_address,
         address_family,
         socket_options,
@@ -1611,24 +1757,36 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
         }
     }
 
+    write_daemon_early_input(cli, transport)?;
+
     let direction = plan
         .daemon_direction
         .context("daemon transfer direction was not planned")?;
-    let args =
-        daemon_server_args_for_direction(cli, plan, daemon, greeting.peer_protocol, direction)?;
+    let daemon_wire_protocol = daemon_wire_protocol_from_plan(plan, greeting.peer_protocol)?;
+    let args = daemon_server_args_for_direction(
+        cli,
+        plan,
+        daemon,
+        daemon_wire_protocol.protocol_number(),
+        direction,
+    )?;
     progress.detail(format!("daemon args: {} argument(s)", args.len()));
-    write_daemon_args(&mut transport, greeting.peer_protocol, &args)
-        .context("failed to send daemon server args")?;
+    write_daemon_args(
+        &mut transport,
+        daemon_wire_protocol.protocol_number(),
+        &args,
+    )
+    .context("failed to send daemon server args")?;
 
     if direction == TransferDirection::Push {
-        return if greeting.peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL {
+        return if daemon_wire_protocol == RemoteWireProtocol::Modern31 {
             execute_remote_push_protocol31(cli, plan, transport)
         } else {
             execute_remote_push_protocol27(cli, plan, transport)
         };
     }
 
-    if greeting.peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL {
+    if daemon_wire_protocol == RemoteWireProtocol::Modern31 {
         let handshake = exchange_protocol31_setup_with_options(
             transport,
             greeting.peer_protocol,
@@ -1638,6 +1796,44 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
         execute_remote_pull_protocol31_with_handshake(cli, plan, transport, handshake)
     } else {
         execute_remote_pull_protocol27(cli, plan, transport)
+    }
+}
+
+fn write_daemon_early_input<T: Write>(cli: &Cli, transport: &mut T) -> Result<()> {
+    let Some(path) = &cli.early_input else {
+        return Ok(());
+    };
+    let path = Path::new(path);
+    let bytes = fs::read(to_long_path_safe(path))
+        .with_context(|| format!("failed to read --early-input file {}", path.display()))?;
+    if bytes.len() > 5 * 1024 {
+        bail!(
+            "--early-input file {} exceeds the 5 KiB daemon early-exec input limit",
+            path.display()
+        );
+    }
+    transport
+        .write_all(&bytes)
+        .with_context(|| format!("failed to send --early-input file {}", path.display()))?;
+    transport.flush()?;
+    Ok(())
+}
+
+fn daemon_wire_protocol_from_plan(
+    plan: &TransferPlan,
+    peer_protocol: u32,
+) -> Result<RemoteWireProtocol> {
+    match plan.protocol_version {
+        Some(27) => Ok(RemoteWireProtocol::Compat27),
+        Some(31) if peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL => Ok(RemoteWireProtocol::Modern31),
+        Some(31) => bail!(
+            "--protocol=31 was requested, but the daemon only advertised protocol {peer_protocol}"
+        ),
+        Some(protocol) => bail!(
+            "--protocol={protocol} is not supported by this build; supported execution protocols are 27 and 31"
+        ),
+        None if peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL => Ok(RemoteWireProtocol::Modern31),
+        None => Ok(RemoteWireProtocol::Compat27),
     }
 }
 
@@ -1850,14 +2046,11 @@ fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
 
     let mut transport = spawn_ssh_remote_command(command)
         .with_context(|| format!("failed to spawn {}", command.display_command()))?;
-    if let Some(protected_args) = &plan.remote_protected_args {
-        write_remote_shell_protected_args(&mut transport, protected_args)
-            .context("failed to send remote-shell protected args")?;
-    }
-
-    let session_result = match direction {
-        TransferDirection::Push => execute_remote_push(cli, &plan, &mut transport),
-        TransferDirection::Pull => execute_remote_pull(cli, &plan, &mut transport),
+    let session_result = if let Some(limit) = bandwidth_limit_from_plan(&plan) {
+        let mut limited = BandwidthLimitedStream::new(&mut transport, limit);
+        execute_remote_shell_session(cli, &plan, direction, &mut limited)
+    } else {
+        execute_remote_shell_session(cli, &plan, direction, &mut transport)
     };
 
     transport.finish_input();
@@ -1872,6 +2065,7 @@ fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         Ok(output) => output,
         Err(err) => {
             if plan.remote_wire_protocol == Some(RemoteWireProtocol::Modern31)
+                && cli.protocol_version.is_none()
                 && should_fallback_to_protocol27(&err)
             {
                 return execute_remote_shell_protocol27_fallback(cli, &plan, direction);
@@ -1896,6 +2090,190 @@ fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     Ok(output)
 }
 
+fn bandwidth_limit_from_plan(plan: &TransferPlan) -> Option<BandwidthLimit> {
+    plan.bwlimit
+        .filter(|bytes_per_second| *bytes_per_second > 0)
+        .map(BandwidthLimit::new)
+}
+
+fn stop_deadline_from_cli(cli: &Cli, report: &mut Report) -> Option<Instant> {
+    let now = Instant::now();
+    let now_system = SystemTime::now();
+    let mut deadline = None;
+
+    for minutes in [cli.stop_after_minutes, cli.time_limit_minutes]
+        .into_iter()
+        .flatten()
+    {
+        match minutes_to_duration(minutes) {
+            Some(duration) => remember_earliest_deadline(&mut deadline, now + duration),
+            None => report.error(
+                "E_STOP_LIMIT",
+                format!("stop limit {minutes} minutes exceeds the supported duration range"),
+            ),
+        }
+    }
+
+    if let Some(stop_at) = &cli.stop_at {
+        match stop_at_deadline(stop_at, now_system, now) {
+            Ok(stop_at_deadline) => remember_earliest_deadline(&mut deadline, stop_at_deadline),
+            Err(err) => report.error("E_STOP_AT", err.to_string()),
+        }
+    }
+
+    deadline
+}
+
+fn remember_earliest_deadline(deadline: &mut Option<Instant>, candidate: Instant) {
+    if match deadline {
+        Some(existing) => candidate < *existing,
+        None => true,
+    } {
+        *deadline = Some(candidate);
+    }
+}
+
+fn minutes_to_duration(minutes: u64) -> Option<Duration> {
+    minutes.checked_mul(60).map(Duration::from_secs)
+}
+
+fn check_transfer_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        bail!("transfer stop deadline reached");
+    }
+    Ok(())
+}
+
+fn stop_at_deadline(value: &str, now_system: SystemTime, now: Instant) -> Result<Instant> {
+    let target = if value.contains('T') {
+        parse_full_stop_at_utc(value)?
+    } else {
+        parse_clock_stop_at_utc(value, now_system)?
+    };
+    let delay = target
+        .duration_since(now_system)
+        .map_err(|_| anyhow::anyhow!("--stop-at must resolve to a future time"))?;
+    Ok(now + delay)
+}
+
+fn parse_clock_stop_at_utc(value: &str, now: SystemTime) -> Result<SystemTime> {
+    let target_seconds = parse_stop_at_clock_seconds(value)?;
+    let now_seconds = now
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let day_start = now_seconds - (now_seconds % 86_400);
+    let mut candidate = day_start + target_seconds;
+    if candidate <= now_seconds {
+        candidate += 86_400;
+    }
+    Ok(UNIX_EPOCH + Duration::from_secs(candidate))
+}
+
+fn parse_full_stop_at_utc(value: &str) -> Result<SystemTime> {
+    let (date, time) = value
+        .split_once('T')
+        .context("--stop-at full form must use y-m-dTh:m")?;
+    let date_parts: Vec<_> = date.split(['-', '/']).collect();
+    if date_parts.len() != 3 {
+        bail!("--stop-at full date must use y-m-d");
+    }
+    let year = date_parts[0]
+        .parse::<i32>()
+        .context("--stop-at year is not valid")?;
+    let month = date_parts[1]
+        .parse::<u32>()
+        .context("--stop-at month is not valid")?;
+    let day = date_parts[2]
+        .parse::<u32>()
+        .context("--stop-at day is not valid")?;
+    let seconds = parse_stop_at_clock_seconds(time)?;
+    let days = days_from_civil(year, month, day)?;
+    let epoch_seconds = days
+        .checked_mul(86_400)
+        .and_then(|base| base.checked_add(seconds as i64))
+        .context("--stop-at timestamp exceeds the supported range")?;
+    if epoch_seconds < 0 {
+        bail!("--stop-at dates before 1970 are not supported");
+    }
+    Ok(UNIX_EPOCH + Duration::from_secs(epoch_seconds as u64))
+}
+
+fn parse_stop_at_clock_seconds(value: &str) -> Result<u64> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        bail!("--stop-at time must use HH:MM or HH:MM:SS");
+    }
+    let hour = parts[0]
+        .parse::<u64>()
+        .context("--stop-at hour is not valid")?;
+    let minute = parts[1]
+        .parse::<u64>()
+        .context("--stop-at minute is not valid")?;
+    let second = if parts.len() == 3 {
+        parts[2]
+            .parse::<u64>()
+            .context("--stop-at second is not valid")?
+    } else {
+        0
+    };
+    if hour > 23 || minute > 59 || second > 59 {
+        bail!("--stop-at time is outside the valid clock range");
+    }
+    Ok(hour * 3600 + minute * 60 + second)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Result<i64> {
+    if !(1..=12).contains(&month) {
+        bail!("--stop-at month is outside 1..12");
+    }
+    let max_day = days_in_month(year, month);
+    if day == 0 || day > max_day {
+        bail!("--stop-at day is outside the valid range for the month");
+    }
+    let mut y = year as i64;
+    let m = month as i64;
+    let d = day as i64;
+    y -= (m <= 2) as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Ok(era * 146_097 + doe - 719_468)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn execute_remote_shell_session<T: Read + Write>(
+    cli: &Cli,
+    plan: &TransferPlan,
+    direction: TransferDirection,
+    transport: &mut T,
+) -> Result<String> {
+    if let Some(protected_args) = &plan.remote_protected_args {
+        write_remote_shell_protected_args(transport, protected_args)
+            .context("failed to send remote-shell protected args")?;
+    }
+
+    match direction {
+        TransferDirection::Push => execute_remote_push(cli, plan, transport),
+        TransferDirection::Pull => execute_remote_pull(cli, plan, transport),
+    }
+}
+
 fn execute_remote_shell_protocol27_fallback(
     cli: &Cli,
     plan: &TransferPlan,
@@ -1909,12 +2287,23 @@ fn execute_remote_shell_protocol27_fallback(
     ));
     let mut transport = spawn_ssh_remote_command(&command)
         .with_context(|| format!("failed to spawn {}", command.display_command()))?;
-    write_remote_shell_protected_args(&mut transport, &protected_args)
-        .context("failed to send remote-shell protected args for protocol 27 fallback")?;
-
-    let session_result = match direction {
-        TransferDirection::Push => execute_remote_push_protocol27(cli, plan, &mut transport),
-        TransferDirection::Pull => execute_remote_pull_protocol27(cli, plan, &mut transport),
+    let session_result = if let Some(limit) = bandwidth_limit_from_plan(plan) {
+        let mut limited = BandwidthLimitedStream::new(&mut transport, limit);
+        execute_remote_shell_protocol27_fallback_session(
+            cli,
+            plan,
+            direction,
+            &protected_args,
+            &mut limited,
+        )
+    } else {
+        execute_remote_shell_protocol27_fallback_session(
+            cli,
+            plan,
+            direction,
+            &protected_args,
+            &mut transport,
+        )
     };
 
     transport.finish_input();
@@ -1949,6 +2338,22 @@ fn execute_remote_shell_protocol27_fallback(
     }
 
     Ok(output)
+}
+
+fn execute_remote_shell_protocol27_fallback_session<T: Read + Write>(
+    cli: &Cli,
+    plan: &TransferPlan,
+    direction: TransferDirection,
+    protected_args: &[String],
+    transport: &mut T,
+) -> Result<String> {
+    write_remote_shell_protected_args(transport, protected_args)
+        .context("failed to send remote-shell protected args for protocol 27 fallback")?;
+
+    match direction {
+        TransferDirection::Push => execute_remote_push_protocol27(cli, plan, transport),
+        TransferDirection::Pull => execute_remote_pull_protocol27(cli, plan, transport),
+    }
 }
 
 fn build_protocol27_fallback_command(
@@ -2064,6 +2469,7 @@ fn build_protocol27_fallback_command(
             compress_level: plan.compress_level,
             compress_threads: plan.compress_threads,
             skip_compress: plan.skip_compress.clone(),
+            outbuf: plan.outbuf.clone(),
             remote_options: plan.remote_options.clone(),
             includes,
             excludes,
@@ -2202,6 +2608,8 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
     let entries = collect_local_source_entries(&sources, &collect_options)?;
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
+    check_rsync_file_list_budget(&wire_entries, plan.max_alloc)
+        .context("local upload file-list exceeds allocation budget")?;
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
     progress.info(format!(
         "upload list: {} files, {}",
@@ -2234,8 +2642,12 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         &entries,
         handshake.checksum_seed,
         plan.dry_run,
-        remote_compression.as_ref(),
-        progress,
+        RemoteTransferRuntime {
+            compression: remote_compression.as_ref(),
+            progress,
+            max_alloc: plan.max_alloc,
+            stop_deadline: plan.stop_deadline,
+        },
     )?;
 
     let mut output = String::new();
@@ -2288,6 +2700,8 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
     let entries = collect_local_source_entries(&sources, &collect_options)?;
     let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
+    check_rsync_file_list_budget(&wire_entries, plan.max_alloc)
+        .context("local upload file-list exceeds allocation budget")?;
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
     progress.info(format!(
         "upload list: {} files, {}",
@@ -2339,8 +2753,12 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         plan.dry_run,
         plan.append_verify,
         remote_file_checksum,
-        remote_compression.as_ref(),
-        progress,
+        RemoteTransferRuntime {
+            compression: remote_compression.as_ref(),
+            progress,
+            max_alloc: plan.max_alloc,
+            stop_deadline: plan.stop_deadline,
+        },
     )?;
 
     let mut output = String::new();
@@ -2418,6 +2836,8 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
             plan.update_mode == UpdateMode::Checksum,
         )?
     };
+    check_rsync_file_list_budget(&entries, plan.max_alloc)
+        .context("remote file-list exceeds allocation budget")?;
     sort_remote_entries_for_sender_indexes(&mut entries);
     validate_remote_file_list_paths(&entries)?;
     let files_from = load_files_from(cli)?;
@@ -2482,6 +2902,8 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
         remote_delta_block_size(plan)?,
         plan.whole_file,
         RemoteFileChecksum::md4_with_seed(handshake.checksum_seed),
+        plan.max_alloc,
+        plan.stop_deadline,
     )?;
     transport.flush()?;
     let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
@@ -2500,6 +2922,8 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
             file_write_options: file_write_options_from_plan(plan),
             append_verify: plan.append_verify,
             compression: remote_compression.as_ref(),
+            max_alloc: plan.max_alloc,
+            stop_deadline: plan.stop_deadline,
             actions: &mut actions,
         },
     )?;
@@ -2584,6 +3008,8 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
         )
         .map_err(protocol31_setup_error)?
     };
+    check_rsync_file_list_budget(&entries, plan.max_alloc)
+        .context("remote file-list exceeds allocation budget")?;
     sort_remote_entries_for_sender_indexes(&mut entries);
     validate_remote_file_list_paths(&entries)?;
     let files_from = load_files_from(cli)?;
@@ -2648,6 +3074,8 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
         remote_delta_block_size(plan)?,
         plan.whole_file,
         remote_file_checksum,
+        plan.max_alloc,
+        plan.stop_deadline,
     )?;
     transport.flush()?;
     let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
@@ -2666,6 +3094,8 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
             file_write_options: file_write_options_from_plan(plan),
             append_verify: plan.append_verify,
             compression: remote_compression.as_ref(),
+            max_alloc: plan.max_alloc,
+            stop_deadline: plan.stop_deadline,
             actions: &mut actions,
         },
     )?;
@@ -2784,6 +3214,9 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
             sparse: plan.sparse,
             preallocate: plan.preallocate,
             fuzzy: plan.fuzzy,
+            bwlimit: plan.bwlimit,
+            max_alloc: plan.max_alloc,
+            stop_deadline: plan.stop_deadline,
         },
     )?;
     log_sync_actions(progress, sync_report.actions());
@@ -4141,13 +4574,13 @@ fn serve_remote_receiver_requests<T: Read + Write>(
     entries: &[RemoteSourceEntry],
     checksum_seed: i32,
     dry_run: bool,
-    compression: Option<&RemoteCompressionConfig>,
-    progress: ProgressLog,
+    runtime: RemoteTransferRuntime<'_>,
 ) -> Result<RemoteExecutionStats> {
     let mut phase_markers = 0_usize;
     let mut stats = RemoteExecutionStats::default();
 
     loop {
+        check_transfer_deadline(runtime.stop_deadline)?;
         let index = read_multiplexed_i32(transport, mux)?;
         if index == -1 {
             write_rsync_i32(transport, -1)?;
@@ -4166,7 +4599,7 @@ fn serve_remote_receiver_requests<T: Read + Write>(
         }
 
         if dry_run {
-            progress.detail(format!(
+            runtime.progress.detail(format!(
                 "dry-run upload request for {}",
                 entry.wire.path.display()
             ));
@@ -4191,6 +4624,7 @@ fn serve_remote_receiver_requests<T: Read + Write>(
             mux,
             sum_head,
             RemoteFileChecksum::md4_with_seed(checksum_seed),
+            runtime.max_alloc,
         )?;
 
         write_rsync_i32(transport, index)?;
@@ -4198,16 +4632,24 @@ fn serve_remote_receiver_requests<T: Read + Write>(
         write_rsync_i32(transport, block_len as i32)?;
         write_rsync_i32(transport, checksum_len as i32)?;
         write_rsync_i32(transport, remainder as i32)?;
-        let mut file_progress =
-            FileProgress::start(progress, "upload", &entry.wire.path, Some(entry.wire.len));
+        let mut file_progress = FileProgress::start(
+            runtime.progress,
+            "upload",
+            &entry.wire.path,
+            Some(entry.wire.len),
+        );
         let delta_stats = write_delta_tokens_from_path(
             transport,
             RemoteFileChecksum::md4_with_seed(checksum_seed),
             RemoteFinalChecksum::protocol27(checksum_seed),
             &entry.local_path,
             &signatures,
-            compression,
-            Some(&mut file_progress),
+            DeltaWriteRuntime {
+                compression: runtime.compression,
+                progress: Some(&mut file_progress),
+                max_alloc: runtime.max_alloc,
+                stop_deadline: runtime.stop_deadline,
+            },
         )?;
         file_progress.finish();
         stats.transferred_entry_indexes.push(entry_index);
@@ -4235,7 +4677,6 @@ fn serve_remote_receiver_requests<T: Read + Write>(
     Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
     transport: &mut T,
     mux: &mut MultiplexReadState,
@@ -4243,8 +4684,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
     dry_run: bool,
     append_verify: bool,
     checksum: RemoteFileChecksum,
-    compression: Option<&RemoteCompressionConfig>,
-    progress: ProgressLog,
+    runtime: RemoteTransferRuntime<'_>,
 ) -> Result<RemoteExecutionStats> {
     let mut read_index_state = RsyncIndexState::default();
     let mut write_index_state = RsyncIndexState::default();
@@ -4252,6 +4692,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
     let mut stats = RemoteExecutionStats::default();
 
     loop {
+        check_transfer_deadline(runtime.stop_deadline)?;
         let request = {
             let mut reader = MultiplexedReader::new(transport, mux);
             let index = read_rsync_index(&mut reader, &mut read_index_state)?;
@@ -4266,7 +4707,12 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                     let signatures = if append_verify {
                         Vec::new()
                     } else {
-                        read_remote_block_signatures_from_reader(&mut reader, sum_head, checksum)?
+                        read_remote_block_signatures_from_reader(
+                            &mut reader,
+                            sum_head,
+                            checksum,
+                            runtime.max_alloc,
+                        )?
                     };
                     Some((index, iflags, attrs, Some(sum_head), signatures))
                 } else {
@@ -4299,7 +4745,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             return Err(RemoteSessionError::NonFileBlockRequest { index: entry_index }.into());
         }
         if dry_run {
-            progress.detail(format!(
+            runtime.progress.detail(format!(
                 "dry-run upload request for {}",
                 entry.wire.path.display()
             ));
@@ -4342,15 +4788,16 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                 "upload"
             };
             let mut file_progress =
-                FileProgress::start(progress, operation, &entry.wire.path, Some(total));
+                FileProgress::start(runtime.progress, operation, &entry.wire.path, Some(total));
             let literal_bytes = if append_verify {
                 write_append_verify_file_tokens_from_path(
                     &mut writer,
                     RemoteFinalChecksum::protocol31_for_algorithm(checksum.algorithm()),
                     &entry.local_path,
                     append_prefix_len,
-                    compression,
+                    runtime.compression,
                     Some(&mut file_progress),
+                    runtime.stop_deadline,
                 )?
             } else {
                 write_delta_tokens_from_path(
@@ -4359,8 +4806,12 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
                     RemoteFinalChecksum::protocol31_for_algorithm(checksum.algorithm()),
                     &entry.local_path,
                     &signatures,
-                    compression,
-                    Some(&mut file_progress),
+                    DeltaWriteRuntime {
+                        compression: runtime.compression,
+                        progress: Some(&mut file_progress),
+                        max_alloc: runtime.max_alloc,
+                        stop_deadline: runtime.stop_deadline,
+                    },
                 )?
                 .literal_bytes
             };
@@ -4397,8 +4848,11 @@ fn request_remote_sender_files<T: Write>(
     block_size: usize,
     whole_file: bool,
     checksum: RemoteFileChecksum,
+    max_alloc: Option<u64>,
+    stop_deadline: Option<Instant>,
 ) -> Result<()> {
     for (index, entry) in entries.iter().enumerate() {
+        check_transfer_deadline(stop_deadline)?;
         if entry.file_type != WireFileType::File || !selected_indexes.contains(&index) {
             continue;
         }
@@ -4409,6 +4863,7 @@ fn request_remote_sender_files<T: Write>(
                 block_size,
                 checksum,
                 whole_file,
+                max_alloc,
             )?;
             write_sum_head(transport, sum_head)?;
             write_remote_block_signatures(transport, &signatures)?;
@@ -4429,10 +4884,13 @@ fn request_remote_sender_files_protocol31<T: Write>(
     block_size: usize,
     whole_file: bool,
     checksum: RemoteFileChecksum,
+    max_alloc: Option<u64>,
+    stop_deadline: Option<Instant>,
 ) -> Result<()> {
     let mut index_state = RsyncIndexState::default();
     let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
     for (index, entry) in entries.iter().enumerate() {
+        check_transfer_deadline(stop_deadline)?;
         if entry.file_type != WireFileType::File || !selected_indexes.contains(&index) {
             continue;
         }
@@ -4453,6 +4911,7 @@ fn request_remote_sender_files_protocol31<T: Write>(
                 block_size,
                 checksum,
                 whole_file,
+                max_alloc,
             )?;
             write_sum_head(&mut writer, sum_head)?;
             write_remote_block_signatures(&mut writer, &signatures)?;
@@ -4475,6 +4934,8 @@ struct RemoteReceiveContext<'a> {
     file_write_options: FileWriteOptions,
     append_verify: bool,
     compression: Option<&'a RemoteCompressionConfig>,
+    max_alloc: Option<u64>,
+    stop_deadline: Option<Instant>,
     actions: &'a mut Vec<SyncAction>,
 }
 
@@ -4486,6 +4947,7 @@ fn receive_remote_sender_files<T: Read>(
     let mut stats = RemoteExecutionStats::default();
 
     loop {
+        check_transfer_deadline(ctx.stop_deadline)?;
         let index = read_multiplexed_i32(transport, mux)?;
         if index == -1 {
             break;
@@ -4529,6 +4991,8 @@ fn receive_remote_sender_files<T: Read>(
             Some((&target, sum_head)),
             ctx.compression,
             Some(&mut file_progress),
+            ctx.max_alloc,
+            ctx.stop_deadline,
         ) {
             Ok(bytes) => {
                 file_progress.finish();
@@ -4559,6 +5023,7 @@ fn receive_remote_sender_files_protocol31<T: Read>(
     let mut stats = RemoteExecutionStats::default();
 
     loop {
+        check_transfer_deadline(ctx.stop_deadline)?;
         let response = {
             let mut reader = MultiplexedReader::new(transport, mux);
             let index = read_rsync_index(&mut reader, &mut read_index_state)?;
@@ -4610,6 +5075,8 @@ fn receive_remote_sender_files_protocol31<T: Read>(
             sum_head.map(|sum_head| (target.as_path(), sum_head)),
             ctx.compression,
             Some(&mut file_progress),
+            ctx.max_alloc,
+            ctx.stop_deadline,
         ) {
             Ok(bytes) => {
                 file_progress.finish();
@@ -5159,17 +5626,25 @@ fn read_remote_block_signatures_multiplexed<T: Read>(
     mux: &mut MultiplexReadState,
     sum_head: RemoteSumHead,
     checksum: RemoteFileChecksum,
+    max_alloc: Option<u64>,
 ) -> Result<Vec<BlockSignature>> {
     let mut reader = MultiplexedReader::new(transport, mux);
-    read_remote_block_signatures_from_reader(&mut reader, sum_head, checksum)
+    read_remote_block_signatures_from_reader(&mut reader, sum_head, checksum, max_alloc)
 }
 
 fn read_remote_block_signatures_from_reader<R: Read>(
     reader: &mut R,
     sum_head: RemoteSumHead,
     checksum: RemoteFileChecksum,
+    max_alloc: Option<u64>,
 ) -> Result<Vec<BlockSignature>> {
     validate_sum_head(sum_head)?;
+    ensure_signature_table_budget(
+        "remote signature table",
+        sum_head.block_count,
+        sum_head.checksum_len,
+        max_alloc,
+    )?;
     let mut signatures = Vec::with_capacity(sum_head.block_count);
     for index in 0..sum_head.block_count {
         let weak = read_i32_le(reader)? as u32;
@@ -5211,6 +5686,7 @@ fn local_basis_signature_request(
     block_size: usize,
     checksum: RemoteFileChecksum,
     whole_file: bool,
+    max_alloc: Option<u64>,
 ) -> Result<(RemoteSumHead, Vec<BlockSignature>)> {
     let empty = RemoteSumHead {
         block_count: 0,
@@ -5228,23 +5704,81 @@ fn local_basis_signature_request(
         return Ok((empty, Vec::new()));
     }
 
-    let basis = read_local_file(path)?;
-    if basis.is_empty() {
-        return Ok((empty, Vec::new()));
-    }
     let checksum_len = 16;
     let strong = RsyncStrongChecksum {
         checksum,
         checksum_len,
     };
-    let signatures = rsync_delta::generate_signatures_with(&basis, block_size, &strong)?;
+    let file_len =
+        usize::try_from(metadata.len()).context("basis file length did not fit usize")?;
+    let block_count = file_len
+        .checked_add(block_size - 1)
+        .context("basis signature block count overflow")?
+        / block_size;
+    ensure_signature_table_budget(
+        "basis signature table",
+        block_count,
+        checksum_len,
+        max_alloc,
+    )?;
+    ensure_allocation_within_limit("basis checksum block", block_size, max_alloc)?;
+    let signatures = generate_signatures_from_path(path, block_size, &strong)?;
+    if signatures.is_empty() {
+        return Ok((empty, Vec::new()));
+    }
     let sum_head = RemoteSumHead {
         block_count: signatures.len(),
         block_len: block_size,
         checksum_len,
-        remainder: basis.len() % block_size,
+        remainder: file_len % block_size,
     };
     Ok((sum_head, signatures))
+}
+
+fn generate_signatures_from_path<S: StrongChecksum>(
+    path: &Path,
+    block_size: usize,
+    strong_checksum: &S,
+) -> Result<Vec<BlockSignature>> {
+    if block_size == 0 {
+        bail!("remote delta block size must be greater than zero");
+    }
+
+    let mut file = open_local_file(path)?;
+    let mut block = vec![0_u8; block_size];
+    let mut signatures = Vec::new();
+    let mut offset = 0_usize;
+    loop {
+        let mut read = 0_usize;
+        while read < block_size {
+            let chunk_read = file
+                .read(&mut block[read..])
+                .with_context(|| format!("failed to read basis block from {}", path.display()))?;
+            if chunk_read == 0 {
+                break;
+            }
+            read = read
+                .checked_add(chunk_read)
+                .context("basis signature block length overflow")?;
+        }
+        if read == 0 {
+            break;
+        }
+        signatures.push(BlockSignature {
+            index: signatures.len(),
+            offset,
+            len: read,
+            weak: rolling_checksum(&block[..read]),
+            strong: strong_checksum.digest(&block[..read]),
+        });
+        offset = offset
+            .checked_add(read)
+            .context("basis signature offset overflow")?;
+        if read < block_size {
+            break;
+        }
+    }
+    Ok(signatures)
 }
 
 fn remote_delta_block_size(plan: &TransferPlan) -> Result<usize> {
@@ -5261,21 +5795,261 @@ fn write_delta_tokens_from_path<T: Write>(
     final_checksum: RemoteFinalChecksum,
     path: &Path,
     signatures: &[BlockSignature],
-    compression: Option<&RemoteCompressionConfig>,
-    progress: Option<&mut FileProgress>,
+    runtime: DeltaWriteRuntime<'_>,
 ) -> Result<RemoteDeltaStats> {
-    let bytes = read_local_file(path)?;
-    write_delta_tokens_from_bytes_with_checksum(
+    check_transfer_deadline(runtime.stop_deadline)?;
+    let mut file = open_local_file(path)?;
+    let compression_level = runtime
+        .compression
+        .map(|compression| compression.level_for_path(path));
+    if signatures.is_empty() {
+        let literal_bytes = write_literal_tokens_from_reader_with_checksum(
+            transport,
+            &mut file,
+            final_checksum,
+            compression_level,
+            runtime.progress,
+            runtime.stop_deadline,
+        )?;
+        return Ok(RemoteDeltaStats {
+            literal_bytes,
+            copied_bytes: 0,
+        });
+    }
+
+    write_delta_tokens_from_reader_with_checksum(
         transport,
-        &bytes,
-        block_checksum,
-        final_checksum,
+        &mut file,
+        RemoteDeltaChecksums {
+            block: block_checksum,
+            final_file: final_checksum,
+        },
         signatures,
-        compression.map(|compression| compression.level_for_path(path)),
-        progress,
+        compression_level,
+        runtime.progress,
+        TransferLimits {
+            max_alloc: runtime.max_alloc,
+            stop_deadline: runtime.stop_deadline,
+        },
     )
 }
 
+fn write_delta_tokens_from_reader_with_checksum<T: Write, R: Read>(
+    transport: &mut T,
+    reader: &mut R,
+    checksums: RemoteDeltaChecksums,
+    signatures: &[BlockSignature],
+    compression_level: Option<u32>,
+    mut progress: Option<&mut FileProgress>,
+    limits: TransferLimits,
+) -> Result<RemoteDeltaStats> {
+    let index = RemoteSignatureIndex::new(signatures)?;
+    ensure_allocation_within_limit("delta match window", index.max_len, limits.max_alloc)?;
+    ensure_allocation_within_limit("delta literal buffer", 32 * 1024, limits.max_alloc)?;
+
+    let checksum_len = signatures
+        .first()
+        .map(|signature| signature.strong.len())
+        .unwrap_or(16);
+    let strong = RsyncStrongChecksum {
+        checksum: checksums.block,
+        checksum_len,
+    };
+    let mut final_checksum = remote_final_checksum_builder(checksums.final_file);
+    let mut compressor = compression_level.map(RsyncDeflatedTokenWriter::new);
+    let mut stats = RemoteDeltaStats::default();
+    let mut window = Vec::with_capacity(index.max_len);
+    let mut literal = Vec::with_capacity(32 * 1024);
+    let mut eof = false;
+
+    fill_delta_window(
+        reader,
+        &mut window,
+        index.max_len,
+        &mut final_checksum,
+        &mut eof,
+        limits.stop_deadline,
+    )?;
+
+    while !window.is_empty() {
+        check_transfer_deadline(limits.stop_deadline)?;
+        if let Some(signature) = index.find_match(&window, &strong) {
+            write_pending_literal_token(
+                transport,
+                compressor.as_mut(),
+                &mut literal,
+                &mut stats,
+                progress.as_deref_mut(),
+            )?;
+            write_copy_token(transport, compressor.as_mut(), signature.index)?;
+            stats.copied_bytes += signature.len as u64;
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.advance(signature.len as u64);
+            }
+            window.drain(..signature.len);
+        } else {
+            literal.push(window.remove(0));
+            if literal.len() >= 32 * 1024 {
+                write_pending_literal_token(
+                    transport,
+                    compressor.as_mut(),
+                    &mut literal,
+                    &mut stats,
+                    progress.as_deref_mut(),
+                )?;
+            }
+        }
+        fill_delta_window(
+            reader,
+            &mut window,
+            index.max_len,
+            &mut final_checksum,
+            &mut eof,
+            limits.stop_deadline,
+        )?;
+    }
+
+    write_pending_literal_token(
+        transport,
+        compressor.as_mut(),
+        &mut literal,
+        &mut stats,
+        progress,
+    )?;
+    if let Some(compressor) = compressor.as_mut() {
+        compressor.finish(transport)?;
+    } else {
+        write_rsync_i32(transport, 0)?;
+    }
+    transport.write_all(&final_checksum.finalize())?;
+    Ok(stats)
+}
+
+struct RemoteSignatureIndex<'a> {
+    signatures: &'a [BlockSignature],
+    lengths_desc: Vec<usize>,
+    max_len: usize,
+}
+
+impl<'a> RemoteSignatureIndex<'a> {
+    fn new(signatures: &'a [BlockSignature]) -> Result<Self> {
+        let mut lengths_desc = signatures
+            .iter()
+            .map(|signature| signature.len)
+            .filter(|len| *len > 0)
+            .collect::<Vec<_>>();
+        lengths_desc.sort_unstable_by(|left, right| right.cmp(left));
+        lengths_desc.dedup();
+        let max_len = lengths_desc.first().copied().unwrap_or(0);
+        if max_len == 0 {
+            bail!("remote delta signatures did not include any non-empty blocks");
+        }
+        Ok(Self {
+            signatures,
+            lengths_desc,
+            max_len,
+        })
+    }
+
+    fn find_match<S: StrongChecksum>(
+        &self,
+        window: &[u8],
+        strong_checksum: &S,
+    ) -> Option<&'a BlockSignature> {
+        for len in &self.lengths_desc {
+            if window.len() < *len {
+                continue;
+            }
+            let candidate = &window[..*len];
+            let weak = rolling_checksum(candidate);
+            let mut strong = None;
+            for signature in self
+                .signatures
+                .iter()
+                .filter(|signature| signature.len == *len && signature.weak == weak)
+            {
+                let strong = strong.get_or_insert_with(|| strong_checksum.digest(candidate));
+                if signature.strong == *strong {
+                    return Some(signature);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn fill_delta_window<R: Read>(
+    reader: &mut R,
+    window: &mut Vec<u8>,
+    max_len: usize,
+    checksum: &mut RemoteChecksumBuilder,
+    eof: &mut bool,
+    stop_deadline: Option<Instant>,
+) -> Result<()> {
+    while !*eof && window.len() < max_len {
+        check_transfer_deadline(stop_deadline)?;
+        let old_len = window.len();
+        window.resize(max_len, 0);
+        let read = reader.read(&mut window[old_len..])?;
+        window.truncate(old_len + read);
+        if read == 0 {
+            *eof = true;
+            break;
+        }
+        checksum.update(&window[old_len..old_len + read]);
+    }
+    Ok(())
+}
+
+fn write_pending_literal_token<T: Write>(
+    transport: &mut T,
+    compressor: Option<&mut RsyncDeflatedTokenWriter>,
+    literal: &mut Vec<u8>,
+    stats: &mut RemoteDeltaStats,
+    progress: Option<&mut FileProgress>,
+) -> Result<()> {
+    if literal.is_empty() {
+        return Ok(());
+    }
+    write_literal_token(transport, compressor, literal, stats, progress)?;
+    literal.clear();
+    Ok(())
+}
+
+fn write_literal_token<T: Write>(
+    transport: &mut T,
+    compressor: Option<&mut RsyncDeflatedTokenWriter>,
+    literal: &[u8],
+    stats: &mut RemoteDeltaStats,
+    progress: Option<&mut FileProgress>,
+) -> Result<()> {
+    if let Some(compressor) = compressor {
+        compressor.send_literal(transport, literal)?;
+    } else {
+        write_rsync_i32(transport, literal.len() as i32)?;
+        transport.write_all(literal)?;
+    }
+    stats.literal_bytes += literal.len() as u64;
+    if let Some(progress) = progress {
+        progress.advance(literal.len() as u64);
+    }
+    Ok(())
+}
+
+fn write_copy_token<T: Write>(
+    transport: &mut T,
+    compressor: Option<&mut RsyncDeflatedTokenWriter>,
+    block_index: usize,
+) -> Result<()> {
+    if let Some(compressor) = compressor {
+        compressor.send_copy(transport, block_index)?;
+    } else {
+        write_rsync_i32(transport, block_index_to_copy_token(block_index)?)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn write_delta_tokens_from_bytes_with_checksum<T: Write>(
     transport: &mut T,
     bytes: &[u8],
@@ -5293,6 +6067,7 @@ fn write_delta_tokens_from_bytes_with_checksum<T: Write>(
             final_checksum,
             compression_level,
             progress,
+            None,
         )?;
         return Ok(RemoteDeltaStats {
             literal_bytes,
@@ -5365,6 +6140,7 @@ fn write_append_verify_file_tokens_from_path<T: Write>(
     prefix_len: usize,
     compression: Option<&RemoteCompressionConfig>,
     progress: Option<&mut FileProgress>,
+    stop_deadline: Option<Instant>,
 ) -> Result<u64> {
     let mut file = open_local_file(path)?;
     write_append_verify_literal_tokens_from_reader_with_checksum(
@@ -5374,6 +6150,7 @@ fn write_append_verify_file_tokens_from_path<T: Write>(
         prefix_len,
         compression.map(|compression| compression.level_for_path(path)),
         progress,
+        stop_deadline,
     )
 }
 
@@ -5383,12 +6160,14 @@ fn write_literal_tokens_from_reader_with_checksum<T: Write, R: Read>(
     checksum: RemoteFinalChecksum,
     compression_level: Option<u32>,
     mut progress: Option<&mut FileProgress>,
+    stop_deadline: Option<Instant>,
 ) -> Result<u64> {
     let mut checksum = remote_final_checksum_builder(checksum);
     let mut buf = [0_u8; 32 * 1024];
     let mut total = 0_u64;
     let mut compressor = compression_level.map(RsyncDeflatedTokenWriter::new);
     loop {
+        check_transfer_deadline(stop_deadline)?;
         let read = reader.read(&mut buf)?;
         if read == 0 {
             break;
@@ -5421,6 +6200,7 @@ fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Rea
     prefix_len: usize,
     compression_level: Option<u32>,
     mut progress: Option<&mut FileProgress>,
+    stop_deadline: Option<Instant>,
 ) -> Result<u64> {
     let mut checksum = remote_final_checksum_builder(checksum);
     let mut buf = [0_u8; 32 * 1024];
@@ -5428,6 +6208,7 @@ fn write_append_verify_literal_tokens_from_reader_with_checksum<T: Write, R: Rea
     let mut total = 0_u64;
     let mut compressor = compression_level.map(RsyncDeflatedTokenWriter::new);
     loop {
+        check_transfer_deadline(stop_deadline)?;
         let read = reader.read(&mut buf)?;
         if read == 0 {
             break;
@@ -5473,6 +6254,7 @@ fn remote_checksum_for_bytes(checksum: RemoteFileChecksum, bytes: &[u8]) -> [u8;
     checksum.finalize()
 }
 
+#[cfg(test)]
 fn remote_final_checksum_for_bytes(checksum: RemoteFinalChecksum, bytes: &[u8]) -> [u8; 16] {
     let mut checksum = remote_final_checksum_builder(checksum);
     checksum.update(bytes);
@@ -5612,14 +6394,17 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
     basis: Option<(&Path, RemoteSumHead)>,
     compression: Option<&RemoteCompressionConfig>,
     mut progress: Option<&mut FileProgress>,
+    max_alloc: Option<u64>,
+    stop_deadline: Option<Instant>,
 ) -> Result<u64> {
     if let Some(parent) = output_path.parent() {
         create_local_dir_all(parent)?;
     }
     let mut output = create_local_file(output_path)?;
-    let basis_bytes = match basis {
+    let mut basis_file = match basis {
         Some((basis_path, sum_head)) if sum_head.block_count > 0 => {
-            Some((read_local_file(basis_path)?, sum_head))
+            ensure_basis_copy_budget(sum_head, max_alloc)?;
+            Some((open_local_file(basis_path)?, sum_head))
         }
         _ => None,
     };
@@ -5629,6 +6414,7 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
     if let Some(compression) = compression {
         let mut token_reader = RsyncDeflatedTokenReader::new(compression.mode);
         loop {
+            check_transfer_deadline(stop_deadline)?;
             let token = {
                 let mut reader = MultiplexedReader::new(transport, mux);
                 token_reader.next_token(&mut reader)?
@@ -5657,25 +6443,15 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
                     }
                 }
                 RsyncDeflatedToken::Copy { block_index } => {
-                    let Some((basis_bytes, sum_head)) = basis_bytes.as_ref() else {
+                    let Some((basis_file, sum_head)) = basis_file.as_mut() else {
                         return Err(RemoteSessionError::UnexpectedToken {
                             token: block_index_to_copy_token(block_index)?,
                             path: path.display().to_string(),
                         }
                         .into());
                     };
-                    let (offset, len) = block_span(sum_head, block_index)?;
-                    let end = offset
-                        .checked_add(len)
-                        .context("basis copy token offset overflow")?;
-                    let Some(bytes) = basis_bytes.get(offset..end) else {
-                        bail!(
-                            "remote copy token {} references bytes outside the basis file for {}",
-                            block_index_to_copy_token(block_index)?,
-                            path.display()
-                        );
-                    };
-                    token_reader.observe_copy_data(bytes)?;
+                    let bytes = read_basis_block(basis_file, *sum_head, block_index, path)?;
+                    token_reader.observe_copy_data(&bytes)?;
                     let next_total = total.checked_add(bytes.len() as u64).ok_or(
                         RemoteSessionError::FileLengthExceeded {
                             path: path.display().to_string(),
@@ -5691,7 +6467,7 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
                         }
                         .into());
                     }
-                    output.write_all(bytes)?;
+                    output.write_all(&bytes)?;
                     total = next_total;
                     if let Some(progress) = progress.as_deref_mut() {
                         progress.advance(bytes.len() as u64);
@@ -5724,6 +6500,7 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
     }
 
     loop {
+        check_transfer_deadline(stop_deadline)?;
         let token = read_multiplexed_i32(transport, mux)?;
         if token > 0 {
             let literal_len = token as u64;
@@ -5777,7 +6554,7 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
             }
             return Ok(total);
         } else {
-            let Some((basis_bytes, sum_head)) = basis_bytes.as_ref() else {
+            let Some((basis_file, sum_head)) = basis_file.as_mut() else {
                 return Err(RemoteSessionError::UnexpectedToken {
                     token,
                     path: path.display().to_string(),
@@ -5785,16 +6562,7 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
                 .into());
             };
             let block_index = copy_token_to_block_index(token)?;
-            let (offset, len) = block_span(sum_head, block_index)?;
-            let end = offset
-                .checked_add(len)
-                .context("basis copy token offset overflow")?;
-            let Some(bytes) = basis_bytes.get(offset..end) else {
-                bail!(
-                    "remote copy token {token} references bytes outside the basis file for {}",
-                    path.display()
-                );
-            };
+            let bytes = read_basis_block(basis_file, *sum_head, block_index, path)?;
             let next_total = total.checked_add(bytes.len() as u64).ok_or(
                 RemoteSessionError::FileLengthExceeded {
                     path: path.display().to_string(),
@@ -5810,7 +6578,7 @@ fn read_file_tokens_to_path_with_basis<T: Read>(
                 }
                 .into());
             }
-            output.write_all(bytes)?;
+            output.write_all(&bytes)?;
             total = next_total;
             if let Some(progress) = progress.as_deref_mut() {
                 progress.advance(bytes.len() as u64);
@@ -5838,6 +6606,61 @@ fn remote_file_checksum_for_path(checksum: RemoteFinalChecksum, path: &Path) -> 
 fn read_local_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(to_long_path_safe(path))
         .with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn ensure_basis_copy_budget(sum_head: RemoteSumHead, max_alloc: Option<u64>) -> Result<()> {
+    validate_sum_head(sum_head)?;
+    if sum_head.block_count == 0 {
+        return Ok(());
+    }
+    ensure_allocation_within_limit("basis copy block", sum_head.block_len, max_alloc)
+}
+
+fn read_basis_block(
+    basis_file: &mut File,
+    sum_head: RemoteSumHead,
+    block_index: usize,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    let (offset, len) = block_span(&sum_head, block_index)?;
+    basis_file.seek(SeekFrom::Start(offset as u64))?;
+    let mut bytes = vec![0_u8; len];
+    basis_file.read_exact(&mut bytes).with_context(|| {
+        format!(
+            "remote copy token {} references bytes outside the basis file for {}",
+            block_index_to_copy_token(block_index).unwrap_or(i32::MIN),
+            path.display()
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn ensure_allocation_within_limit(
+    label: &'static str,
+    bytes: usize,
+    max_alloc: Option<u64>,
+) -> Result<()> {
+    if let Some(limit) = max_alloc.filter(|limit| *limit > 0) {
+        if bytes as u64 > limit {
+            bail!("{label} would require a {bytes} byte allocation, exceeding --max-alloc={limit}");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_signature_table_budget(
+    label: &'static str,
+    block_count: usize,
+    checksum_len: usize,
+    max_alloc: Option<u64>,
+) -> Result<()> {
+    let per_signature = std::mem::size_of::<BlockSignature>()
+        .checked_add(checksum_len)
+        .context("signature table allocation estimate overflow")?;
+    let bytes = block_count
+        .checked_mul(per_signature)
+        .context("signature table allocation estimate overflow")?;
+    ensure_allocation_within_limit(label, bytes, max_alloc)
 }
 
 fn open_local_file(path: &Path) -> Result<File> {
@@ -6182,6 +7005,23 @@ struct TransferPlan {
     write_batch: Option<PathBuf>,
     only_write_batch: Option<PathBuf>,
     read_batch: Option<PathBuf>,
+    // Chunk 13: Resource limits and operational controls
+    #[allow(dead_code)]
+    bwlimit: Option<u64>,
+    bwlimit_display: Option<String>,
+    timeout_secs: Option<u64>,
+    stop_after_minutes: Option<u64>,
+    time_limit_minutes: Option<u64>,
+    stop_deadline: Option<Instant>,
+    stop_at: Option<String>,
+    #[allow(dead_code)]
+    max_alloc: Option<u64>,
+    max_alloc_display: Option<String>,
+    early_input: Option<String>,
+    outbuf: Option<String>,
+    protocol_version: Option<u32>,
+    iconv: Option<String>,
+    open_noatime: bool,
     report: Report,
 }
 
@@ -6246,6 +7086,7 @@ impl TransferPlan {
         };
         let symlink_mode = symlink_mode_from_cli(cli);
         let explicit_server_mode = cli.daemon_server || cli.internal_server;
+        let requested_remote_wire_protocol = remote_wire_protocol_from_cli(cli, &mut report);
         let (daemon_operand, daemon_direction, has_daemon_operand) = if explicit_server_mode {
             (None, None, false)
         } else {
@@ -6303,7 +7144,8 @@ impl TransferPlan {
                             .collect();
                         let remote_path_refs: Vec<&Path> =
                             remote_paths.iter().map(PathBuf::as_path).collect();
-                        match build_remote_shell_protocol31_invocation_for_paths(
+                        match build_remote_shell_invocation_for_wire_protocol(
+                            requested_remote_wire_protocol,
                             &remote_shell_options_from_cli(
                                 cli,
                                 direction,
@@ -6320,12 +7162,10 @@ impl TransferPlan {
                                     &invocation.argv,
                                 ) {
                                     Ok(ssh_command) => {
-                                        report.info(
-                                        "I_REMOTE_PROTOCOL31_MVP",
-                                        format!(
-                                            "remote-shell execution tries protocol {REMOTE_SHELL_MODERN_PROTOCOL} first for the ordinary-file MVP"
-                                        ),
-                                    );
+                                        add_remote_protocol_diagnostic(
+                                            &mut report,
+                                            requested_remote_wire_protocol,
+                                        );
                                         (
                                             Some(invocation.argv),
                                             Some(invocation.protected_args),
@@ -6334,7 +7174,7 @@ impl TransferPlan {
                                             Some(remote.clone()),
                                             remotes,
                                             Some(direction),
-                                            Some(RemoteWireProtocol::Modern31),
+                                            Some(requested_remote_wire_protocol),
                                         )
                                     }
                                     Err(err) => {
@@ -6361,7 +7201,8 @@ impl TransferPlan {
                     .as_ref()
                     .expect("checked remote destination");
                 let direction = TransferDirection::Push;
-                match build_remote_shell_protocol31_invocation_for_paths(
+                match build_remote_shell_invocation_for_wire_protocol(
+                    requested_remote_wire_protocol,
                     &remote_shell_options_from_cli(
                         cli,
                         direction,
@@ -6374,11 +7215,9 @@ impl TransferPlan {
                     Ok(invocation) => {
                         match build_remote_transport_command(cli, &remote.host, &invocation.argv) {
                             Ok(ssh_command) => {
-                                report.info(
-                                    "I_REMOTE_PROTOCOL31_MVP",
-                                    format!(
-                                        "remote-shell execution tries protocol {REMOTE_SHELL_MODERN_PROTOCOL} first for the ordinary-file MVP"
-                                    ),
+                                add_remote_protocol_diagnostic(
+                                    &mut report,
+                                    requested_remote_wire_protocol,
                                 );
                                 (
                                     Some(invocation.argv),
@@ -6388,7 +7227,7 @@ impl TransferPlan {
                                     Some(remote.clone()),
                                     vec![remote.clone()],
                                     Some(direction),
-                                    Some(RemoteWireProtocol::Modern31),
+                                    Some(requested_remote_wire_protocol),
                                 )
                             }
                             Err(err) => {
@@ -6543,8 +7382,114 @@ impl TransferPlan {
             write_batch: cli.write_batch.clone(),
             only_write_batch: cli.only_write_batch.clone(),
             read_batch: cli.read_batch.clone(),
+            // Chunk 13
+            bwlimit: cli.bwlimit.as_ref().and_then(|v| parse_bwlimit_quiet(v)),
+            bwlimit_display: cli.bwlimit.clone().map(|v| format_bwlimit(&v)),
+            timeout_secs: cli.timeout_secs,
+            stop_after_minutes: cli.stop_after_minutes,
+            time_limit_minutes: cli.time_limit_minutes,
+            stop_deadline: stop_deadline_from_cli(cli, &mut report),
+            stop_at: cli.stop_at.clone(),
+            max_alloc: cli
+                .max_alloc
+                .as_ref()
+                .and_then(|v| parse_max_alloc_quiet(v)),
+            max_alloc_display: cli.max_alloc.clone().map(|v| format_max_alloc(&v)),
+            early_input: cli.early_input.clone(),
+            outbuf: cli.outbuf.clone(),
+            protocol_version: cli.protocol_version,
+            iconv: cli.iconv.clone(),
+            open_noatime: cli.open_noatime,
             report,
         }
+    }
+}
+
+fn parse_bwlimit_quiet(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (number, unit) = match trimmed.as_bytes().last().copied() {
+        Some(b'B') | Some(b'b') => (&trimmed[..trimmed.len() - 1], 1_f64),
+        Some(b'K') | Some(b'k') => (&trimmed[..trimmed.len() - 1], 1024_f64),
+        Some(b'M') | Some(b'm') => (&trimmed[..trimmed.len() - 1], 1024_f64 * 1024_f64),
+        Some(b'G') | Some(b'g') => (
+            &trimmed[..trimmed.len() - 1],
+            1024_f64 * 1024_f64 * 1024_f64,
+        ),
+        _ => (trimmed, 1024_f64),
+    };
+    let rate = number.trim().parse::<f64>().ok()?;
+    if !rate.is_finite() || rate <= 0.0 {
+        return None;
+    }
+    let bytes_per_second = (rate * unit).round();
+    if bytes_per_second < 1.0 || bytes_per_second > u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes_per_second as u64)
+}
+
+fn format_bwlimit(value: &str) -> String {
+    let trimmed = value.trim();
+    let (number, unit_label) = match trimmed.as_bytes().last().copied() {
+        Some(b'B') | Some(b'b') => (number_str(trimmed, 1), "B/s"),
+        Some(b'K') | Some(b'k') => (number_str(trimmed, 1), "KB/s"),
+        Some(b'M') | Some(b'm') => (number_str(trimmed, 1), "MB/s"),
+        Some(b'G') | Some(b'g') => (number_str(trimmed, 1), "GB/s"),
+        _ => (trimmed, "KB/s"),
+    };
+    let num: f64 = match number.parse::<f64>() {
+        Ok(n) if n.is_finite() => n,
+        _ => return trimmed.to_string(),
+    };
+    format!("{:.1} {}", num, unit_label)
+}
+
+fn number_str(s: &str, trim: usize) -> &str {
+    let end = s.len().saturating_sub(trim);
+    &s[..end]
+}
+
+fn parse_max_alloc_quiet(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (number_str, multiplier) = match trimmed.as_bytes().last().copied() {
+        Some(b'K') | Some(b'k') => (&trimmed[..trimmed.len() - 1], 1024_u64),
+        Some(b'M') | Some(b'm') => (&trimmed[..trimmed.len() - 1], 1024 * 1024),
+        Some(b'G') | Some(b'g') => (&trimmed[..trimmed.len() - 1], 1024 * 1024 * 1024),
+        _ => (trimmed, 1),
+    };
+    let number = number_str.trim().parse::<f64>().ok()?;
+    if !number.is_finite() || number <= 0.0 {
+        return None;
+    }
+    let bytes = (number * multiplier as f64).round();
+    if bytes < 1.0 || bytes > u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes as u64)
+}
+
+fn format_max_alloc(value: &str) -> String {
+    let trimmed = value.trim();
+    match trimmed.as_bytes().last().copied() {
+        Some(b'G') | Some(b'g') => {
+            let n: &str = &trimmed[..trimmed.len() - 1];
+            format!("{} GB", n.trim())
+        }
+        Some(b'M') | Some(b'm') => {
+            let n: &str = &trimmed[..trimmed.len() - 1];
+            format!("{} MB", n.trim())
+        }
+        Some(b'K') | Some(b'k') => {
+            let n: &str = &trimmed[..trimmed.len() - 1];
+            format!("{} KB", n.trim())
+        }
+        _ => format!("{trimmed} B"),
     }
 }
 
@@ -6817,6 +7762,7 @@ fn remote_shell_options_from_cli(
         compress_level: cli.compress_level,
         compress_threads: cli.compress_threads,
         skip_compress: cli.skip_compress.clone(),
+        outbuf: cli.outbuf.clone(),
         remote_options: cli.remote_options.clone(),
         includes,
         excludes,
@@ -7068,6 +8014,9 @@ fn file_write_options_from_plan(plan: &TransferPlan) -> FileWriteOptions {
         fsync: plan.fsync,
         sparse: plan.sparse,
         preallocate: plan.preallocate,
+        bwlimit: plan.bwlimit,
+        max_alloc: plan.max_alloc,
+        stop_deadline: plan.stop_deadline,
     }
 }
 
@@ -7594,6 +8543,76 @@ fn add_explicit_option_diagnostics(cli: &Cli, report: &mut Report) {
                 "--read-batch={} will replay a recorded transfer",
                 batch.display()
             ),
+        );
+    }
+
+    // Chunk 13 diagnostics
+    if let Some(ref bwlimit) = cli.bwlimit {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--bwlimit={bwlimit} bandwidth limiting will be applied to the transfer"),
+        );
+    }
+    if let Some(timeout) = cli.timeout_secs {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--timeout={timeout} sets I/O timeout in seconds during transfer"),
+        );
+    }
+    if let Some(stop_after) = cli.stop_after_minutes {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--stop-after={stop_after} will stop the transfer after the specified number of minutes"),
+        );
+    }
+    if let Some(time_limit) = cli.time_limit_minutes {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--time-limit={time_limit} sets a maximum runtime for the transfer"),
+        );
+    }
+    if let Some(ref stop_at) = cli.stop_at {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--stop-at={stop_at} will stop the transfer at the specified wall-clock time"),
+        );
+    }
+    if let Some(ref max_alloc) = cli.max_alloc {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--max-alloc={max_alloc} caps the largest single memory allocation during the transfer"),
+        );
+    }
+    if let Some(ref early_input) = cli.early_input {
+        report.info(
+            "I_OPTION_PARSED",
+            format!(
+                "--early-input={early_input} provides pre-seed data to send before the file list"
+            ),
+        );
+    }
+    if let Some(ref outbuf) = cli.outbuf {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--outbuf={outbuf} sets output buffering mode"),
+        );
+    }
+    if let Some(protocol) = cli.protocol_version {
+        report.info(
+            "I_OPTION_PARSED",
+            format!("--protocol={protocol} constrains protocol version negotiation"),
+        );
+    }
+    if let Some(ref iconv) = cli.iconv {
+        report.warn(
+            "W_ICONV_UNAVAILABLE",
+            format!("--iconv={iconv} charset conversion is not available on this platform; filenames are transferred as-is"),
+        );
+    }
+    if cli.open_noatime {
+        report.info(
+            "I_OPTION_PARSED",
+            "--open-noatime requested; O_NOATIME is not available on Windows, files are opened with normal access time semantics",
         );
     }
 }
@@ -8544,6 +9563,7 @@ mod tests {
             RemoteFinalChecksum::PlainMd4,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -8659,6 +9679,8 @@ mod tests {
             )),
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -8721,6 +9743,8 @@ mod tests {
             )),
             Some(&compression),
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -8740,6 +9764,7 @@ mod tests {
             &mut input,
             RemoteFinalChecksum::PlainMd4,
             3,
+            None,
             None,
             None,
         )
@@ -8798,8 +9823,12 @@ mod tests {
                 RemoteFinalChecksum::PlainMd4,
                 &source,
                 &[],
-                None,
-                None
+                DeltaWriteRuntime {
+                    compression: None,
+                    progress: None,
+                    max_alloc: None,
+                    stop_deadline: None,
+                },
             )
             .unwrap()
             .literal_bytes,
@@ -8830,7 +9859,9 @@ mod tests {
                 3,
                 None,
                 None,
-                None
+                None,
+                None,
+                None,
             )
             .unwrap(),
             3

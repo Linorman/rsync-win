@@ -538,13 +538,13 @@
 - Modify: `crates/rsync-cli/src/plan.rs`
 - Test: `crates/rsync-cli/src/lib.rs`
 
-- [ ] Implement `--bwlimit`.
-- [ ] Implement `--timeout`.
-- [ ] Implement `--stop-after`.
-- [ ] Implement `--stop-at`.
-- [ ] Implement `--max-alloc`.
-- [ ] Add deterministic tests with fake clocks or injectable throttlers.
-- [ ] Run `cargo test --workspace --all-features limits`.
+- [x] Implement `--bwlimit`.
+- [x] Implement `--timeout`.
+- [x] Implement `--stop-after`.
+- [x] Implement `--stop-at`.
+- [x] Implement `--max-alloc`.
+- [x] Add deterministic tests with fake clocks or injectable throttlers.
+- [x] Run `cargo test --workspace --all-features limits`.
 - [ ] Commit: `feat: add rsync operational limits`.
 
 ### Task 30: Implement Remaining Compatibility Toggles
@@ -554,11 +554,11 @@
 - Modify: `crates/rsync-cli/src/plan.rs`
 - Test: `tests/compat/options.rs`
 
-- [ ] Implement `--protocol` mode negotiation gating.
-- [ ] Implement `--iconv` or explicit platform-scoped diagnostic if charset conversion is unavailable.
-- [ ] Implement `--open-noatime` with capability fallback.
-- [ ] Implement `--outbuf`.
-- [ ] Implement `--early-input`.
+- [x] Implement `--protocol` mode negotiation gating.
+- [x] Implement `--iconv` or explicit platform-scoped diagnostic if charset conversion is unavailable.
+- [x] Implement `--open-noatime` with capability fallback.
+- [x] Implement `--outbuf`.
+- [x] Implement `--early-input`.
 - [x] Ensure all registry options have a non-placeholder implementation status.
 - [x] Run `cargo test -p rsync-cli --test options --all-features`.
 - [ ] Commit: `feat: handle remaining rsync compatibility toggles`.

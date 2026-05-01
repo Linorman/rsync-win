@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 use crate::metadata::{FileType, HardlinkId, MetadataFeature, PortableMetadata};
 use crate::walk::{FileWriteMode, FileWriteOptions, FsError, PortableFileSystem, WalkEntry};
@@ -59,6 +60,9 @@ pub struct SyncOptions {
     pub sparse: bool,
     pub preallocate: bool,
     pub fuzzy: bool,
+    pub bwlimit: Option<u64>,
+    pub max_alloc: Option<u64>,
+    pub stop_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +126,9 @@ impl Default for SyncOptions {
             sparse: false,
             preallocate: false,
             fuzzy: false,
+            bwlimit: None,
+            max_alloc: None,
+            stop_deadline: None,
         }
     }
 }
@@ -287,6 +294,7 @@ pub fn sync_tree<F: PortableFileSystem>(
     let mut hardlink_targets = BTreeMap::new();
     let mut directory_mtimes = Vec::new();
     for (relative, entry) in &source_entries {
+        check_sync_deadline(options.stop_deadline)?;
         let target = dest.join(relative);
         let result = match entry.metadata.file_type {
             FileType::Directory => {
@@ -404,6 +412,7 @@ pub fn sync_sources<F: PortableFileSystem>(
     let mut report = SyncReport::default();
     let mut present_sources = Vec::with_capacity(sources.len());
     for source in sources {
+        check_sync_deadline(options.stop_deadline)?;
         match fs.metadata(source) {
             Ok(_) => present_sources.push(source.clone()),
             Err(FsError::NotFound(_)) if options.delete_missing_args => {
@@ -437,6 +446,13 @@ pub fn sync_sources<F: PortableFileSystem>(
     }?;
     report.actions.extend(child.actions);
     Ok(report)
+}
+
+fn check_sync_deadline(deadline: Option<Instant>) -> Result<(), FsError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(FsError::Unsupported("transfer stop deadline reached"));
+    }
+    Ok(())
 }
 
 fn ensure_implied_relative_dirs<F: PortableFileSystem>(
@@ -1000,6 +1016,9 @@ fn file_write_options(options: &SyncOptions) -> FileWriteOptions {
         fsync: options.fsync,
         sparse: options.sparse,
         preallocate: options.preallocate,
+        bwlimit: options.bwlimit,
+        max_alloc: options.max_alloc,
+        stop_deadline: options.stop_deadline,
     }
 }
 
@@ -1012,6 +1031,9 @@ fn delayed_file_write_options(options: &SyncOptions) -> FileWriteOptions {
         fsync: options.fsync,
         sparse: options.sparse,
         preallocate: options.preallocate,
+        bwlimit: options.bwlimit,
+        max_alloc: options.max_alloc,
+        stop_deadline: options.stop_deadline,
     }
 }
 

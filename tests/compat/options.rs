@@ -3,7 +3,7 @@ use std::fs;
 
 use rsync_cli::options::{
     daemon_option_specs, parse_options, project_option_specs, upstream_client_option_specs,
-    ImplementationStatus,
+    OptionSupport,
 };
 use rsync_cli::{parse_and_execute, parse_and_render, parse_and_render_result};
 
@@ -232,7 +232,7 @@ fn daemon_and_project_options_are_classified_separately() {
 fn chunk10_daemon_options_are_marked_implemented() {
     let daemon = daemon_option_specs()
         .iter()
-        .map(|spec| (spec.long, spec.status))
+        .map(|spec| (spec.long, spec.support))
         .collect::<std::collections::BTreeMap<_, _>>();
 
     for option in [
@@ -251,7 +251,7 @@ fn chunk10_daemon_options_are_marked_implemented() {
     ] {
         assert_eq!(
             daemon.get(option).copied(),
-            Some(ImplementationStatus::Implemented),
+            Some(OptionSupport::Partial),
             "daemon --{option} should be implemented for chunk10"
         );
     }
@@ -261,7 +261,7 @@ fn chunk10_daemon_options_are_marked_implemented() {
 fn chunk11_output_options_are_marked_implemented() {
     let client = upstream_client_option_specs()
         .iter()
-        .map(|spec| (spec.long, spec.status))
+        .map(|spec| (spec.long, spec.support))
         .collect::<std::collections::BTreeMap<_, _>>();
 
     for option in [
@@ -283,8 +283,59 @@ fn chunk11_output_options_are_marked_implemented() {
     ] {
         assert_eq!(
             client.get(option).copied(),
-            Some(ImplementationStatus::Implemented),
+            Some(OptionSupport::Full),
             "client --{option} should be implemented for chunk11"
+        );
+    }
+}
+
+#[test]
+fn option_status_model_does_not_overstate_execution_support() {
+    let client = upstream_client_option_specs()
+        .iter()
+        .map(|spec| (spec.long, spec.support))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for (option, support) in [
+        ("iconv", OptionSupport::DiagnosticOnly),
+        ("compress-threads", OptionSupport::ParsedOnly),
+        ("copy-as", OptionSupport::DiagnosticOnly),
+        ("early-input", OptionSupport::Partial),
+    ] {
+        assert_eq!(client.get(option).copied(), Some(support));
+        assert_ne!(support, OptionSupport::Full);
+    }
+}
+
+#[test]
+fn option_status_doc_separates_execution_support_levels() {
+    let doc_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/OPTION-STATUS.md");
+    let doc = fs::read_to_string(doc_path).unwrap();
+
+    for heading in [
+        "Fully implemented",
+        "Partially implemented by mode",
+        "Diagnostic/reporting only",
+        "Parsed for compatibility only",
+        "Planned",
+    ] {
+        assert!(doc.contains(heading), "missing status heading {heading}");
+    }
+
+    let full_line = doc
+        .lines()
+        .find(|line| line.starts_with("| Fully implemented |"))
+        .unwrap_or("");
+    for option in [
+        "`--iconv`",
+        "`--compress-threads`",
+        "`--copy-as`",
+        "`--early-input`",
+    ] {
+        assert!(
+            !full_line.contains(option),
+            "{option} must not be advertised as fully implemented"
         );
     }
 }
@@ -432,13 +483,14 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
         "--i-r",
         "--no-inc-recursive",
         "--no-i-r",
-        "--time-limit",
     ] {
         assert!(
             output.contains(option),
             "missing compatibility diagnostic for {option}: {output}"
         );
     }
+    // --time-limit is now implemented
+    assert!(output.contains("time limit: 1 minutes"));
 
     let daemon_output =
         parse_and_render_result(["rsync-win", "--plan", "--daemon", "--no-detach"]).unwrap();
@@ -1062,6 +1114,214 @@ fn conflict_engine_reports_update_delete_temp_metadata_and_link_conflicts() {
         assert!(
             output.contains(expected),
             "missing `{expected}` in output:\n{output}"
+        );
+    }
+}
+
+// Chunk 13: Resource Limits and Operational Controls
+
+#[test]
+fn chunk13_bwlimit_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--bwlimit=128", "src", "dst"]);
+    assert!(output.contains("bwlimit: 128.0 KB/s"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_bwlimit_parses_megabytes() {
+    let output = parse_and_render(["rsync-win", "--plan", "--bwlimit=2M", "src", "dst"]);
+    assert!(output.contains("bwlimit: 2.0 MB/s"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_timeout_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--timeout=30", "src", "dst"]);
+    assert!(output.contains("timeout: 30s"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_stop_after_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--stop-after=5", "src", "dst"]);
+    assert!(output.contains("stop after: 5 minutes"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_stop_at_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--stop-at=23:59", "src", "dst"]);
+    assert!(output.contains("stop at: 23:59"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_max_alloc_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--max-alloc=256M", "src", "dst"]);
+    assert!(output.contains("max alloc: 256 MB"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_time_limit_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--time-limit=60", "src", "dst"]);
+    assert!(output.contains("time limit: 60 minutes"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_protocol_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--protocol=31", "src", "dst"]);
+    assert!(output.contains("protocol: 31"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_protocol_27_gates_remote_shell_plan() {
+    let output = parse_and_render(["rsync-win", "--plan", "--protocol=27", "src", "host:/dest"]);
+
+    assert!(output.contains("protocol: 27"), "{output}");
+    assert!(
+        output.contains("wire protocol: experimental protocol 27 compatibility mode (27)"),
+        "{output}"
+    );
+    assert!(!output.contains("--no-inc-recursive"), "{output}");
+}
+
+#[test]
+fn chunk13_protocol_rejects_unsupported_execution_version() {
+    let err =
+        parse_and_render_result(["rsync-win", "--plan", "--protocol=30", "src", "host:/dest"])
+            .unwrap_err();
+
+    assert!(err.to_string().contains("--protocol"), "{err}");
+    assert!(err.to_string().contains("27 and 31"), "{err}");
+}
+
+#[test]
+fn chunk13_iconv_emits_diagnostic() {
+    let output = parse_and_render([
+        "rsync-win",
+        "--plan",
+        "--iconv=UTF-8,ISO-8859-1",
+        "src",
+        "dst",
+    ]);
+    assert!(output.contains("iconv: UTF-8,ISO-8859-1"), "{output}");
+    assert!(output.contains("charset conversion"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_open_noatime_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--open-noatime", "src", "dst"]);
+    assert!(output.contains("open noatime: true"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_outbuf_is_parsed_and_rendered() {
+    let output = parse_and_render(["rsync-win", "--plan", "--outbuf=L", "src", "dst"]);
+    assert!(output.contains("outbuf: L"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_outbuf_routes_to_remote_server_argv() {
+    let output = parse_and_render(["rsync-win", "--plan", "--outbuf=L", "src", "host:/dest"]);
+
+    assert!(output.contains("remote --server argv:"), "{output}");
+    assert!(output.contains("--outbuf=L"), "{output}");
+}
+
+#[test]
+fn chunk13_early_input_is_parsed_and_rendered() {
+    let output = parse_and_render([
+        "rsync-win",
+        "--plan",
+        "--early-input=preseed.dat",
+        "src",
+        "dst",
+    ]);
+    assert!(output.contains("early input: preseed.dat"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_all_limits_combined_no_warnings() {
+    let output = parse_and_render([
+        "rsync-win",
+        "--plan",
+        "--bwlimit=1M",
+        "--timeout=60",
+        "--stop-after=10",
+        "--time-limit=30",
+        "--max-alloc=512M",
+        "--protocol=31",
+        "--outbuf=L",
+        "--early-input=seed.bin",
+        "src",
+        "dst",
+    ]);
+    assert!(output.contains("bwlimit: 1.0 MB/s"), "{output}");
+    assert!(output.contains("timeout: 60s"), "{output}");
+    assert!(output.contains("stop after: 10 minutes"), "{output}");
+    assert!(output.contains("time limit: 30 minutes"), "{output}");
+    assert!(output.contains("max alloc: 512 MB"), "{output}");
+    assert!(output.contains("protocol: 31"), "{output}");
+    assert!(output.contains("outbuf: L"), "{output}");
+    assert!(output.contains("early input: seed.bin"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_clustered_short_limits() {
+    let output = parse_and_render(["rsync-win", "--plan", "-4", "--ipv6", "src", "dst"]);
+    assert!(output.contains("address family: ipv6"), "{output}");
+    assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
+}
+
+#[test]
+fn chunk13_resource_limit_values_are_validated() {
+    for args in [
+        vec!["rsync-win", "--plan", "--bwlimit=-1", "src", "dst"],
+        vec!["rsync-win", "--plan", "--bwlimit=not-a-rate", "src", "dst"],
+        vec!["rsync-win", "--plan", "--max-alloc=-1", "src", "dst"],
+        vec!["rsync-win", "--plan", "--max-alloc=bad-size", "src", "dst"],
+        vec!["rsync-win", "--plan", "--outbuf=X", "src", "dst"],
+        vec!["rsync-win", "--plan", "--stop-at=25:61", "src", "dst"],
+    ] {
+        assert!(
+            parse_and_render_result(args.clone()).is_err(),
+            "{args:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn chunk13_registry_status_is_implemented() {
+    let specs = rsync_cli::options::upstream_client_option_specs();
+    let chunk13_options = [
+        ("bwlimit", OptionSupport::Partial),
+        ("timeout", OptionSupport::Partial),
+        ("stop-after", OptionSupport::Partial),
+        ("time-limit", OptionSupport::Partial),
+        ("stop-at", OptionSupport::Partial),
+        ("max-alloc", OptionSupport::Partial),
+        ("protocol", OptionSupport::Partial),
+        ("iconv", OptionSupport::DiagnosticOnly),
+        ("open-noatime", OptionSupport::DiagnosticOnly),
+        ("outbuf", OptionSupport::Partial),
+        ("early-input", OptionSupport::Partial),
+    ];
+    for (option, support) in chunk13_options {
+        let spec = specs
+            .iter()
+            .find(|s| s.long == option)
+            .expect(&format!("missing --{option}"));
+        assert_eq!(
+            spec.support, support,
+            "--{option} should have conservative execution support"
         );
     }
 }

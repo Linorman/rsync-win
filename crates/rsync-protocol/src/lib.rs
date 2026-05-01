@@ -11,16 +11,16 @@ pub use daemon::{
     DaemonModuleSelection, DaemonOperand, DEFAULT_DAEMON_PORT,
 };
 pub use flist::{
-    read_file_list, read_internal_file_list, read_rsync27_file_list,
+    check_rsync_file_list_budget, read_file_list, read_internal_file_list, read_rsync27_file_list,
     read_rsync27_file_list_with_options, read_rsync31_file_list,
     read_rsync31_file_list_with_metadata, read_rsync31_file_list_with_options, read_rsync_long,
     write_file_list, write_internal_file_list, write_rsync27_file_list,
     write_rsync27_file_list_with_options, write_rsync31_file_list,
     write_rsync31_file_list_with_metadata, write_rsync31_file_list_with_options, write_rsync_long,
-    FileListEntry, FileListError, RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions,
-    RsyncHardLinkGroup, RsyncXattrPayload, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
-    DEFAULT_MAX_FILE_LIST_PATH_LEN, RSYNC_DIRECTORY_MODE, RSYNC_REGULAR_FILE_MODE,
-    RSYNC_SYMLINK_MODE,
+    AllocationBudget, FileListEntry, FileListError, RsyncFileListEntry, RsyncFileListMetadata,
+    RsyncFileListOptions, RsyncHardLinkGroup, RsyncXattrPayload, WireFileType,
+    DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN, RSYNC_DIRECTORY_MODE,
+    RSYNC_REGULAR_FILE_MODE, RSYNC_SYMLINK_MODE,
 };
 pub use io::{
     read_i32_le, read_rsync_index, read_u16_le, read_u8, read_varlong, read_vstring, write_i32_le,

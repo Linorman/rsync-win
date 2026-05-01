@@ -45,3 +45,11 @@ path = "../../tests/compat/options.rs"
 [[test]]
 name = "security_remote_peer"
 path = "../../tests/security/remote_peer.rs"
+
+[[test]]
+name = "large_file"
+path = "../../tests/stress/large_file.rs"
+
+[[test]]
+name = "large_tree"
+path = "../../tests/stress/large_tree.rs"
