@@ -99,6 +99,7 @@ fn incremental_receiver_state_plans_deletes_after_all_batches_and_protects_filte
             IncrementalDeleteDecision::ProtectDelete(PathBuf::from("protected.bak")),
         ]
     );
+    assert_eq!(state.pending_deletes(), decisions.as_slice());
 }
 
 #[test]

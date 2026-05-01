@@ -274,6 +274,10 @@ fn estimated_file_list_entry_alloc(entry: &RsyncFileListEntry) -> usize {
     total
 }
 
+pub fn estimated_rsync_file_list_entry_alloc(entry: &RsyncFileListEntry) -> usize {
+    estimated_file_list_entry_alloc(entry)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RsyncFileListOptions {
     pub include_checksums: bool,

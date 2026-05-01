@@ -11,8 +11,9 @@ pub use daemon::{
     DaemonModuleSelection, DaemonOperand, DEFAULT_DAEMON_PORT,
 };
 pub use flist::{
-    check_rsync_file_list_budget, read_file_list, read_internal_file_list, read_rsync27_file_list,
-    read_rsync27_file_list_with_options, read_rsync31_file_list, read_rsync31_file_list_batch,
+    check_rsync_file_list_budget, estimated_rsync_file_list_entry_alloc, read_file_list,
+    read_internal_file_list, read_rsync27_file_list, read_rsync27_file_list_with_options,
+    read_rsync31_file_list, read_rsync31_file_list_batch,
     read_rsync31_file_list_batch_with_metadata, read_rsync31_file_list_with_metadata,
     read_rsync31_file_list_with_options, read_rsync_long, write_file_list,
     write_internal_file_list, write_rsync27_file_list, write_rsync27_file_list_with_options,

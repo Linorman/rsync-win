@@ -32,15 +32,16 @@ use rsync_protocol::{
     authenticate_daemon_module, build_remote_shell_argv_for_paths,
     build_remote_shell_invocation_for_paths, build_remote_shell_protocol31_argv_for_paths,
     build_remote_shell_protocol31_invocation_for_paths, check_rsync_file_list_budget,
-    exchange_daemon_greeting, exchange_protocol31_setup_with_options,
-    exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake_with_options,
-    read_i32_le, read_multiplexed_i32, read_multiplexed_long, read_rsync27_file_list_with_options,
+    estimated_rsync_file_list_entry_alloc, exchange_daemon_greeting,
+    exchange_protocol31_setup_with_options, exchange_remote_shell_mvp_handshake,
+    exchange_remote_shell_protocol31_handshake_with_options, read_i32_le, read_multiplexed_i32,
+    read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_metadata, read_rsync_index, read_u16_le, read_u8, read_varlong,
     read_vstring, request_module_list, rsync_plain_md4_checksum_reader, select_daemon_module,
     write_daemon_args, write_i32_le, write_remote_shell_protected_args,
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_metadata, write_rsync_i32,
-    write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
-    DaemonOperand, FileListBatch, FileListBatchBuilder, MultiplexReadState, MultiplexedReader,
+    write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, AllocationBudget,
+    DaemonModuleSelection, DaemonOperand, FileListBatch, MultiplexReadState, MultiplexedReader,
     MultiplexedWriter, Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError,
     RemoteShellInvocation, RemoteShellOperand, RemoteShellOptions, RsyncDeflatedToken,
     RsyncDeflatedTokenMode, RsyncDeflatedTokenReader, RsyncDeflatedTokenWriter, RsyncFileListEntry,
@@ -1121,6 +1122,104 @@ fn execute_or_render(cli: &Cli) -> Result<String> {
 struct RemoteSourceEntry {
     wire: RsyncFileListEntry,
     local_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteSourceEntryBatch {
+    base_index: usize,
+    entries: Vec<RemoteSourceEntry>,
+    is_final: bool,
+}
+
+impl RemoteSourceEntryBatch {
+    fn file_list_batch(&self) -> FileListBatch {
+        FileListBatch {
+            base_index: self.base_index,
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| entry.wire.clone())
+                .collect(),
+            is_final: self.is_final,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RemoteSourceEntryBatchBuilder {
+    max_entries: usize,
+    max_alloc: Option<u64>,
+    next_base_index: usize,
+    current_entries: Vec<RemoteSourceEntry>,
+    current_alloc: usize,
+}
+
+impl RemoteSourceEntryBatchBuilder {
+    fn with_max_alloc(max_entries: usize, max_alloc: Option<u64>) -> Result<Self> {
+        if max_entries == 0 {
+            bail!("file-list batch size must be greater than zero");
+        }
+
+        Ok(Self {
+            max_entries,
+            max_alloc,
+            next_base_index: 0,
+            current_entries: Vec::with_capacity(max_entries.min(1024)),
+            current_alloc: 0,
+        })
+    }
+
+    fn push(&mut self, entry: RemoteSourceEntry) -> Result<Option<RemoteSourceEntryBatch>> {
+        let entry_alloc = estimated_rsync_file_list_entry_alloc(&entry.wire);
+        if self.should_flush_before(entry_alloc) {
+            let batch = self.emit(false);
+            self.push_current(entry, entry_alloc)?;
+            return Ok(Some(batch));
+        }
+
+        self.push_current(entry, entry_alloc)?;
+        if self.current_entries.len() >= self.max_entries {
+            Ok(Some(self.emit(false)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn finish(&mut self) -> RemoteSourceEntryBatch {
+        self.emit(true)
+    }
+
+    fn should_flush_before(&self, entry_alloc: usize) -> bool {
+        if self.current_entries.is_empty() {
+            return false;
+        }
+        if self.current_entries.len() >= self.max_entries {
+            return true;
+        }
+        if let Some(limit) = self.max_alloc.filter(|limit| *limit > 0) {
+            return self.current_alloc.saturating_add(entry_alloc) as u64 > limit;
+        }
+        false
+    }
+
+    fn push_current(&mut self, entry: RemoteSourceEntry, entry_alloc: usize) -> Result<()> {
+        AllocationBudget::new(self.max_alloc).check("file-list batch entry", entry_alloc)?;
+        self.current_alloc = self.current_alloc.saturating_add(entry_alloc);
+        self.current_entries.push(entry);
+        Ok(())
+    }
+
+    fn emit(&mut self, is_final: bool) -> RemoteSourceEntryBatch {
+        let entries = std::mem::take(&mut self.current_entries);
+        let base_index = self.next_base_index;
+        self.next_base_index += entries.len();
+        self.current_alloc = 0;
+        RemoteSourceEntryBatch {
+            base_index,
+            entries,
+            is_final,
+        }
+    }
 }
 
 struct LocalSourceCollectContext<'a> {
@@ -2609,9 +2708,9 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     let files_from = load_files_from(cli)?;
     progress.info("building upload file list");
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
-    let entries = collect_local_source_entries(&sources, &collect_options)?;
-    let wire_batches = remote_source_file_list_batches(&entries, plan.max_alloc)
-        .context("local upload file-list batch exceeds allocation budget")?;
+    let (entries, wire_batches) =
+        collect_local_push_source_entries_and_batches(&sources, &collect_options, plan.max_alloc)
+            .context("local upload file-list batch exceeds allocation budget")?;
     let wire_entries = flatten_file_list_batches(&wire_batches);
     check_rsync_file_list_budget(&wire_entries, plan.max_alloc)
         .context("local upload file-list exceeds allocation budget")?;
@@ -2704,9 +2803,9 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     let files_from = load_files_from(cli)?;
     progress.info("building upload file list");
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
-    let entries = collect_local_source_entries(&sources, &collect_options)?;
-    let wire_batches = remote_source_file_list_batches(&entries, plan.max_alloc)
-        .context("local upload file-list batch exceeds allocation budget")?;
+    let (entries, wire_batches) =
+        collect_local_push_source_entries_and_batches(&sources, &collect_options, plan.max_alloc)
+            .context("local upload file-list batch exceeds allocation budget")?;
     let wire_entries = flatten_file_list_batches(&wire_batches);
     check_rsync_file_list_budget(&wire_entries, plan.max_alloc)
         .context("local upload file-list exceeds allocation budget")?;
@@ -4095,22 +4194,88 @@ fn collect_local_source_entries(
     sources: &[PathBuf],
     options: &LocalSourceCollectOptions<'_>,
 ) -> Result<Vec<RemoteSourceEntry>> {
-    if sources.len() == 1 {
-        return collect_single_local_source_entries(&sources[0], options);
-    }
-
-    collect_batch_local_source_entries(sources, options)
+    let mut entries = Vec::new();
+    collect_local_source_entries_with_callback(sources, options, |entry| {
+        entries.push(entry);
+        Ok(())
+    })?;
+    entries.sort_by(|left, right| left.wire.path.cmp(&right.wire.path));
+    Ok(entries)
 }
 
-fn collect_single_local_source_entries(
+fn collect_local_source_entry_batches<F>(
+    sources: &[PathBuf],
+    options: &LocalSourceCollectOptions<'_>,
+    max_entries: usize,
+    max_alloc: Option<u64>,
+    mut on_batch: F,
+) -> Result<()>
+where
+    F: FnMut(RemoteSourceEntryBatch) -> Result<()>,
+{
+    let mut builder = RemoteSourceEntryBatchBuilder::with_max_alloc(max_entries, max_alloc)?;
+    collect_local_source_entries_with_callback(sources, options, |entry| {
+        if let Some(batch) = builder.push(entry)? {
+            on_batch(batch)?;
+        }
+        Ok(())
+    })?;
+    on_batch(builder.finish())?;
+    Ok(())
+}
+
+fn collect_local_push_source_entries_and_batches(
+    sources: &[PathBuf],
+    options: &LocalSourceCollectOptions<'_>,
+    max_alloc: Option<u64>,
+) -> Result<(Vec<RemoteSourceEntry>, Vec<FileListBatch>)> {
+    let mut entries = Vec::new();
+    let mut wire_batches = Vec::new();
+    collect_local_source_entry_batches(
+        sources,
+        options,
+        REMOTE_FILE_LIST_BATCH_ENTRIES,
+        max_alloc,
+        |batch| {
+            wire_batches.push(batch.file_list_batch());
+            entries.extend(batch.entries.iter().cloned());
+            Ok(())
+        },
+    )?;
+    Ok((entries, wire_batches))
+}
+
+fn collect_local_source_entries_with_callback<F>(
+    sources: &[PathBuf],
+    options: &LocalSourceCollectOptions<'_>,
+    mut on_entry: F,
+) -> Result<()>
+where
+    F: FnMut(RemoteSourceEntry) -> Result<()>,
+{
+    if sources.len() == 1 {
+        return collect_single_local_source_entries_with_callback(
+            &sources[0],
+            options,
+            &mut on_entry,
+        );
+    }
+
+    collect_batch_local_source_entries_with_callback(sources, options, &mut on_entry)
+}
+
+fn collect_single_local_source_entries_with_callback<F>(
     source: &Path,
     options: &LocalSourceCollectOptions<'_>,
-) -> Result<Vec<RemoteSourceEntry>> {
+    on_entry: &mut F,
+) -> Result<()>
+where
+    F: FnMut(RemoteSourceEntry) -> Result<()>,
+{
     let fs = LocalFileSystem;
     let source_metadata =
         remote_sender_metadata(&fs, source, fs.metadata(source)?, options.symlink_mode)?
             .context("source is skipped by link handling")?;
-    let mut entries = Vec::new();
 
     if source_metadata.file_type == FileType::File {
         let file_name = source
@@ -4122,9 +4287,9 @@ fn collect_single_local_source_entries(
                 .files_from
                 .is_some_and(|files_from| !files_from_matches(&relative, files_from))
         {
-            return Ok(entries);
+            return Ok(());
         }
-        entries.push(RemoteSourceEntry {
+        on_entry(RemoteSourceEntry {
             wire: RsyncFileListEntry {
                 path: relative.clone(),
                 file_type: WireFileType::File,
@@ -4148,15 +4313,15 @@ fn collect_single_local_source_entries(
                 metadata: remote_file_list_metadata(source),
             },
             local_path: source.to_path_buf(),
-        });
-        return Ok(entries);
+        })?;
+        return Ok(());
     }
 
     if source_metadata.file_type != FileType::Directory {
         bail!("remote-shell MVP only transfers ordinary files and directories");
     }
 
-    entries.push(RemoteSourceEntry {
+    on_entry(RemoteSourceEntry {
         wire: RsyncFileListEntry {
             path: PathBuf::from("."),
             file_type: WireFileType::Directory,
@@ -4168,25 +4333,25 @@ fn collect_single_local_source_entries(
             metadata: remote_file_list_metadata(source),
         },
         local_path: source.to_path_buf(),
-    });
+    })?;
 
-    collect_local_directory_source_entries(
+    collect_local_directory_source_entries_with_callback(
         &LocalSourceCollectContext { fs: &fs, options },
         source,
         Path::new(""),
-        &mut entries,
-    )?;
-
-    entries.sort_by(|left, right| left.wire.path.cmp(&right.wire.path));
-    Ok(entries)
+        on_entry,
+    )
 }
 
-fn collect_batch_local_source_entries(
+fn collect_batch_local_source_entries_with_callback<F>(
     sources: &[PathBuf],
     options: &LocalSourceCollectOptions<'_>,
-) -> Result<Vec<RemoteSourceEntry>> {
+    on_entry: &mut F,
+) -> Result<()>
+where
+    F: FnMut(RemoteSourceEntry) -> Result<()>,
+{
     let fs = LocalFileSystem;
-    let mut entries = Vec::new();
     for source in sources {
         let file_name = source
             .file_name()
@@ -4237,7 +4402,7 @@ fn collect_batch_local_source_entries(
             continue;
         }
 
-        entries.push(RemoteSourceEntry {
+        on_entry(RemoteSourceEntry {
             wire: RsyncFileListEntry {
                 path: relative.clone(),
                 file_type,
@@ -4255,7 +4420,7 @@ fn collect_batch_local_source_entries(
                 metadata: remote_file_list_metadata(source),
             },
             local_path: source.clone(),
-        });
+        })?;
 
         if options.recursive && file_type == WireFileType::Directory {
             let child_root = remote_followed_directory_path(
@@ -4265,33 +4430,16 @@ fn collect_batch_local_source_entries(
                 options.symlink_mode,
             )
             .unwrap_or_else(|| source.clone());
-            collect_local_directory_source_entries(
+            collect_local_directory_source_entries_with_callback(
                 &LocalSourceCollectContext { fs: &fs, options },
                 &child_root,
                 &relative,
-                &mut entries,
+                on_entry,
             )?;
         }
     }
 
-    entries.sort_by(|left, right| left.wire.path.cmp(&right.wire.path));
-    Ok(entries)
-}
-
-fn remote_source_file_list_batches(
-    entries: &[RemoteSourceEntry],
-    max_alloc: Option<u64>,
-) -> Result<Vec<FileListBatch>> {
-    let mut builder =
-        FileListBatchBuilder::with_max_alloc(REMOTE_FILE_LIST_BATCH_ENTRIES, max_alloc)?;
-    let mut batches = Vec::new();
-    for entry in entries {
-        if let Some(batch) = builder.push(entry.wire.clone())? {
-            batches.push(batch);
-        }
-    }
-    batches.push(builder.finish());
-    Ok(batches)
+    Ok(())
 }
 
 fn flatten_file_list_batches(batches: &[FileListBatch]) -> Vec<RsyncFileListEntry> {
@@ -4301,12 +4449,15 @@ fn flatten_file_list_batches(batches: &[FileListBatch]) -> Vec<RsyncFileListEntr
         .collect()
 }
 
-fn collect_local_directory_source_entries(
+fn collect_local_directory_source_entries_with_callback<F>(
     ctx: &LocalSourceCollectContext<'_>,
     current: &Path,
     relative_root: &Path,
-    entries: &mut Vec<RemoteSourceEntry>,
-) -> Result<()> {
+    on_entry: &mut F,
+) -> Result<()>
+where
+    F: FnMut(RemoteSourceEntry) -> Result<()>,
+{
     for entry in ctx.fs.list(current)? {
         let name = entry
             .path
@@ -4365,7 +4516,7 @@ fn collect_local_directory_source_entries(
             continue;
         }
 
-        entries.push(RemoteSourceEntry {
+        on_entry(RemoteSourceEntry {
             wire: RsyncFileListEntry {
                 path: relative.clone(),
                 file_type,
@@ -4383,7 +4534,7 @@ fn collect_local_directory_source_entries(
                 metadata: remote_file_list_metadata(&original_path),
             },
             local_path: original_path.clone(),
-        });
+        })?;
         if ctx.options.recursive && file_type == WireFileType::Directory {
             let child_root = remote_followed_directory_path(
                 &original_path,
@@ -4392,7 +4543,12 @@ fn collect_local_directory_source_entries(
                 ctx.options.symlink_mode,
             )
             .unwrap_or(original_path);
-            collect_local_directory_source_entries(ctx, &child_root, &relative, entries)?;
+            collect_local_directory_source_entries_with_callback(
+                ctx,
+                &child_root,
+                &relative,
+                on_entry,
+            )?;
         }
     }
 
@@ -12565,6 +12721,48 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.wire.path.as_path() == Path::new("keep.bak")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_sender_collects_file_list_batches_during_local_walk() {
+        let root = unique_temp_dir("rsync-cli-source-batches");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("dir")).unwrap();
+        for path in ["a.txt", "b.txt", "dir/c.txt", "dir/d.txt"] {
+            fs::write(source.join(path), b"x").unwrap();
+        }
+        let filter_rules = RuleSet::empty();
+        let options = LocalSourceCollectOptions {
+            recursive: true,
+            filter_rules: &filter_rules,
+            files_from: None,
+            symlink_mode: SymlinkMode::Preserve,
+            include_checksums: false,
+            preserve_executability: false,
+            preserve_hard_links: false,
+            chmod_rules: None,
+        };
+
+        let mut batch_lengths = Vec::new();
+        let mut paths = Vec::new();
+        collect_local_source_entry_batches(
+            std::slice::from_ref(&source),
+            &options,
+            2,
+            None,
+            |batch| {
+                assert!(batch.entries.len() <= 2);
+                batch_lengths.push(batch.entries.len());
+                paths.extend(batch.entries.iter().map(|entry| entry.wire.path.clone()));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(batch_lengths.len() >= 3);
+        assert_eq!(paths.first().map(PathBuf::as_path), Some(Path::new(".")));
+        assert!(paths.contains(&PathBuf::from("dir/c.txt")));
         fs::remove_dir_all(root).unwrap();
     }
 

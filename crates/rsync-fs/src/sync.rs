@@ -175,6 +175,7 @@ pub struct IncrementalReceiverState {
     delete_mode: DeleteMode,
     source_relatives: BTreeSet<PathBuf>,
     pending_directories: BTreeSet<PathBuf>,
+    pending_deletes: Vec<IncrementalDeleteDecision>,
     completed_file_indexes: BTreeSet<usize>,
     next_index: usize,
     final_seen: bool,
@@ -186,6 +187,7 @@ impl IncrementalReceiverState {
             delete_mode,
             source_relatives: BTreeSet::new(),
             pending_directories: BTreeSet::new(),
+            pending_deletes: Vec::new(),
             completed_file_indexes: BTreeSet::new(),
             next_index: 0,
             final_seen: false,
@@ -243,8 +245,12 @@ impl IncrementalReceiverState {
         &self.completed_file_indexes
     }
 
+    pub fn pending_deletes(&self) -> &[IncrementalDeleteDecision] {
+        &self.pending_deletes
+    }
+
     pub fn plan_deletes<I>(
-        &self,
+        &mut self,
         existing_entries: I,
         filter_rules: &RuleSet,
         files_from: Option<&[PathBuf]>,
@@ -254,6 +260,7 @@ impl IncrementalReceiverState {
         I: IntoIterator<Item = IncrementalSourceEntry>,
     {
         if !self.delete_ready() {
+            self.pending_deletes.clear();
             return Vec::new();
         }
 
@@ -270,7 +277,7 @@ impl IncrementalReceiverState {
                 .then_with(|| right.path.cmp(&left.path))
         });
 
-        delete_entries
+        let decisions: Vec<_> = delete_entries
             .into_iter()
             .map(|entry| {
                 if files_from.is_some_and(|files_from| !files_from_matches(&entry.path, files_from))
@@ -288,7 +295,9 @@ impl IncrementalReceiverState {
                     IncrementalDeleteDecision::DeleteFile(entry.path)
                 }
             })
-            .collect()
+            .collect();
+        self.pending_deletes = decisions.clone();
+        decisions
     }
 }
 
