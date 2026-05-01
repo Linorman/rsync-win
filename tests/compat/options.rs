@@ -258,6 +258,38 @@ fn chunk10_daemon_options_are_marked_implemented() {
 }
 
 #[test]
+fn chunk11_output_options_are_marked_implemented() {
+    let client = upstream_client_option_specs()
+        .iter()
+        .map(|spec| (spec.long, spec.status))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for option in [
+        "verbose",
+        "quiet",
+        "info",
+        "debug",
+        "stderr",
+        "msgs2stderr",
+        "no-msgs2stderr",
+        "human-readable",
+        "8-bit-output",
+        "progress",
+        "out-format",
+        "stats",
+        "itemize-changes",
+        "log-file",
+        "log-file-format",
+    ] {
+        assert_eq!(
+            client.get(option).copied(),
+            Some(ImplementationStatus::Implemented),
+            "client --{option} should be implemented for chunk11"
+        );
+    }
+}
+
+#[test]
 fn parser_accepts_rsync_short_clusters_and_plans_implications() {
     let output = parse_and_render([
         "rsync-win",
@@ -379,10 +411,23 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
 
     assert!(output.contains("existing only: true"));
     assert!(output.contains("compress choice: zlib"));
+
+    // --msgs2stderr / --no-msgs2stderr are now fully implemented with last option wins.
+    assert!(
+        output.lines().any(|line| line == "msgs2stderr: false"),
+        "msgs2stderr flag not set: {output}"
+    );
+    assert!(
+        output.lines().any(|line| line == "no msgs2stderr: true"),
+        "no-msgs2stderr flag not set: {output}"
+    );
+    assert!(
+        output.lines().any(|line| line == "stderr: client"),
+        "{output}"
+    );
+
     for option in [
         "--no-motd",
-        "--msgs2stderr",
-        "--no-msgs2stderr",
         "--inc-recursive",
         "--i-r",
         "--no-inc-recursive",
@@ -398,6 +443,20 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
     let daemon_output =
         parse_and_render_result(["rsync-win", "--plan", "--daemon", "--no-detach"]).unwrap();
     assert!(daemon_output.contains("daemon no detach: true"));
+}
+
+#[test]
+fn parser_rejects_invalid_stderr_mode() {
+    let err = parse_and_render_result([
+        "rsync-win",
+        "--plan",
+        "--stderr=definitely-not-a-mode",
+        "src",
+        "dst",
+    ])
+    .unwrap_err();
+
+    assert!(err.to_string().contains("invalid --stderr mode"), "{err:#}");
 }
 
 #[test]

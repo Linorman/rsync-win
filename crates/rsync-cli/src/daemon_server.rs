@@ -577,7 +577,7 @@ fn serve_daemon_receiver_protocol31<T: Read + Write>(
             index_offset,
             final_checksum: RemoteFinalChecksum::PlainMd4,
             dry_run: transfer.dry_run,
-            progress: ProgressLog { verbosity: 0 },
+            progress: ProgressLog::new(0),
             preserve_times: transfer.preserve_times,
             file_write_options: transfer.file_write_options.clone(),
             append_verify: transfer.append_verify,

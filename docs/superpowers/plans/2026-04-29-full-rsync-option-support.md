@@ -451,14 +451,14 @@
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: `crates/rsync-cli/src/output.rs`
 
-- [ ] Implement `--verbose` / `-v`, `--quiet` / `-q`, and repeated verbosity levels.
-- [ ] Implement `--info` and `--debug`.
-- [ ] Implement `--stderr`.
-- [ ] Implement `--human-readable` / `-h` and `--8-bit-output` / `-8`.
-- [ ] Implement `--progress` and `--out-format`.
-- [ ] Preserve existing `--stats` and `--itemize-changes` while aligning field formats with rsync.
-- [ ] Run `cargo test -p rsync-cli --all-features output`.
-- [ ] Commit: `feat: align rsync output controls`.
+- [x] Implement `--verbose` / `-v`, `--quiet` / `-q`, and repeated verbosity levels.
+- [x] Implement `--info` and `--debug`.
+- [x] Implement `--stderr`.
+- [x] Implement `--human-readable` / `-h` and `--8-bit-output` / `-8`.
+- [x] Implement `--progress` and `--out-format`.
+- [x] Preserve existing `--stats` and `--itemize-changes` while aligning field formats with rsync.
+- [x] Run `cargo test -p rsync-cli --all-features output`.
+- [x] Commit: `feat: align rsync output controls`.
 
 ### Task 25: Implement Logging and Exit Code Mapping
 
@@ -467,11 +467,11 @@
 - Modify: `crates/rsync-cli/src/main.rs`
 - Test: `crates/rsync-cli/src/output.rs`
 
-- [ ] Implement `--log-file` and `--log-file-format`.
-- [ ] Map errors to rsync-compatible exit codes.
-- [ ] Add tests for syntax errors, file IO errors, protocol errors, partial transfer, timeout, and daemon auth failures.
-- [ ] Run `cargo test -p rsync-cli --all-features exit_code log_file`.
-- [ ] Commit: `feat: add rsync logging and exit codes`.
+- [x] Implement `--log-file` and `--log-file-format`.
+- [x] Map errors to rsync-compatible exit codes.
+- [x] Add tests for syntax errors, file IO errors, protocol errors, partial transfer, timeout, and daemon auth failures.
+- [x] Run `cargo test -p rsync-cli --all-features exit_code` and `cargo test -p rsync-cli --all-features log_file`.
+- [x] Commit: `feat: add rsync logging and exit codes`.
 
 ## Chunk 12: Advanced Transfer Features
 

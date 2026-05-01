@@ -63,6 +63,7 @@ use rsync_winfs::{
 
 mod daemon_server;
 pub mod options;
+pub mod output;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliMetadataPolicy {
@@ -142,6 +143,33 @@ pub struct Cli {
 
     #[arg(skip)]
     quiet: u8,
+
+    #[arg(skip)]
+    info_flags: Vec<String>,
+
+    #[arg(skip)]
+    debug_flags: Vec<String>,
+
+    #[arg(skip)]
+    msgs2stderr: bool,
+
+    #[arg(skip)]
+    no_msgs2stderr: bool,
+
+    #[arg(skip)]
+    stderr_mode: Option<String>,
+
+    #[arg(skip)]
+    out_format: Option<String>,
+
+    #[arg(skip)]
+    eight_bit_output: bool,
+
+    #[arg(skip)]
+    client_log_file: Option<PathBuf>,
+
+    #[arg(skip)]
+    client_log_file_format: Option<String>,
 
     #[arg(skip)]
     human_readable: u8,
@@ -503,6 +531,11 @@ pub fn run_from_env() -> Result<()> {
     Ok(())
 }
 
+/// Entry point for `main()` that propagates exit-code-mapped errors.
+pub fn run_from_env_main() -> Result<(), anyhow::Error> {
+    run_from_env()
+}
+
 pub fn parse_and_render_result<I, T>(args: I) -> Result<String>
 where
     I: IntoIterator<Item = T>,
@@ -642,6 +675,27 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
     output.push_str(&format!("progress: {}\n", plan.progress));
     output.push_str(&format!("itemize changes: {}\n", cli.itemize_changes));
     output.push_str(&format!("stats: {}\n", cli.stats));
+    if !cli.info_flags.is_empty() {
+        output.push_str(&format!("info flags: {}\n", cli.info_flags.join(",")));
+    }
+    if !cli.debug_flags.is_empty() {
+        output.push_str(&format!("debug flags: {}\n", cli.debug_flags.join(",")));
+    }
+    output.push_str(&format!("msgs2stderr: {}\n", cli.msgs2stderr));
+    output.push_str(&format!("no msgs2stderr: {}\n", cli.no_msgs2stderr));
+    if let Some(ref mode) = cli.stderr_mode {
+        output.push_str(&format!("stderr: {mode}\n"));
+    }
+    if let Some(ref fmt) = cli.out_format {
+        output.push_str(&format!("out format: {fmt}\n"));
+    }
+    output.push_str(&format!("8-bit output: {}\n", cli.eight_bit_output));
+    if let Some(ref path) = cli.client_log_file {
+        output.push_str(&format!("client log file: {}\n", path.display()));
+    }
+    if let Some(ref fmt) = cli.client_log_file_format {
+        output.push_str(&format!("client log file format: {fmt}\n"));
+    }
     output.push_str(&format!(
         "update mode: {}\n",
         update_mode_label(plan.update_mode)
@@ -932,40 +986,14 @@ struct LocalSourceCollectOptions<'a> {
     chmod_rules: Option<&'a ChmodRules>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct RemoteExecutionStats {
     files: usize,
     bytes: u64,
+    transferred_entry_indexes: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ProgressLog {
-    verbosity: u8,
-}
-
-impl ProgressLog {
-    fn from_cli(cli: &Cli) -> Self {
-        Self {
-            verbosity: cli.verbosity,
-        }
-    }
-
-    fn info(self, message: impl AsRef<str>) {
-        if self.verbosity > 0 {
-            eprintln!("rsync-win: {}", message.as_ref());
-        }
-    }
-
-    fn detail(self, message: impl AsRef<str>) {
-        if self.verbosity > 1 {
-            eprintln!("rsync-win: {}", message.as_ref());
-        }
-    }
-
-    fn enabled(self) -> bool {
-        self.verbosity > 0
-    }
-}
+pub use output::ProgressLog;
 
 #[derive(Debug)]
 struct FileProgress {
@@ -2076,6 +2104,7 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     transport: &mut T,
 ) -> Result<String> {
     let progress = ProgressLog::from_cli(cli);
+    let mut client_log = output::TransferLog::from_cli(cli)?;
     let sources = local_source_paths(cli);
     log_source_storage_notes(progress, &sources);
     let files_from = load_files_from(cli)?;
@@ -2143,7 +2172,14 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     output.push_str(&format!("bytes offered: {}\n", total_file_bytes));
     output.push_str(&format!("files sent: {}\n", stats.files));
     output.push_str(&format!("bytes sent: {}\n", stats.bytes));
-    append_remote_push_quick_check_note(&mut output, plan, file_count, total_file_bytes, stats);
+    append_remote_push_quick_check_note(&mut output, plan, file_count, total_file_bytes, &stats);
+    append_remote_source_out_format_and_client_log(
+        &mut output,
+        cli,
+        &entries,
+        &stats.transferred_entry_indexes,
+        &mut client_log,
+    )?;
     append_remote_messages(&mut output, &mux);
     Ok(output)
 }
@@ -2154,6 +2190,7 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     transport: &mut T,
 ) -> Result<String> {
     let progress = ProgressLog::from_cli(cli);
+    let mut client_log = output::TransferLog::from_cli(cli)?;
     let sources = local_source_paths(cli);
     log_source_storage_notes(progress, &sources);
     let files_from = load_files_from(cli)?;
@@ -2243,7 +2280,14 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     output.push_str(&format!("bytes offered: {}\n", total_file_bytes));
     output.push_str(&format!("files sent: {}\n", stats.files));
     output.push_str(&format!("bytes sent: {}\n", stats.bytes));
-    append_remote_push_quick_check_note(&mut output, plan, file_count, total_file_bytes, stats);
+    append_remote_push_quick_check_note(&mut output, plan, file_count, total_file_bytes, &stats);
+    append_remote_source_out_format_and_client_log(
+        &mut output,
+        cli,
+        &entries,
+        &stats.transferred_entry_indexes,
+        &mut client_log,
+    )?;
     append_remote_messages(&mut output, &mux);
     Ok(output)
 }
@@ -2268,6 +2312,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
     transport: &mut T,
 ) -> Result<String> {
     let dest = Path::new(cli.paths.last().expect("checked operand count"));
+    let mut client_log = output::TransferLog::from_cli(cli)?;
     let handshake = exchange_remote_shell_mvp_handshake(transport)?;
     let mut mux = MultiplexReadState::default();
 
@@ -2398,6 +2443,7 @@ fn execute_remote_pull_protocol27<T: Read + Write>(
     ));
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     append_action_report(&mut output, cli, &actions);
+    append_out_format_and_client_log(&mut output, cli, &actions, &mut client_log)?;
     output.push_str(&format!("files received: {}\n", stats.files));
     output.push_str(&format!("bytes received: {}\n", stats.bytes));
     append_remote_messages(&mut output, &mux);
@@ -2424,6 +2470,7 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
     handshake: rsync_protocol::RemoteShellHandshake,
 ) -> Result<String> {
     let dest = Path::new(cli.paths.last().expect("checked operand count"));
+    let mut client_log = output::TransferLog::from_cli(cli)?;
     let mut mux = MultiplexReadState::default();
 
     {
@@ -2573,6 +2620,7 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
     }
     output.push_str(&format!("dry run: {}\n", plan.dry_run));
     append_action_report(&mut output, cli, &actions);
+    append_out_format_and_client_log(&mut output, cli, &actions, &mut client_log)?;
     output.push_str(&format!("files received: {}\n", stats.files));
     output.push_str(&format!("bytes received: {}\n", stats.bytes));
     append_remote_messages(&mut output, &mux);
@@ -2585,6 +2633,7 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     let files_from = load_files_from(cli)?;
     let ntfs_files_from = files_from.clone();
     let mut fs = LocalFileSystem;
+    let mut client_log = output::TransferLog::from_cli(cli)?;
     let progress = ProgressLog::from_cli(cli);
     progress.info(format!(
         "local sync starting: {} source(s) -> {}",
@@ -2699,6 +2748,7 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     }
 
     append_action_report(&mut output, cli, sync_report.actions());
+    append_out_format_and_client_log(&mut output, cli, sync_report.actions(), &mut client_log)?;
 
     Ok(output)
 }
@@ -3264,29 +3314,11 @@ fn remote_entries_file_summary(entries: &[RemoteSourceEntry]) -> (usize, u64) {
 }
 
 fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-
-    let value = bytes as f64;
-    if value >= GIB {
-        format!("{:.2} GiB", value / GIB)
-    } else if value >= MIB {
-        format!("{:.2} MiB", value / MIB)
-    } else if value >= KIB {
-        format!("{:.2} KiB", value / KIB)
-    } else {
-        format!("{bytes} B")
-    }
+    output::format_bytes_human(bytes)
 }
 
 fn transfer_rate_label(bytes: u64, elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs_f64();
-    if seconds <= f64::EPSILON {
-        return "instant".to_string();
-    }
-
-    format!("{}/s", format_bytes((bytes as f64 / seconds) as u64))
+    output::transfer_rate_label(bytes, elapsed)
 }
 
 fn append_remote_push_quick_check_note(
@@ -3294,7 +3326,7 @@ fn append_remote_push_quick_check_note(
     plan: &TransferPlan,
     file_count: usize,
     total_file_bytes: u64,
-    stats: RemoteExecutionStats,
+    stats: &RemoteExecutionStats,
 ) {
     if plan.dry_run
         || plan.update_mode != UpdateMode::QuickCheck
@@ -3917,6 +3949,7 @@ fn serve_remote_receiver_requests<T: Read + Write>(
                 entry.wire.path.display()
             ));
             write_rsync_i32(transport, index)?;
+            stats.transferred_entry_indexes.push(entry_index);
             stats.files += 1;
             continue;
         }
@@ -3955,6 +3988,7 @@ fn serve_remote_receiver_requests<T: Read + Write>(
             Some(&mut file_progress),
         )?;
         file_progress.finish();
+        stats.transferred_entry_indexes.push(entry_index);
         stats.files += 1;
         stats.bytes += delta_stats.literal_bytes;
     }
@@ -4112,6 +4146,7 @@ fn serve_remote_receiver_requests_protocol31<T: Read + Write>(
             file_progress.finish();
             stats.bytes += literal_bytes;
         }
+        stats.transferred_entry_indexes.push(entry_index);
         stats.files += 1;
     }
 
@@ -7429,6 +7464,262 @@ fn append_action_report(output: &mut String, cli: &Cli, actions: &[SyncAction]) 
     append_structured_stats(output, cli.stats, actions);
 }
 
+fn append_out_format_and_client_log(
+    output: &mut String,
+    cli: &Cli,
+    actions: &[SyncAction],
+    client_log: &mut output::TransferLog,
+) -> Result<()> {
+    for action in actions {
+        let record = OutputActionRecord::from_action(action, cli.eight_bit_output);
+        if let Some(format) = &cli.out_format {
+            output.push_str(&output::render_out_format(
+                format,
+                &output::OutFormatArgs {
+                    filename: &record.name,
+                    full_path: &record.full_path,
+                    length: record.len,
+                    perms: &record.perms,
+                    owner: &record.owner,
+                    group: &record.group,
+                    mtime: record.mtime,
+                    itemized: &record.itemized,
+                    symlink_target: record.symlink_target.as_deref(),
+                    checksum: None,
+                },
+            ));
+            output.push('\n');
+        }
+
+        if cli.client_log_file.is_some() {
+            let log_format = cli.client_log_file_format.as_deref().unwrap_or("%i %n%L");
+            client_log.log_transfer_with_format(
+                Some(log_format),
+                &output::TransferLogRecord {
+                    operation: Some(record.operation),
+                    path: Some(record.name.clone()),
+                    bytes: Some(record.len),
+                    itemized: Some(record.itemized),
+                    symlink_target: record.symlink_target,
+                    message: record.message,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn append_remote_source_out_format_and_client_log(
+    output: &mut String,
+    cli: &Cli,
+    entries: &[RemoteSourceEntry],
+    transferred_entry_indexes: &[usize],
+    client_log: &mut output::TransferLog,
+) -> Result<()> {
+    for entry_index in transferred_entry_indexes {
+        let Some(entry) = entries.get(*entry_index) else {
+            continue;
+        };
+        if entry.wire.file_type != WireFileType::File {
+            continue;
+        }
+
+        let record = OutputRemoteSourceRecord::from_entry(entry, cli.eight_bit_output);
+        if let Some(format) = &cli.out_format {
+            output.push_str(&output::render_out_format(
+                format,
+                &output::OutFormatArgs {
+                    filename: &record.name,
+                    full_path: &record.full_path,
+                    length: record.len,
+                    perms: &record.perms,
+                    owner: &record.owner,
+                    group: &record.group,
+                    mtime: record.mtime,
+                    itemized: &record.itemized,
+                    symlink_target: None,
+                    checksum: None,
+                },
+            ));
+            output.push('\n');
+        }
+
+        if cli.client_log_file.is_some() {
+            let log_format = cli.client_log_file_format.as_deref().unwrap_or("%i %n%L");
+            client_log.log_transfer_with_format(
+                Some(log_format),
+                &output::TransferLogRecord {
+                    operation: Some(record.operation),
+                    path: Some(record.name.clone()),
+                    bytes: Some(record.len),
+                    itemized: Some(record.itemized),
+                    symlink_target: None,
+                    message: record.message,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct OutputActionRecord {
+    operation: String,
+    name: String,
+    full_path: String,
+    len: u64,
+    perms: String,
+    owner: String,
+    group: String,
+    mtime: i64,
+    itemized: String,
+    symlink_target: Option<String>,
+    message: String,
+}
+
+impl OutputActionRecord {
+    fn from_action(action: &SyncAction, eight_bit_output: bool) -> Self {
+        let path = primary_action_path(action);
+        let name = output_name(path, eight_bit_output);
+        let full_path = output::escape_output_name(&path.display().to_string(), eight_bit_output);
+        let itemized = itemized_code_for_action(action).to_string();
+        let len = action_len(action);
+        let operation = action_operation(action).to_string();
+        let symlink_target = match action {
+            SyncAction::CreateSymlink { target, .. } => Some(output::escape_output_name(
+                &target.display().to_string(),
+                eight_bit_output,
+            )),
+            _ => None,
+        };
+        let message = format!("{operation} {name}");
+
+        Self {
+            operation,
+            name,
+            full_path,
+            len,
+            perms: String::new(),
+            owner: String::new(),
+            group: String::new(),
+            mtime: 0,
+            itemized,
+            symlink_target,
+            message,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OutputRemoteSourceRecord {
+    operation: String,
+    name: String,
+    full_path: String,
+    len: u64,
+    perms: String,
+    owner: String,
+    group: String,
+    mtime: i64,
+    itemized: String,
+    message: String,
+}
+
+impl OutputRemoteSourceRecord {
+    fn from_entry(entry: &RemoteSourceEntry, eight_bit_output: bool) -> Self {
+        let raw_name = entry
+            .wire
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| entry.wire.path.display().to_string());
+        let name = output::escape_output_name(&raw_name, eight_bit_output);
+        let full_path =
+            output::escape_output_name(&entry.wire.path.display().to_string(), eight_bit_output);
+        let operation = "send".to_string();
+        let message = format!("{operation} {name}");
+
+        Self {
+            operation,
+            name,
+            full_path,
+            len: entry.wire.len,
+            perms: String::new(),
+            owner: String::new(),
+            group: String::new(),
+            mtime: entry.wire.mtime_unix,
+            itemized: ">f+++++++++".to_string(),
+            message,
+        }
+    }
+}
+
+fn primary_action_path(action: &SyncAction) -> &Path {
+    match action {
+        SyncAction::CreateDir(path)
+        | SyncAction::WriteFile { path, .. }
+        | SyncAction::WriteFileInPlace { path, .. }
+        | SyncAction::AppendFile { path, .. }
+        | SyncAction::PreserveMtime(path)
+        | SyncAction::DeleteFile(path)
+        | SyncAction::DeleteDir(path)
+        | SyncAction::ProtectDelete(path)
+        | SyncAction::CreateSymlink { path, .. }
+        | SyncAction::Warn { path, .. } => path,
+        SyncAction::BackupFile { from, .. } => from,
+        SyncAction::CreateHardLink { to, .. } => to,
+    }
+}
+
+fn output_name(path: &Path, eight_bit_output: bool) -> String {
+    let display_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    output::escape_output_name(&display_name, eight_bit_output)
+}
+
+fn action_len(action: &SyncAction) -> u64 {
+    match action {
+        SyncAction::WriteFile { len, .. }
+        | SyncAction::WriteFileInPlace { len, .. }
+        | SyncAction::AppendFile { len, .. } => *len as u64,
+        _ => 0,
+    }
+}
+
+fn action_operation(action: &SyncAction) -> &'static str {
+    match action {
+        SyncAction::CreateDir(_) => "create-dir",
+        SyncAction::WriteFile { .. } => "write",
+        SyncAction::WriteFileInPlace { .. } => "write-inplace",
+        SyncAction::AppendFile { .. } => "append",
+        SyncAction::BackupFile { .. } => "backup",
+        SyncAction::PreserveMtime(_) => "preserve-mtime",
+        SyncAction::DeleteFile(_) => "delete-file",
+        SyncAction::DeleteDir(_) => "delete-dir",
+        SyncAction::ProtectDelete(_) => "protect-delete",
+        SyncAction::CreateSymlink { .. } => "symlink",
+        SyncAction::CreateHardLink { .. } => "hardlink",
+        SyncAction::Warn { .. } => "warning",
+    }
+}
+
+fn itemized_code_for_action(action: &SyncAction) -> &'static str {
+    match action {
+        SyncAction::CreateDir(_) => "cd+++++++++",
+        SyncAction::WriteFile { .. } => ">f+++++++++",
+        SyncAction::WriteFileInPlace { .. } => ">f..t.i....",
+        SyncAction::AppendFile { .. } => ">f+++++a+++",
+        SyncAction::BackupFile { .. } => "bf+++++++++",
+        SyncAction::PreserveMtime(_) => ".f..t......",
+        SyncAction::DeleteFile(_) | SyncAction::DeleteDir(_) => "*deleting",
+        SyncAction::ProtectDelete(_) => ".protect...",
+        SyncAction::CreateSymlink { .. } => "cL+++++++++",
+        SyncAction::CreateHardLink { .. } => "hf+++++++++",
+        SyncAction::Warn { .. } => ".warning...",
+    }
+}
+
 fn append_compact_action_summary(output: &mut String, actions: &[SyncAction]) {
     if actions.is_empty() {
         output.push_str("changes: none\n");
@@ -8760,6 +9051,47 @@ mod tests {
     }
 
     #[test]
+    fn remote_push_protocol31_applies_out_format_and_log_file_format() {
+        let root = unique_temp_dir("rsync-cli-remote-push-output-format");
+        let source = root.join("source");
+        let log_file = root.join("transfer.log");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"abcdef").unwrap();
+
+        let cli = options::parse_cli(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--append-verify".to_string(),
+            "--out-format".to_string(),
+            "%i %n %l".to_string(),
+            "--log-file".to_string(),
+            log_file.to_string_lossy().into_owned(),
+            "--log-file-format".to_string(),
+            "%i|%n|%l|%M".to_string(),
+            source.to_string_lossy().into_owned(),
+            "host:/tmp/dest".to_string(),
+        ])
+        .unwrap();
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_push_append_verify_input());
+
+        let output = execute_remote_push(&cli, &plan, &mut transport).unwrap();
+
+        assert!(
+            output.lines().any(|line| line == ">f+++++++++ file.txt 6"),
+            "{output}"
+        );
+        let log = fs::read_to_string(&log_file).unwrap();
+        assert!(
+            log.lines()
+                .any(|line| line == ">f+++++++++|file.txt|6|send file.txt"),
+            "{log}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn remote_push_protocol31_rejects_append_basis_larger_than_sender() {
         let root = unique_temp_dir("rsync-cli-remote-push-append-oversize");
         let source = root.join("source");
@@ -8899,6 +9231,45 @@ mod tests {
         assert!(output.contains("write-file"));
         assert!(output.contains("files received: 1"));
         assert!(!dest.join("file.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_pull_protocol31_applies_out_format_and_log_file_format() {
+        let root = unique_temp_dir("rsync-cli-remote-pull-output-format");
+        let dest = root.join("dest");
+        let log_file = root.join("transfer.log");
+        fs::create_dir_all(&dest).unwrap();
+
+        let cli = options::parse_cli(vec![
+            "rsync-win".to_string(),
+            "--dry-run".to_string(),
+            "--out-format".to_string(),
+            "%i %n %l".to_string(),
+            "--log-file".to_string(),
+            log_file.to_string_lossy().into_owned(),
+            "--log-file-format".to_string(),
+            "%i|%n|%l|%M".to_string(),
+            "host:/tmp/source".to_string(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let plan = TransferPlan::from_cli(&cli);
+        let mut transport = TestTransport::with_input(remote_pull_dry_run_input());
+
+        let output = execute_remote_pull(&cli, &plan, &mut transport).unwrap();
+
+        assert!(
+            output.lines().any(|line| line == ">f+++++++++ file.txt 5"),
+            "{output}"
+        );
+        let log = fs::read_to_string(&log_file).unwrap();
+        assert!(
+            log.lines()
+                .any(|line| line == ">f+++++++++|file.txt|5|write file.txt"),
+            "{log}"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -10311,6 +10682,117 @@ mod tests {
         assert!(output.contains(">f+++++a+++"));
         assert!(output.contains("structured stats:"));
         assert!(output.contains("- appended files: 1"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_executor_applies_out_format_and_log_file_format() {
+        let root = unique_temp_dir("rsync-cli-output-format");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        let log_file = root.join("transfer.log");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(source.join("file.txt"), b"payload").unwrap();
+
+        let output = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--out-format".to_string(),
+            "%i %n %l".to_string(),
+            "--log-file".to_string(),
+            log_file.to_string_lossy().into_owned(),
+            "--log-file-format".to_string(),
+            "%i|%n|%l|%M".to_string(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert!(
+            output.lines().any(|line| line == ">f+++++++++ file.txt 7"),
+            "{output}"
+        );
+        let log = fs::read_to_string(&log_file).unwrap();
+        assert!(
+            log.lines()
+                .any(|line| line == ">f+++++++++|file.txt|7|write file.txt"),
+            "{log}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_executor_escapes_out_format_names_unless_8_bit_output_is_set() {
+        let root = unique_temp_dir("rsync-cli-8bit-output");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        let filename = "caf\u{00e9}.txt";
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(source.join(filename), b"payload").unwrap();
+
+        let escaped = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--out-format".to_string(),
+            "%n".to_string(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert!(
+            escaped.lines().any(|line| line == "caf\\#303\\#251.txt"),
+            "{escaped}"
+        );
+
+        fs::remove_dir_all(&dest).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let literal = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--8-bit-output".to_string(),
+            "--out-format".to_string(),
+            "%n".to_string(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert!(literal.lines().any(|line| line == filename), "{literal}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_executor_fails_before_transfer_when_log_file_cannot_be_opened() {
+        let root = unique_temp_dir("rsync-cli-log-file-open");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        let log_file = root.join("missing").join("transfer.log");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(source.join("file.txt"), b"payload").unwrap();
+
+        let err = parse_and_execute(vec![
+            "rsync-win".to_string(),
+            "-r".to_string(),
+            "--log-file".to_string(),
+            log_file.to_string_lossy().into_owned(),
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        ])
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("failed to open client log file"),
+            "{err:#}"
+        );
+        assert!(!dest.join("file.txt").exists());
 
         fs::remove_dir_all(root).unwrap();
     }

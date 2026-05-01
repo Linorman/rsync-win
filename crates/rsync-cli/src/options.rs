@@ -128,11 +128,11 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
         OptionScope::Client,
         I,
     ),
-    append_value("info", None, P),
-    append_value("debug", None, P),
-    value("stderr", None, P),
-    flag("msgs2stderr", None, P),
-    flag("no-msgs2stderr", None, P),
+    append_value("info", None, I),
+    append_value("debug", None, I),
+    value("stderr", None, I),
+    flag("msgs2stderr", None, I),
+    flag("no-msgs2stderr", None, I),
     spec(
         "quiet",
         Some('q'),
@@ -140,7 +140,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::Count,
         true,
         OptionScope::Client,
-        P,
+        I,
     ),
     flag("no-motd", None, I),
     flag("checksum", Some('c'), I),
@@ -267,7 +267,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("blocking-io", None, I),
     value("outbuf", None, P),
     flag("stats", None, I),
-    flag("8-bit-output", Some('8'), P),
+    flag("8-bit-output", Some('8'), I),
     spec(
         "human-readable",
         Some('h'),
@@ -281,9 +281,9 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("P", Some('P'), I),
     flag("itemize-changes", Some('i'), I),
     append_value("remote-option", Some('M'), I),
-    value("out-format", None, P),
-    value("log-file", None, P),
-    value("log-file-format", None, P),
+    value("out-format", None, I),
+    value("log-file", None, I),
+    value("log-file-format", None, I),
     value("password-file", None, I),
     value("early-input", None, P),
     flag("list-only", None, I),
@@ -679,6 +679,15 @@ impl Default for Cli {
             compress_threads: None,
             skip_compress: Vec::new(),
             quiet: 0,
+            info_flags: Vec::new(),
+            debug_flags: Vec::new(),
+            msgs2stderr: false,
+            no_msgs2stderr: false,
+            stderr_mode: None,
+            out_format: None,
+            eight_bit_output: false,
+            client_log_file: None,
+            client_log_file_format: None,
             human_readable: 0,
             help: false,
             progress: false,
@@ -957,7 +966,7 @@ fn apply_short_option(cli: &mut Cli, option: char, value: Option<&str>) -> Resul
             cli.secluded_args = true;
             cli.old_args = false;
         }
-        '8' => remember_unsupported(cli, "--8-bit-output"),
+        '8' => cli.eight_bit_output = true,
         'h' => cli.human_readable = cli.human_readable.saturating_add(1),
         'P' => {
             cli.partial = true;
@@ -1252,9 +1261,15 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
             .daemon_params
             .push(required_value(name, value)?.to_string()),
         "no-detach" => cli.daemon_no_detach = true,
-        "log-file" => cli.daemon_log_file = Some(PathBuf::from(required_value(name, value)?)),
+        "log-file" => {
+            let path = PathBuf::from(required_value(name, value)?);
+            cli.daemon_log_file = Some(path.clone());
+            cli.client_log_file = Some(path);
+        }
         "log-file-format" => {
-            cli.daemon_log_file_format = Some(required_value(name, value)?.to_string())
+            let fmt = required_value(name, value)?.to_string();
+            cli.daemon_log_file_format = Some(fmt.clone());
+            cli.client_log_file_format = Some(fmt);
         }
         "bwlimit" => cli.daemon_bwlimit = Some(required_value(name, value)?.to_string()),
         "list-only" => cli.list_only = true,
@@ -1277,6 +1292,29 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
         }
         "fail-on-metadata-loss" => cli.fail_on_metadata_loss = true,
         "vss" => cli.vss = true,
+        "info" => cli
+            .info_flags
+            .push(required_value(name, value)?.to_string()),
+        "debug" => cli
+            .debug_flags
+            .push(required_value(name, value)?.to_string()),
+        "stderr" => {
+            let mode = required_value(name, value)?;
+            crate::output::parse_stderr_mode(mode)?;
+            cli.stderr_mode = Some(mode.to_string());
+        }
+        "msgs2stderr" => {
+            cli.msgs2stderr = true;
+            cli.no_msgs2stderr = false;
+            cli.stderr_mode = Some("all".to_string());
+        }
+        "no-msgs2stderr" => {
+            cli.no_msgs2stderr = true;
+            cli.msgs2stderr = false;
+            cli.stderr_mode = Some("client".to_string());
+        }
+        "out-format" => cli.out_format = Some(required_value(name, value)?.to_string()),
+        "8-bit-output" => cli.eight_bit_output = true,
         other => remember_unsupported(cli, &format!("--{other}")),
     }
 
@@ -1302,8 +1340,19 @@ fn apply_standalone_no_prefixed_or_compat_alias(cli: &mut Cli, name: &str) -> Re
             cli.daemon_no_detach = true;
             Ok(true)
         }
-        "msgs2stderr" | "no-msgs2stderr" | "inc-recursive" | "i-r" | "no-inc-recursive"
-        | "no-i-r" => {
+        "msgs2stderr" => {
+            cli.msgs2stderr = true;
+            cli.no_msgs2stderr = false;
+            cli.stderr_mode = Some("all".to_string());
+            Ok(true)
+        }
+        "no-msgs2stderr" => {
+            cli.no_msgs2stderr = true;
+            cli.msgs2stderr = false;
+            cli.stderr_mode = Some("client".to_string());
+            Ok(true)
+        }
+        "inc-recursive" | "i-r" | "no-inc-recursive" | "no-i-r" => {
             if find_long_spec(name).is_none() {
                 bail!("unknown option --{name}");
             }
