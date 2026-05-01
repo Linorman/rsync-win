@@ -12,6 +12,120 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use common::FixtureTempDir;
+use rsync_filter::{Rule, RuleSet};
+use rsync_fs::{
+    DeleteMode, FileType, IncrementalDeleteDecision, IncrementalReceiverState,
+    IncrementalSourceEntry,
+};
+use rsync_protocol::{
+    FileListBatchBuilder, RsyncFileListEntry, RsyncFileListMetadata, WireFileType,
+    RSYNC_DIRECTORY_MODE, RSYNC_REGULAR_FILE_MODE,
+};
+
+#[test]
+fn protocol_file_list_batch_builder_stays_within_window_for_large_tree() {
+    let mut builder = FileListBatchBuilder::new(257).unwrap();
+    let mut batches = 0_usize;
+    let mut max_batch_len = 0_usize;
+    let mut total_entries = 0_usize;
+
+    for index in 0..100_123 {
+        if let Some(batch) = builder.push(synthetic_file_list_entry(index)).unwrap() {
+            assert!(!batch.is_final);
+            assert!(batch.entries.len() <= 257);
+            max_batch_len = max_batch_len.max(batch.entries.len());
+            total_entries += batch.entries.len();
+            batches += 1;
+        }
+    }
+    let final_batch = builder.finish();
+    assert!(final_batch.is_final);
+    assert!(final_batch.entries.len() <= 257);
+    max_batch_len = max_batch_len.max(final_batch.entries.len());
+    total_entries += final_batch.entries.len();
+    batches += 1;
+
+    assert_eq!(total_entries, 100_123);
+    assert_eq!(max_batch_len, 257);
+    assert!(batches > 300);
+}
+
+#[test]
+fn incremental_receiver_state_plans_deletes_after_all_batches_and_protects_filters() {
+    let mut state = IncrementalReceiverState::new(DeleteMode::Delay);
+    state
+        .observe_batch(
+            0,
+            [
+                IncrementalSourceEntry::new(PathBuf::from("keep"), FileType::Directory),
+                IncrementalSourceEntry::new(PathBuf::from("keep/file.txt"), FileType::File),
+            ],
+            false,
+        )
+        .unwrap();
+    assert!(!state.is_final());
+    assert!(!state.delete_ready());
+
+    state
+        .observe_batch(
+            2,
+            [IncrementalSourceEntry::new(
+                PathBuf::from("late.txt"),
+                FileType::File,
+            )],
+            true,
+        )
+        .unwrap();
+
+    let rules = RuleSet::new(vec![Rule::protect("*.bak").unwrap()]);
+    let decisions = state.plan_deletes(
+        [
+            IncrementalSourceEntry::new(PathBuf::from("keep/file.txt"), FileType::File),
+            IncrementalSourceEntry::new(PathBuf::from("late.txt"), FileType::File),
+            IncrementalSourceEntry::new(PathBuf::from("stale.txt"), FileType::File),
+            IncrementalSourceEntry::new(PathBuf::from("protected.bak"), FileType::File),
+        ],
+        &rules,
+        None,
+        false,
+    );
+
+    assert!(state.is_final());
+    assert!(state.delete_ready());
+    assert_eq!(
+        decisions,
+        vec![
+            IncrementalDeleteDecision::DeleteFile(PathBuf::from("stale.txt")),
+            IncrementalDeleteDecision::ProtectDelete(PathBuf::from("protected.bak")),
+        ]
+    );
+}
+
+#[test]
+fn incremental_receiver_delete_timing_covers_all_delete_modes() {
+    for (mode, ready_before_final, ready_after_final) in [
+        (DeleteMode::None, false, false),
+        (DeleteMode::Before, false, true),
+        (DeleteMode::During, false, true),
+        (DeleteMode::Delay, false, true),
+        (DeleteMode::After, false, true),
+    ] {
+        let mut state = IncrementalReceiverState::new(mode);
+        state
+            .observe_batch(
+                0,
+                [IncrementalSourceEntry::new(
+                    PathBuf::from("file.txt"),
+                    FileType::File,
+                )],
+                false,
+            )
+            .unwrap();
+        assert_eq!(state.delete_ready(), ready_before_final, "{mode:?}");
+        state.observe_batch(1, [], true).unwrap();
+        assert_eq!(state.delete_ready(), ready_after_final, "{mode:?}");
+    }
+}
 
 #[test]
 fn local_copy_larger_than_max_alloc_uses_bounded_buffers() {
@@ -138,6 +252,32 @@ fn write_pattern_file(path: &Path, len: usize, seed: u8) -> io::Result<()> {
         offset += chunk;
     }
     Ok(())
+}
+
+fn synthetic_file_list_entry(index: usize) -> RsyncFileListEntry {
+    let is_dir = index % 17 == 0;
+    RsyncFileListEntry {
+        path: if is_dir {
+            PathBuf::from(format!("dir-{index:06}"))
+        } else {
+            PathBuf::from(format!("dir-{index:06}/file-{index:06}.txt"))
+        },
+        file_type: if is_dir {
+            WireFileType::Directory
+        } else {
+            WireFileType::File
+        },
+        len: if is_dir { 0 } else { 7 },
+        mtime_unix: 1_700_000_000,
+        mode: if is_dir {
+            RSYNC_DIRECTORY_MODE
+        } else {
+            RSYNC_REGULAR_FILE_MODE
+        },
+        checksum: None,
+        hardlink_group: None,
+        metadata: RsyncFileListMetadata::default(),
+    }
 }
 
 fn assert_files_equal(expected: &Path, actual: &Path) {

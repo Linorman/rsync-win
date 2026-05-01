@@ -10,7 +10,8 @@ pub use metadata::{
 };
 pub use sync::{
     selected_source_paths, source_relative_paths, sync_sources, sync_tree, DeleteMode,
-    DestinationPathPreflight, SourceSelectionOptions, SymlinkMode, SyncAction, SyncOptions,
+    DestinationPathPreflight, IncrementalDeleteDecision, IncrementalReceiverState,
+    IncrementalSourceEntry, SourceSelectionOptions, SymlinkMode, SyncAction, SyncOptions,
     SyncReport, UpdateMode,
 };
 pub use walk::{

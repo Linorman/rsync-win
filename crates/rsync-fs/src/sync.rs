@@ -151,6 +151,164 @@ pub enum DeleteMode {
     After,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncrementalSourceEntry {
+    pub path: PathBuf,
+    pub file_type: FileType,
+}
+
+impl IncrementalSourceEntry {
+    pub fn new(path: PathBuf, file_type: FileType) -> Self {
+        Self { path, file_type }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncrementalDeleteDecision {
+    DeleteFile(PathBuf),
+    DeleteDir(PathBuf),
+    ProtectDelete(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub struct IncrementalReceiverState {
+    delete_mode: DeleteMode,
+    source_relatives: BTreeSet<PathBuf>,
+    pending_directories: BTreeSet<PathBuf>,
+    completed_file_indexes: BTreeSet<usize>,
+    next_index: usize,
+    final_seen: bool,
+}
+
+impl IncrementalReceiverState {
+    pub fn new(delete_mode: DeleteMode) -> Self {
+        Self {
+            delete_mode,
+            source_relatives: BTreeSet::new(),
+            pending_directories: BTreeSet::new(),
+            completed_file_indexes: BTreeSet::new(),
+            next_index: 0,
+            final_seen: false,
+        }
+    }
+
+    pub fn observe_batch<I>(
+        &mut self,
+        base_index: usize,
+        entries: I,
+        is_final: bool,
+    ) -> Result<(), FsError>
+    where
+        I: IntoIterator<Item = IncrementalSourceEntry>,
+    {
+        if self.final_seen {
+            return Err(FsError::Unsupported(
+                "incremental receiver batch arrived after final batch",
+            ));
+        }
+        if base_index != self.next_index {
+            return Err(FsError::Unsupported("incremental receiver batch index gap"));
+        }
+
+        for (offset, entry) in entries.into_iter().enumerate() {
+            let relative = normalize_incremental_relative_path(&entry.path)?;
+            let index = base_index + offset;
+            self.source_relatives.insert(relative.clone());
+            self.completed_file_indexes.insert(index);
+            if entry.file_type == FileType::Directory {
+                self.pending_directories.insert(relative);
+            }
+            self.next_index = index + 1;
+        }
+
+        if is_final {
+            self.final_seen = true;
+        }
+        Ok(())
+    }
+
+    pub fn is_final(&self) -> bool {
+        self.final_seen
+    }
+
+    pub fn delete_ready(&self) -> bool {
+        self.delete_mode != DeleteMode::None && self.final_seen
+    }
+
+    pub fn pending_directories(&self) -> &BTreeSet<PathBuf> {
+        &self.pending_directories
+    }
+
+    pub fn completed_file_indexes(&self) -> &BTreeSet<usize> {
+        &self.completed_file_indexes
+    }
+
+    pub fn plan_deletes<I>(
+        &self,
+        existing_entries: I,
+        filter_rules: &RuleSet,
+        files_from: Option<&[PathBuf]>,
+        delete_excluded: bool,
+    ) -> Vec<IncrementalDeleteDecision>
+    where
+        I: IntoIterator<Item = IncrementalSourceEntry>,
+    {
+        if !self.delete_ready() {
+            return Vec::new();
+        }
+
+        let mut delete_entries: Vec<_> = existing_entries
+            .into_iter()
+            .filter(|entry| !self.source_relatives.contains(&entry.path))
+            .collect();
+        delete_entries.sort_by(|left, right| {
+            right
+                .path
+                .components()
+                .count()
+                .cmp(&left.path.components().count())
+                .then_with(|| right.path.cmp(&left.path))
+        });
+
+        delete_entries
+            .into_iter()
+            .map(|entry| {
+                if files_from.is_some_and(|files_from| !files_from_matches(&entry.path, files_from))
+                    || delete_is_protected(
+                        filter_rules,
+                        &entry.path,
+                        entry.file_type,
+                        delete_excluded,
+                    )
+                {
+                    IncrementalDeleteDecision::ProtectDelete(entry.path)
+                } else if entry.file_type == FileType::Directory {
+                    IncrementalDeleteDecision::DeleteDir(entry.path)
+                } else {
+                    IncrementalDeleteDecision::DeleteFile(entry.path)
+                }
+            })
+            .collect()
+    }
+}
+
+fn normalize_incremental_relative_path(path: &Path) -> Result<PathBuf, FsError> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => out.push(name),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(FsError::InvalidPortablePath(path.to_path_buf()));
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(FsError::InvalidPortablePath(path.to_path_buf()));
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymlinkMode {
     Skip,
@@ -1780,40 +1938,43 @@ fn apply_receiver_deletes<F: PortableFileSystem>(
         return Ok(());
     }
 
-    let source_relatives: BTreeSet<_> = source_entries.keys().cloned().collect();
-    let mut delete_entries: Vec<_> = dest_entries
-        .iter()
-        .filter(|(relative, _)| !source_relatives.contains(*relative))
-        .map(|(relative, entry)| (relative.clone(), entry.clone()))
-        .collect();
-    delete_entries.sort_by(|left, right| {
-        right
-            .0
-            .components()
-            .count()
-            .cmp(&left.0.components().count())
-            .then_with(|| right.0.cmp(&left.0))
-    });
+    let mut state = IncrementalReceiverState::new(options.effective_delete_mode());
+    state.observe_batch(
+        0,
+        source_entries
+            .iter()
+            .map(|(relative, entry)| IncrementalSourceEntry {
+                path: relative.clone(),
+                file_type: entry.metadata.file_type,
+            }),
+        true,
+    )?;
+    let delete_decisions = state.plan_deletes(
+        dest_entries
+            .iter()
+            .map(|(relative, entry)| IncrementalSourceEntry {
+                path: relative.clone(),
+                file_type: entry.metadata.file_type,
+            }),
+        &options.filter_rules,
+        options.files_from.as_deref(),
+        options.delete_excluded,
+    );
 
     let mut deleted = 0_usize;
-    for (relative, entry) in delete_entries {
+    for decision in delete_decisions {
+        let (relative, protected) = match decision {
+            IncrementalDeleteDecision::DeleteFile(relative)
+            | IncrementalDeleteDecision::DeleteDir(relative) => (relative, false),
+            IncrementalDeleteDecision::ProtectDelete(relative) => (relative, true),
+        };
+        let Some(entry) = dest_entries.get(&relative) else {
+            continue;
+        };
         if !fs.exists(&entry.path) {
             continue;
         }
-        if options
-            .files_from
-            .as_ref()
-            .is_some_and(|files_from| !files_from_matches(&relative, files_from))
-        {
-            report.push(SyncAction::ProtectDelete(entry.path.clone()));
-            continue;
-        }
-        if delete_is_protected(
-            &options.filter_rules,
-            &relative,
-            entry.metadata.file_type,
-            options.delete_excluded,
-        ) {
+        if protected {
             report.push(SyncAction::ProtectDelete(entry.path.clone()));
             continue;
         }

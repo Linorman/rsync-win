@@ -40,14 +40,15 @@ use rsync_protocol::{
     write_daemon_args, write_i32_le, write_remote_shell_protected_args,
     write_rsync27_file_list_with_options, write_rsync31_file_list_with_metadata, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
-    DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter,
-    Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError, RemoteShellInvocation,
-    RemoteShellOperand, RemoteShellOptions, RsyncDeflatedToken, RsyncDeflatedTokenMode,
-    RsyncDeflatedTokenReader, RsyncDeflatedTokenWriter, RsyncFileListEntry, RsyncFileListMetadata,
-    RsyncFileListOptions, RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError,
-    TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
-    MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
-    REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
+    DaemonOperand, FileListBatch, FileListBatchBuilder, MultiplexReadState, MultiplexedReader,
+    MultiplexedWriter, Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError,
+    RemoteShellInvocation, RemoteShellOperand, RemoteShellOptions, RsyncDeflatedToken,
+    RsyncDeflatedTokenMode, RsyncDeflatedTokenReader, RsyncDeflatedTokenWriter, RsyncFileListEntry,
+    RsyncFileListMetadata, RsyncFileListOptions, RsyncHardLinkGroup, RsyncIndexState,
+    RsyncMd4Checksum, SessionError, TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
+    DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+    REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
+    RSYNC_INDEX_DONE,
 };
 use rsync_transport::process::ChildTransport;
 use rsync_transport::remote_shell::{
@@ -1355,6 +1356,7 @@ fn transfer_direction_label(direction: TransferDirection) -> &'static str {
 }
 
 const RSYNC31_MUX_FRAME_SIZE: usize = 32 * 1024;
+const REMOTE_FILE_LIST_BATCH_ENTRIES: usize = 4096;
 const RSYNC_ITEM_BASIS_TYPE_FOLLOWS: u16 = 1 << 11;
 const RSYNC_ITEM_XNAME_FOLLOWS: u16 = 1 << 12;
 const RSYNC_ITEM_IS_NEW: u16 = 1 << 13;
@@ -2388,6 +2390,7 @@ fn build_protocol27_fallback_command(
             direction,
             secluded_args: plan.secluded_args,
             recursive: plan.recursive,
+            incremental_recursion: false,
             preserve_times: plan.preserve_times,
             delete_mode: remote_delete_mode(plan.delete, plan.delete_mode),
             dry_run: plan.dry_run,
@@ -2607,7 +2610,9 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     progress.info("building upload file list");
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
     let entries = collect_local_source_entries(&sources, &collect_options)?;
-    let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
+    let wire_batches = remote_source_file_list_batches(&entries, plan.max_alloc)
+        .context("local upload file-list batch exceeds allocation budget")?;
+    let wire_entries = flatten_file_list_batches(&wire_batches);
     check_rsync_file_list_budget(&wire_entries, plan.max_alloc)
         .context("local upload file-list exceeds allocation budget")?;
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
@@ -2617,6 +2622,7 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         format_bytes(total_file_bytes)
     ));
     progress.detail(format!("upload list entries: {}", entries.len(),));
+    progress.detail(format!("upload list batches: {}", wire_batches.len()));
 
     let handshake = exchange_remote_shell_mvp_handshake(transport)?;
     progress.detail(format!(
@@ -2699,7 +2705,9 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     progress.info("building upload file list");
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
     let entries = collect_local_source_entries(&sources, &collect_options)?;
-    let wire_entries: Vec<_> = entries.iter().map(|entry| entry.wire.clone()).collect();
+    let wire_batches = remote_source_file_list_batches(&entries, plan.max_alloc)
+        .context("local upload file-list batch exceeds allocation budget")?;
+    let wire_entries = flatten_file_list_batches(&wire_batches);
     check_rsync_file_list_budget(&wire_entries, plan.max_alloc)
         .context("local upload file-list exceeds allocation budget")?;
     let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
@@ -2709,6 +2717,7 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         format_bytes(total_file_bytes)
     ));
     progress.detail(format!("upload list entries: {}", entries.len(),));
+    progress.detail(format!("upload list batches: {}", wire_batches.len()));
 
     let handshake = exchange_remote_shell_protocol31_handshake_with_options(
         transport,
@@ -4267,6 +4276,29 @@ fn collect_batch_local_source_entries(
 
     entries.sort_by(|left, right| left.wire.path.cmp(&right.wire.path));
     Ok(entries)
+}
+
+fn remote_source_file_list_batches(
+    entries: &[RemoteSourceEntry],
+    max_alloc: Option<u64>,
+) -> Result<Vec<FileListBatch>> {
+    let mut builder =
+        FileListBatchBuilder::with_max_alloc(REMOTE_FILE_LIST_BATCH_ENTRIES, max_alloc)?;
+    let mut batches = Vec::new();
+    for entry in entries {
+        if let Some(batch) = builder.push(entry.wire.clone())? {
+            batches.push(batch);
+        }
+    }
+    batches.push(builder.finish());
+    Ok(batches)
+}
+
+fn flatten_file_list_batches(batches: &[FileListBatch]) -> Vec<RsyncFileListEntry> {
+    batches
+        .iter()
+        .flat_map(|batch| batch.entries.iter().cloned())
+        .collect()
 }
 
 fn collect_local_directory_source_entries(
@@ -7691,6 +7723,7 @@ fn remote_shell_options_from_cli(
         direction,
         secluded_args: cli.secluded_args,
         recursive,
+        incremental_recursion: false,
         preserve_times,
         delete_mode: remote_delete_mode_from_cli(cli),
         dry_run: cli.dry_run,

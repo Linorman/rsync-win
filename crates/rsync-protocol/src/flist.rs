@@ -113,6 +113,107 @@ pub struct RsyncXattrPayload {
     pub value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileListBatch {
+    pub base_index: usize,
+    pub entries: Vec<RsyncFileListEntry>,
+    pub is_final: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileListBatchBuilder {
+    max_entries: usize,
+    max_alloc: Option<u64>,
+    next_base_index: usize,
+    current_entries: Vec<RsyncFileListEntry>,
+    current_alloc: usize,
+}
+
+impl FileListBatchBuilder {
+    pub fn new(max_entries: usize) -> Result<Self, FileListError> {
+        Self::with_max_alloc(max_entries, None)
+    }
+
+    pub fn with_max_alloc(
+        max_entries: usize,
+        max_alloc: Option<u64>,
+    ) -> Result<Self, FileListError> {
+        if max_entries == 0 {
+            return Err(FileListError::Io(io::Error::new(
+                ErrorKind::InvalidInput,
+                "file-list batch size must be greater than zero",
+            )));
+        }
+
+        Ok(Self {
+            max_entries,
+            max_alloc,
+            next_base_index: 0,
+            current_entries: Vec::with_capacity(max_entries.min(1024)),
+            current_alloc: 0,
+        })
+    }
+
+    pub fn push(
+        &mut self,
+        entry: RsyncFileListEntry,
+    ) -> Result<Option<FileListBatch>, FileListError> {
+        let entry_alloc = estimated_file_list_entry_alloc(&entry);
+        if self.should_flush_before(entry_alloc) {
+            let batch = self.emit(false);
+            self.push_current(entry, entry_alloc)?;
+            return Ok(Some(batch));
+        }
+
+        self.push_current(entry, entry_alloc)?;
+        if self.current_entries.len() >= self.max_entries {
+            Ok(Some(self.emit(false)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn finish(&mut self) -> FileListBatch {
+        self.emit(true)
+    }
+
+    fn should_flush_before(&self, entry_alloc: usize) -> bool {
+        if self.current_entries.is_empty() {
+            return false;
+        }
+        if self.current_entries.len() >= self.max_entries {
+            return true;
+        }
+        if let Some(limit) = self.max_alloc.filter(|limit| *limit > 0) {
+            return self.current_alloc.saturating_add(entry_alloc) as u64 > limit;
+        }
+        false
+    }
+
+    fn push_current(
+        &mut self,
+        entry: RsyncFileListEntry,
+        entry_alloc: usize,
+    ) -> Result<(), FileListError> {
+        AllocationBudget::new(self.max_alloc).check("file-list batch entry", entry_alloc)?;
+        self.current_alloc = self.current_alloc.saturating_add(entry_alloc);
+        self.current_entries.push(entry);
+        Ok(())
+    }
+
+    fn emit(&mut self, is_final: bool) -> FileListBatch {
+        let entries = std::mem::take(&mut self.current_entries);
+        let base_index = self.next_base_index;
+        self.next_base_index += entries.len();
+        self.current_alloc = 0;
+        FileListBatch {
+            base_index,
+            entries,
+            is_final,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationBudget {
     max_alloc: Option<u64>,
@@ -754,6 +855,37 @@ fn write_xattr_payload<W: Write>(
     Ok(())
 }
 
+pub fn write_rsync31_file_list_batch<W: Write>(
+    writer: &mut W,
+    batch: &FileListBatch,
+) -> Result<(), FileListError> {
+    write_rsync31_file_list_batch_with_metadata(writer, batch, RsyncFileListOptions::default())
+}
+
+pub fn write_rsync31_file_list_batch_with_metadata<W: Write>(
+    writer: &mut W,
+    batch: &FileListBatch,
+    options: RsyncFileListOptions,
+) -> Result<(), FileListError> {
+    let base_index = u64::try_from(batch.base_index).map_err(|_| {
+        FileListError::Io(io::Error::new(
+            ErrorKind::InvalidInput,
+            "file-list batch base index exceeds u64 range",
+        ))
+    })?;
+    let count = u32::try_from(batch.entries.len()).map_err(|_| {
+        FileListError::Io(io::Error::new(
+            ErrorKind::InvalidInput,
+            "file-list batch has too many entries",
+        ))
+    })?;
+
+    write_varlong(writer, base_index, 3)?;
+    write_u8(writer, u8::from(batch.is_final))?;
+    write_u32_le(writer, count)?;
+    write_rsync31_file_list_with_metadata(writer, &batch.entries, options)
+}
+
 pub fn read_rsync31_file_list<R: Read>(
     reader: &mut R,
     max_entries: usize,
@@ -1055,6 +1187,67 @@ pub fn read_rsync31_file_list_with_metadata<R: Read>(
     }
 
     Ok(entries)
+}
+
+pub fn read_rsync31_file_list_batch<R: Read>(
+    reader: &mut R,
+    max_entries: usize,
+    max_path_len: usize,
+) -> Result<FileListBatch, FileListError> {
+    read_rsync31_file_list_batch_with_metadata(
+        reader,
+        max_entries,
+        max_path_len,
+        RsyncFileListOptions::default(),
+    )
+}
+
+pub fn read_rsync31_file_list_batch_with_metadata<R: Read>(
+    reader: &mut R,
+    max_entries: usize,
+    max_path_len: usize,
+    options: RsyncFileListOptions,
+) -> Result<FileListBatch, FileListError> {
+    let base_index = usize::try_from(read_varlong(reader, 3)?).map_err(|_| {
+        FileListError::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            "file-list batch base index exceeds usize range",
+        ))
+    })?;
+    let is_final = match read_u8(reader)? {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(FileListError::Io(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid file-list batch final flag {value}"),
+            )));
+        }
+    };
+    let count = read_u32_le(reader)? as usize;
+    if count > max_entries {
+        return Err(FileListError::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("file-list batch entry count {count} exceeds limit {max_entries}"),
+        )));
+    }
+
+    let entries = read_rsync31_file_list_with_metadata(reader, count, max_path_len, options)?;
+    if entries.len() != count {
+        return Err(FileListError::Io(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "file-list batch header declared {count} entries but decoded {}",
+                entries.len()
+            ),
+        )));
+    }
+
+    Ok(FileListBatch {
+        base_index,
+        entries,
+        is_final,
+    })
 }
 
 fn read_protocol_time<R: Read>(reader: &mut R, field: &'static str) -> Result<i64, FileListError> {
@@ -1530,6 +1723,109 @@ mod tests {
     }
 
     #[test]
+    fn writes_and_reads_protocol31_file_list_batches_in_order() {
+        let entries = vec![
+            RsyncFileListEntry {
+                path: PathBuf::from("."),
+                file_type: WireFileType::Directory,
+                len: 0,
+                mtime_unix: 1_700_000_000,
+                mode: RSYNC_DIRECTORY_MODE,
+                checksum: None,
+                hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
+            },
+            RsyncFileListEntry {
+                path: PathBuf::from("alpha"),
+                file_type: WireFileType::Directory,
+                len: 0,
+                mtime_unix: 1_700_000_001,
+                mode: RSYNC_DIRECTORY_MODE,
+                checksum: None,
+                hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
+            },
+            RsyncFileListEntry {
+                path: PathBuf::from("alpha/file.txt"),
+                file_type: WireFileType::File,
+                len: 5,
+                mtime_unix: 1_700_000_002,
+                mode: RSYNC_REGULAR_FILE_MODE,
+                checksum: None,
+                hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
+            },
+        ];
+        let batches = vec![
+            FileListBatch {
+                base_index: 0,
+                entries: entries[..2].to_vec(),
+                is_final: false,
+            },
+            FileListBatch {
+                base_index: 2,
+                entries: entries[2..].to_vec(),
+                is_final: true,
+            },
+        ];
+
+        let mut bytes = Vec::new();
+        for batch in &batches {
+            write_rsync31_file_list_batch_with_metadata(
+                &mut bytes,
+                batch,
+                RsyncFileListOptions::default(),
+            )
+            .unwrap();
+        }
+
+        let mut cursor = bytes.as_slice();
+        let decoded: Vec<_> = (0..2)
+            .map(|_| {
+                read_rsync31_file_list_batch_with_metadata(
+                    &mut cursor,
+                    16,
+                    256,
+                    RsyncFileListOptions::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        assert_eq!(decoded, batches);
+        assert!(cursor.is_empty());
+        assert_eq!(
+            decoded
+                .iter()
+                .flat_map(|batch| batch.entries.iter().map(|entry| entry.path.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("."),
+                PathBuf::from("alpha"),
+                PathBuf::from("alpha/file.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_list_batch_builder_flushes_at_configured_window() {
+        let mut builder = FileListBatchBuilder::new(2).unwrap();
+
+        assert!(builder.push(test_file("one.txt")).unwrap().is_none());
+        let first = builder.push(test_file("two.txt")).unwrap().unwrap();
+        assert_eq!(first.base_index, 0);
+        assert_eq!(first.entries.len(), 2);
+        assert!(!first.is_final);
+
+        assert!(builder.push(test_file("three.txt")).unwrap().is_none());
+        let final_batch = builder.finish();
+
+        assert_eq!(final_batch.base_index, 2);
+        assert_eq!(final_batch.entries.len(), 1);
+        assert!(final_batch.is_final);
+    }
+
+    #[test]
     fn protocol_file_list_marks_dot_as_content_top_directory() {
         let entries = vec![RsyncFileListEntry {
             path: PathBuf::from("."),
@@ -1721,5 +2017,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(fake_super_bytes, default_bytes);
+    }
+
+    fn test_file(path: &str) -> RsyncFileListEntry {
+        RsyncFileListEntry {
+            path: PathBuf::from(path),
+            file_type: WireFileType::File,
+            len: 1,
+            mtime_unix: 1_700_000_000,
+            mode: RSYNC_REGULAR_FILE_MODE,
+            checksum: None,
+            hardlink_group: None,
+            metadata: RsyncFileListMetadata::default(),
+        }
     }
 }

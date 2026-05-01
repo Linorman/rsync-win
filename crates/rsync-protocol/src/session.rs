@@ -549,6 +549,7 @@ pub struct RemoteShellOptions {
     pub direction: TransferDirection,
     pub secluded_args: bool,
     pub recursive: bool,
+    pub incremental_recursion: bool,
     pub preserve_times: bool,
     pub delete_mode: RemoteDeleteMode,
     pub dry_run: bool,
@@ -611,6 +612,7 @@ impl Default for RemoteShellOptions {
             direction: TransferDirection::Push,
             secluded_args: false,
             recursive: false,
+            incremental_recursion: false,
             preserve_times: false,
             delete_mode: RemoteDeleteMode::None,
             dry_run: true,
@@ -841,7 +843,7 @@ pub fn build_remote_shell_invocation_for_paths(
         argv.push("--times".to_string());
     }
     append_remote_delete_option(&mut argv, options.delete_mode);
-    if options.recursive {
+    if options.recursive && !options.incremental_recursion {
         argv.push("--no-inc-recursive".to_string());
     }
     if options.dry_run {
@@ -883,7 +885,7 @@ pub fn build_remote_shell_protocol31_invocation_for_paths(
         argv.push("--sender".to_string());
     }
     append_remote_delete_option(&mut argv, options.delete_mode);
-    if options.recursive {
+    if options.recursive && !options.incremental_recursion {
         argv.push("--no-inc-recursive".to_string());
     }
     append_remote_shell_long_options(&mut argv, options);
@@ -1831,6 +1833,21 @@ mod tests {
         assert_eq!(argv[2], "--sender");
         assert_eq!(argv[3], "--no-inc-recursive");
         assert_eq!(argv[4], "-Wre.LsfxCIvu");
+    }
+
+    #[test]
+    fn incremental_recursion_option_omits_no_inc_recursive_arg() {
+        let options = RemoteShellOptions {
+            recursive: true,
+            incremental_recursion: true,
+            ..RemoteShellOptions::default()
+        };
+
+        let protocol27 = build_remote_shell_argv(&options, Path::new("dest")).unwrap();
+        let protocol31 = build_remote_shell_protocol31_argv(&options, Path::new("dest")).unwrap();
+
+        assert!(!protocol27.contains(&"--no-inc-recursive".to_string()));
+        assert!(!protocol31.contains(&"--no-inc-recursive".to_string()));
     }
 
     #[test]
