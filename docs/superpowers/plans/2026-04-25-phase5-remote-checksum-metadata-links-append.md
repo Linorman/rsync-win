@@ -6,7 +6,7 @@
 
 **Architecture:** Add checksum-aware protocol file-list codecs, then wire CLI remote push/pull through checksum-capable flist reads/writes. Route link and metadata options according to which side is the rsync sender/receiver; implement sender-side link following locally, pass receiver-side chmod/numeric options to upstream rsync where the existing file-list metadata can support it, and keep unsupported preservation semantics explicit.
 
-**Tech Stack:** Rust std I/O, existing `rsync-protocol` protocol 31 file-list implementation, `rsync-cli` remote-shell protocol 31 session, upstream rsync 3.2.7 SSH interop fixture.
+**Tech Stack:** Rust std I/O, existing `rsync-protocol` protocol 31 file-list implementation, `rsync-cli` remote-shell protocol 31 session, upstream rsync SSH interop fixture.
 
 ---
 

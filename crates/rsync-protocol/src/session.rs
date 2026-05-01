@@ -1955,7 +1955,6 @@ mod tests {
             Protocol31SetupOptions {
                 checksum_choices: vec!["md5".to_string(), "md4".to_string()],
                 checksum_seed: Some(77),
-                ..Protocol31SetupOptions::default()
             },
         )
         .unwrap();

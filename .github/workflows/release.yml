@@ -28,6 +28,8 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Resolve release tag
         id: release
@@ -60,6 +62,21 @@ jobs:
           if ($package.version -ne "${{ steps.release.outputs.crate_version }}") {
             throw "Tag ${{ steps.release.outputs.tag }} expects package version ${{ steps.release.outputs.crate_version }}, got $($package.version)."
           }
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-features -- -D warnings
+
+      - name: Parser golden tests
+        run: cargo test -p rsync-cli --test options --all-features
+
+      - name: Security regression tests
+        run: cargo test -p rsync-cli --test security_remote_peer --all-features
+
+      - name: Interop fixture matrix
+        run: cargo test -p rsync-cli --test rsync_compat --all-features
 
       - name: Test
         run: cargo test --workspace --all-features

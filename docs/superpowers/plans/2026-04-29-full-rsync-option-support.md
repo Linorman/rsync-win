@@ -404,6 +404,8 @@
 
 ## Chunk 10: Daemon Client and Daemon Server
 
+**Current implementation note (2026-04-30):** Chunk 10 is implemented for daemon client module listing, no-auth and `--password-file` pull, daemon push to writable modules, local daemon-server listing/pull/push, daemon client `--address`/`--port`/`--sockopts`/`--contimeout`/`--no-motd`, `RSYNC_PROXY`, `RSYNC_CONNECT_PROG`, and daemon-server `--daemon`/`--config`/`--dparam`/`--no-detach`/`--log-file`/`--log-file-format`/`--address`/`--port`/`--sockopts`/`--ipv4`/`--ipv6`/`--bwlimit`. The daemon server remains a safe minimal rsyncd.conf subset: advanced module keys, server-side auth users/secrets, and encrypted daemon transport are still explicit limitations.
+
 ### Task 22: Complete Daemon Client Pull and Push
 
 **Files:**
@@ -412,11 +414,11 @@
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: `tests/interop/daemon.rs`
 
-- [ ] Finish daemon pull for all implemented file/update/filter/metadata options.
-- [ ] Implement daemon push to writable modules.
+- [x] Finish daemon pull for all implemented file/update/filter/metadata options.
+- [x] Implement daemon push to writable modules.
 - [x] Implement `--password-file`, `RSYNC_PASSWORD`, auth user handling, and no-secret logging tests.
-- [ ] Implement `--address`, `--port`, `--sockopts`, `--contimeout`, and `--no-motd`.
-- [ ] Implement `RSYNC_PROXY` and `RSYNC_CONNECT_PROG` if in scope for full compatibility.
+- [x] Implement `--address`, `--port`, `--sockopts`, `--contimeout`, and `--no-motd`.
+- [x] Implement `RSYNC_PROXY` and `RSYNC_CONNECT_PROG` if in scope for full compatibility.
 - [x] Run `cargo test -p rsync-cli --test daemon --all-features`.
 - [ ] Commit: `feat: complete daemon client mode`.
 
@@ -428,14 +430,16 @@
 - Create: `crates/rsync-cli/src/daemon_server.rs`
 - Test: `tests/interop/daemon.rs`
 
-- [ ] Implement `--daemon`.
-- [ ] Implement `--config`.
-- [ ] Implement `--dparam` / `-M`.
-- [ ] Implement `--no-detach`.
-- [ ] Implement daemon `--log-file`, `--log-file-format`, `--address`, `--port`, `--sockopts`, `--ipv4`, `--ipv6`, and `--bwlimit`.
-- [ ] Add a minimal safe module config parser and explicit unsupported diagnostics for advanced config keys not yet implemented.
-- [ ] Add local daemon-server integration tests using a disposable module root.
-- [ ] Run `cargo test -p rsync-cli --test daemon --all-features`.
+- [x] Implement `--daemon`.
+- [x] Implement `--config`.
+- [x] Implement `--dparam` / `-M`.
+- [x] Implement `--no-detach`.
+- [x] Implement daemon `--log-file`, `--log-file-format`, `--address`, `--port`, `--sockopts`, `--ipv4`, `--ipv6`, and `--bwlimit`.
+- [x] Add a minimal safe module config parser and explicit unsupported diagnostics for advanced config keys not yet implemented.
+- [x] Execute daemon server protocol 31 sender mode for module pulls using the existing file-list and delta-token path.
+- [x] Execute daemon server protocol 31 receiver mode for writable-module pushes with safe module path validation.
+- [x] Add local daemon-server integration tests using a disposable module root.
+- [x] Run `cargo test -p rsync-cli --test daemon --all-features`.
 - [ ] Commit: `feat: add rsync daemon server mode`.
 
 ## Chunk 11: Output, Logging, and Exit Codes

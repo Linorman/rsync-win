@@ -1,8 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,33 +33,35 @@ use rsync_protocol::{
     exchange_protocol31_setup_with_options, exchange_remote_shell_mvp_handshake,
     exchange_remote_shell_protocol31_handshake_with_options, read_i32_le, read_multiplexed_i32,
     read_multiplexed_long, read_rsync27_file_list_with_options,
-    read_rsync31_file_list_with_options, read_rsync_index, read_u16_le, read_u8, read_varlong,
+    read_rsync31_file_list_with_metadata, read_rsync_index, read_u16_le, read_u8, read_varlong,
     read_vstring, request_module_list, rsync_plain_md4_checksum_reader, select_daemon_module,
-    write_daemon_args, write_i32_le,
-    write_remote_shell_protected_args, write_rsync27_file_list_with_options,
-    write_rsync31_file_list_with_metadata, write_rsync_i32, write_rsync_index,
-    write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection, DaemonOperand,
-    MultiplexReadState, MultiplexedReader, MultiplexedWriter, Protocol31SetupOptions,
-    RemoteDeleteMode, RemoteSessionError, RemoteShellOperand, RemoteShellOptions,
-    RsyncDeflatedToken, RsyncDeflatedTokenMode, RsyncDeflatedTokenReader, RsyncDeflatedTokenWriter,
-    RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions, RsyncHardLinkGroup,
-    RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection, WireFileType,
-    DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION,
-    MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL,
-    RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
+    write_daemon_args, write_i32_le, write_remote_shell_protected_args,
+    write_rsync27_file_list_with_options, write_rsync31_file_list_with_metadata, write_rsync_i32,
+    write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, DaemonModuleSelection,
+    DaemonOperand, MultiplexReadState, MultiplexedReader, MultiplexedWriter,
+    Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError, RemoteShellOperand,
+    RemoteShellOptions, RsyncDeflatedToken, RsyncDeflatedTokenMode, RsyncDeflatedTokenReader,
+    RsyncDeflatedTokenWriter, RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions,
+    RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection,
+    WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
+    MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
+    REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
 };
+use rsync_transport::process::ChildTransport;
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command_with_options, build_ssh_remote_command_with_options,
     default_ssh_program, spawn_ssh_remote_command, RemoteShellCommandOptions, SshAddressFamily,
     SshRemoteCommand,
 };
-use rsync_transport::tcp::TcpTransport;
+use rsync_transport::tcp::{TcpAddressFamily, TcpConnectOptions, TcpSocketOptions, TcpTransport};
 use rsync_winfs::{
-    capture_ntfs_native_sidecar, copy_alternate_data_streams, read_windows_metadata,
+    capture_ntfs_native_sidecar, copy_alternate_data_streams,
+    parse_posix_fake_super_sidecar_manifest, read_windows_metadata,
     restore_safe_windows_attributes, to_long_path_safe, PosixAclRecord, PosixFakeSuperSidecar,
     PosixXattrRecord, WindowsDriveKind,
 };
 
+mod daemon_server;
 pub mod options;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -222,6 +226,39 @@ pub struct Cli {
 
     #[arg(skip)]
     daemon_server: bool,
+
+    #[arg(skip)]
+    daemon_config: Option<PathBuf>,
+
+    #[arg(skip)]
+    daemon_params: Vec<String>,
+
+    #[arg(skip)]
+    daemon_no_detach: bool,
+
+    #[arg(skip)]
+    daemon_address: Option<String>,
+
+    #[arg(skip)]
+    daemon_port: Option<u16>,
+
+    #[arg(skip)]
+    daemon_sockopts: Option<String>,
+
+    #[arg(skip)]
+    daemon_connect_timeout_secs: Option<u64>,
+
+    #[arg(skip)]
+    daemon_no_motd: bool,
+
+    #[arg(skip)]
+    daemon_log_file: Option<PathBuf>,
+
+    #[arg(skip)]
+    daemon_log_file_format: Option<String>,
+
+    #[arg(skip)]
+    daemon_bwlimit: Option<String>,
 
     #[arg(skip)]
     internal_server: bool,
@@ -726,6 +763,18 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
             "daemon endpoint: {}:{}\n",
             daemon.host, daemon.port
         ));
+        if let Some(address) = &cli.daemon_address {
+            output.push_str(&format!("daemon bind address: {address}\n"));
+        }
+        if let Some(sockopts) = &cli.daemon_sockopts {
+            output.push_str(&format!("daemon socket options: {sockopts}\n"));
+        }
+        if let Some(timeout) = cli.daemon_connect_timeout_secs {
+            output.push_str(&format!("daemon connect timeout: {timeout}s\n"));
+        }
+        if cli.daemon_no_motd {
+            output.push_str("daemon motd: disabled\n");
+        }
         if let Some(direction) = plan.daemon_direction {
             output.push_str(&format!(
                 "daemon direction: {} ({})\n",
@@ -750,6 +799,30 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
     }
     if plan.transfer_mode == TransferMode::DaemonServer {
         output.push_str("daemon mode: server\n");
+        let address = cli.daemon_address.as_deref().unwrap_or("0.0.0.0");
+        let port = cli
+            .daemon_port
+            .unwrap_or(rsync_protocol::DEFAULT_DAEMON_PORT);
+        output.push_str(&format!("daemon listen: {address}:{port}\n"));
+        if let Some(config) = &cli.daemon_config {
+            output.push_str(&format!("daemon config: {}\n", config.display()));
+        }
+        for param in &cli.daemon_params {
+            output.push_str(&format!("daemon dparam: {param}\n"));
+        }
+        output.push_str(&format!("daemon no detach: {}\n", cli.daemon_no_detach));
+        if let Some(sockopts) = &cli.daemon_sockopts {
+            output.push_str(&format!("daemon socket options: {sockopts}\n"));
+        }
+        if let Some(log_file) = &cli.daemon_log_file {
+            output.push_str(&format!("daemon log file: {}\n", log_file.display()));
+        }
+        if let Some(format) = &cli.daemon_log_file_format {
+            output.push_str(&format!("daemon log file format: {format}\n"));
+        }
+        if let Some(bwlimit) = &cli.daemon_bwlimit {
+            output.push_str(&format!("daemon bwlimit: {bwlimit}\n"));
+        }
     }
     if plan.transfer_mode == TransferMode::InternalServer {
         output.push_str("internal server mode: remote peer\n");
@@ -815,6 +888,10 @@ fn execute_or_render(cli: &Cli) -> Result<String> {
     let plan = TransferPlan::from_cli(cli);
     if plan.report.has_errors() {
         return Ok(render_transfer_plan_with(cli, &plan));
+    }
+
+    if plan.transfer_mode == TransferMode::DaemonServer {
+        return daemon_server::run(cli);
     }
 
     if plan.daemon_operand.is_some() {
@@ -1229,10 +1306,128 @@ fn execute_daemon_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
         "daemon connection started: {}:{}",
         daemon.host, daemon.port
     ));
-    let mut transport =
-        TcpTransport::connect((daemon.host.as_str(), daemon.port), Duration::from_secs(30))
-            .with_context(|| format!("failed to connect to {}:{}", daemon.host, daemon.port))?;
+    if let Some(connect_prog) = std::env::var_os("RSYNC_CONNECT_PROG") {
+        return execute_daemon_sync_with_connect_prog(cli, &plan, daemon, connect_prog);
+    }
+
+    let tcp_options = daemon_tcp_connect_options(cli)?;
+    let mut transport = if let Some(proxy) = std::env::var_os("RSYNC_PROXY") {
+        let proxy = proxy.to_string_lossy();
+        let (proxy_host, proxy_port) = parse_daemon_proxy(&proxy)?;
+        TcpTransport::connect_http_proxy_with_options(
+            (proxy_host.as_str(), proxy_port),
+            &daemon.host,
+            daemon.port,
+            &tcp_options,
+        )
+        .with_context(|| {
+            format!(
+                "failed to connect to {}:{} through RSYNC_PROXY={proxy}",
+                daemon.host, daemon.port
+            )
+        })?
+    } else {
+        TcpTransport::connect_with_options((daemon.host.as_str(), daemon.port), &tcp_options)
+            .with_context(|| format!("failed to connect to {}:{}", daemon.host, daemon.port))?
+    };
     execute_daemon_sync_with_transport(cli, &plan, &mut transport)
+}
+
+fn execute_daemon_sync_with_connect_prog(
+    cli: &Cli,
+    plan: &TransferPlan,
+    daemon: &DaemonOperand,
+    connect_prog: OsString,
+) -> Result<String> {
+    let command = render_connect_prog(&connect_prog.to_string_lossy(), &daemon.host, daemon.port);
+    let (program, args) = shell_command_for_connect_prog(&command);
+    let mut transport = ChildTransport::spawn(&program, args.iter())
+        .with_context(|| format!("failed to spawn RSYNC_CONNECT_PROG command `{command}`"))?;
+    let session_result = execute_daemon_sync_with_transport(cli, plan, &mut transport);
+    transport.finish_input();
+    let child_report = transport
+        .wait_with_diagnostics()
+        .context("failed to wait for RSYNC_CONNECT_PROG child process")?;
+    if !child_report.status.success() {
+        let stderr = String::from_utf8_lossy(&child_report.stderr)
+            .trim()
+            .to_string();
+        if stderr.is_empty() {
+            bail!(
+                "RSYNC_CONNECT_PROG exited with status {}",
+                child_report.status
+            );
+        }
+        bail!(
+            "RSYNC_CONNECT_PROG exited with status {}; stderr: {}",
+            child_report.status,
+            stderr
+        );
+    }
+    session_result
+}
+
+fn daemon_tcp_connect_options(cli: &Cli) -> Result<TcpConnectOptions> {
+    let bind_address = cli
+        .daemon_address
+        .as_deref()
+        .map(str::parse::<IpAddr>)
+        .transpose()
+        .context("--address must be an IPv4 or IPv6 address for daemon client mode")?;
+    let socket_options = cli
+        .daemon_sockopts
+        .as_deref()
+        .map(TcpSocketOptions::parse)
+        .transpose()
+        .context("invalid --sockopts value")?
+        .unwrap_or_default();
+    let address_family = if cli.ipv4 {
+        Some(TcpAddressFamily::Ipv4)
+    } else if cli.ipv6 {
+        Some(TcpAddressFamily::Ipv6)
+    } else {
+        None
+    };
+    Ok(TcpConnectOptions {
+        timeout: Duration::from_secs(cli.daemon_connect_timeout_secs.unwrap_or(30)),
+        bind_address,
+        address_family,
+        socket_options,
+    })
+}
+
+fn parse_daemon_proxy(value: &str) -> Result<(String, u16)> {
+    let trimmed = value.trim();
+    let (host, port) = trimmed
+        .rsplit_once(':')
+        .context("RSYNC_PROXY must be in host:port form")?;
+    if host.is_empty() || port.is_empty() {
+        bail!("RSYNC_PROXY must be in host:port form");
+    }
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("invalid RSYNC_PROXY port `{port}`"))?;
+    Ok((host.to_string(), port))
+}
+
+fn render_connect_prog(template: &str, host: &str, port: u16) -> String {
+    template
+        .replace("%H", host)
+        .replace("%P", &port.to_string())
+}
+
+fn shell_command_for_connect_prog(command: &str) -> (OsString, Vec<OsString>) {
+    if cfg!(windows) {
+        (
+            OsString::from("cmd"),
+            vec![OsString::from("/C"), OsString::from(command)],
+        )
+    } else {
+        (
+            OsString::from("sh"),
+            vec![OsString::from("-c"), OsString::from(command)],
+        )
+    }
 }
 
 fn execute_daemon_sync_with_transport<T: Read + Write>(
@@ -1264,7 +1459,7 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
             "protocol: {}.{}\n",
             greeting.peer_protocol, greeting.peer_subprotocol
         ));
-        if !listing.motd.is_empty() {
+        if !cli.daemon_no_motd && !listing.motd.is_empty() {
             output.push_str("motd:\n");
             for line in listing.motd {
                 output.push_str(&format!("- {line}\n"));
@@ -1285,11 +1480,7 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
     match select_daemon_module(&mut transport, module).context("failed to select daemon module")? {
         DaemonModuleSelection::Ok { .. } => {}
         DaemonModuleSelection::AuthRequired { challenge, motd: _ } => {
-            let password_file = cli
-                .password_file
-                .as_ref()
-                .context("daemon module requires auth; pass --password-file")?;
-            let password = read_password_file(password_file)?;
+            let password = daemon_password(cli)?;
             let user = daemon_auth_user(daemon)?;
             authenticate_daemon_module(
                 &mut transport,
@@ -1302,10 +1493,22 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
         }
     }
 
-    let args = daemon_server_args_for_pull(cli, plan, daemon, greeting.peer_protocol)?;
+    let direction = plan
+        .daemon_direction
+        .context("daemon transfer direction was not planned")?;
+    let args =
+        daemon_server_args_for_direction(cli, plan, daemon, greeting.peer_protocol, direction)?;
     progress.detail(format!("daemon args: {} argument(s)", args.len()));
     write_daemon_args(&mut transport, greeting.peer_protocol, &args)
         .context("failed to send daemon server args")?;
+
+    if direction == TransferDirection::Push {
+        return if greeting.peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL {
+            execute_remote_push_protocol31(cli, plan, transport)
+        } else {
+            execute_remote_push_protocol27(cli, plan, transport)
+        };
+    }
 
     if greeting.peer_protocol >= REMOTE_SHELL_MODERN_PROTOCOL {
         let handshake = exchange_protocol31_setup_with_options(
@@ -1320,6 +1523,19 @@ fn execute_daemon_sync_with_transport<T: Read + Write>(
     }
 }
 
+fn daemon_server_args_for_direction(
+    cli: &Cli,
+    plan: &TransferPlan,
+    daemon: &DaemonOperand,
+    protocol: u32,
+    direction: TransferDirection,
+) -> Result<Vec<String>> {
+    match direction {
+        TransferDirection::Pull => daemon_server_args_for_pull(cli, plan, daemon, protocol),
+        TransferDirection::Push => daemon_server_args_for_push(cli, plan, daemon, protocol),
+    }
+}
+
 fn daemon_server_args_for_pull(
     cli: &Cli,
     plan: &TransferPlan,
@@ -1327,9 +1543,31 @@ fn daemon_server_args_for_pull(
     protocol: u32,
 ) -> Result<Vec<String>> {
     let path_arg = daemon_module_path_arg(daemon)?;
-    let options = remote_shell_options_from_cli(
+    let options = daemon_remote_shell_options_from_cli(
         cli,
         TransferDirection::Pull,
+        plan.recursive,
+        plan.preserve_times,
+        plan.symlink_mode,
+    );
+    let argv = if protocol < REMOTE_SHELL_MODERN_PROTOCOL {
+        build_remote_shell_argv_for_paths(&options, &[Path::new(&path_arg)])?
+    } else {
+        build_remote_shell_protocol31_argv_for_paths(&options, &[Path::new(&path_arg)])?
+    };
+    Ok(argv.into_iter().skip(1).collect())
+}
+
+fn daemon_server_args_for_push(
+    cli: &Cli,
+    plan: &TransferPlan,
+    daemon: &DaemonOperand,
+    protocol: u32,
+) -> Result<Vec<String>> {
+    let path_arg = daemon_module_path_arg(daemon)?;
+    let options = daemon_remote_shell_options_from_cli(
+        cli,
+        TransferDirection::Push,
         plan.recursive,
         plan.preserve_times,
         plan.symlink_mode,
@@ -1381,12 +1619,39 @@ where
         .find_map(|value| normalize_daemon_auth_user(&value))
 }
 
+fn daemon_password(cli: &Cli) -> Result<String> {
+    if let Some(password_file) = cli.password_file.as_ref() {
+        return read_password_file(password_file);
+    }
+    daemon_password_from_vars([("RSYNC_PASSWORD", std::env::var("RSYNC_PASSWORD").ok())])
+        .context("daemon module requires auth; pass --password-file or set RSYNC_PASSWORD")
+}
+
+fn daemon_password_from_vars<I, K>(vars: I) -> Option<String>
+where
+    I: IntoIterator<Item = (K, Option<String>)>,
+    K: AsRef<str>,
+{
+    vars.into_iter()
+        .filter(|(key, _)| key.as_ref() == "RSYNC_PASSWORD")
+        .filter_map(|(_, value)| value)
+        .find_map(|value| normalize_daemon_password(&value))
+}
+
 fn normalize_daemon_auth_user(value: &str) -> Option<String> {
     let user = value.trim();
     if user.is_empty() || user.as_bytes().contains(&0) {
         None
     } else {
         Some(user.to_string())
+    }
+}
+
+fn normalize_daemon_password(value: &str) -> Option<String> {
+    if value.is_empty() || value.as_bytes().contains(&0) {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 
@@ -1854,16 +2119,20 @@ fn execute_remote_push_protocol27<T: Read + Write>(
         progress,
     )?;
 
-    let remote = plan
-        .remote_operand
-        .as_ref()
-        .context("remote operand was not planned")?;
     let mut output = String::new();
-    output.push_str("rsync-win remote-shell push\n");
-    output.push_str("direction: upload (local -> remote)\n");
+    if plan.daemon_operand.is_some() {
+        output.push_str("rsync-win daemon push\n");
+    } else {
+        output.push_str("rsync-win remote-shell push\n");
+    }
+    if plan.daemon_operand.is_some() {
+        output.push_str("direction: upload (local -> daemon)\n");
+    } else {
+        output.push_str("direction: upload (local -> remote)\n");
+    }
     append_sources_summary(&mut output, &sources);
     append_source_storage_notes(&mut output, &sources);
-    output.push_str(&format!("destination: {}:{}\n", remote.host, remote.path));
+    append_push_destination_summary(&mut output, plan)?;
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
         handshake.selected_protocol.value(),
@@ -1919,17 +2188,12 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         write_rsync31_file_list_with_metadata(
             &mut writer,
             &wire_entries,
-            RsyncFileListOptions {
-                include_checksums: plan.update_mode == UpdateMode::Checksum,
-                preserve_owner: plan.preserve_owner,
-                preserve_group: plan.preserve_group,
-                numeric_ids: plan.numeric_ids,
-                acls: plan.preserve_acls,
-                xattrs: plan.preserve_xattrs,
-                fake_super: plan.fake_super,
-                atimes: plan.atimes,
-                crtimes: plan.crtimes,
-            },
+            rsync31_file_list_options_from_plan(
+                plan,
+                plan.update_mode == UpdateMode::Checksum,
+                true,
+                plan.daemon_operand.is_some(),
+            ),
         )
         .map_err(protocol31_setup_error)?;
         writer.flush().map_err(protocol31_setup_error)?;
@@ -1952,16 +2216,20 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         progress,
     )?;
 
-    let remote = plan
-        .remote_operand
-        .as_ref()
-        .context("remote operand was not planned")?;
     let mut output = String::new();
-    output.push_str("rsync-win remote-shell push\n");
-    output.push_str("direction: upload (local -> remote)\n");
+    if plan.daemon_operand.is_some() {
+        output.push_str("rsync-win daemon push\n");
+    } else {
+        output.push_str("rsync-win remote-shell push\n");
+    }
+    if plan.daemon_operand.is_some() {
+        output.push_str("direction: upload (local -> daemon)\n");
+    } else {
+        output.push_str("direction: upload (local -> remote)\n");
+    }
     append_sources_summary(&mut output, &sources);
     append_source_storage_notes(&mut output, &sources);
-    output.push_str(&format!("destination: {}:{}\n", remote.host, remote.path));
+    append_push_destination_summary(&mut output, plan)?;
     output.push_str(&format!(
         "protocol: {} (peer advertised {})\n",
         handshake.selected_protocol.value(),
@@ -2166,11 +2434,16 @@ fn execute_remote_pull_protocol31_with_handshake<T: Read + Write>(
 
     let mut entries = {
         let mut reader = MultiplexedReader::new(transport, &mut mux);
-        read_rsync31_file_list_with_options(
+        read_rsync31_file_list_with_metadata(
             &mut reader,
             DEFAULT_MAX_FILE_LIST_ENTRIES,
             DEFAULT_MAX_FILE_LIST_PATH_LEN,
-            plan.update_mode == UpdateMode::Checksum,
+            rsync31_file_list_options_from_plan(
+                plan,
+                plan.update_mode == UpdateMode::Checksum,
+                plan.daemon_operand.is_some(),
+                true,
+            ),
         )
         .map_err(protocol31_setup_error)?
     };
@@ -2411,8 +2684,8 @@ fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     }
     if let Some(sidecars) = posix_sidecars {
         output.push_str(&format!(
-            "posix sidecars: planned {}, written {}\n",
-            sidecars.planned, sidecars.written
+            "posix sidecars: planned {}, written {}, restored {}\n",
+            sidecars.planned, sidecars.written, sidecars.restored
         ));
         output.push_str(&format!(
             "posix sidecar root: {}\n",
@@ -2446,6 +2719,7 @@ struct PosixSidecarExecution {
     root: PathBuf,
     planned: usize,
     written: usize,
+    restored: usize,
 }
 
 fn handle_ntfs_native_sidecars(
@@ -2555,6 +2829,7 @@ fn handle_posix_fake_super_sidecars(
             root: sidecar_root,
             planned: capture_paths.len(),
             written: 0,
+            restored: 0,
         }));
     }
 
@@ -2568,12 +2843,91 @@ fn handle_posix_fake_super_sidecars(
         fs::write(&manifest_path, sidecar.manifest())?;
         written += 1;
     }
+    let restored = restore_posix_fake_super_sidecar_manifests(sources, &sidecar_root)?;
 
     Ok(Some(PosixSidecarExecution {
         root: sidecar_root,
         planned: capture_paths.len(),
         written,
+        restored,
     }))
+}
+
+fn restore_posix_fake_super_sidecar_manifests(
+    sources: &[PathBuf],
+    dest_sidecar_root: &Path,
+) -> Result<usize> {
+    let mut restored = 0;
+    for source in sources {
+        let source_sidecar_root = source.join(".rsync-win.fake-super");
+        if !source_sidecar_root.is_dir() {
+            continue;
+        }
+        if sidecar_roots_overlap(&source_sidecar_root, dest_sidecar_root) {
+            continue;
+        }
+        restored += copy_posix_fake_super_sidecar_manifests(
+            &source_sidecar_root,
+            &source_sidecar_root,
+            dest_sidecar_root,
+        )?;
+    }
+    Ok(restored)
+}
+
+fn copy_posix_fake_super_sidecar_manifests(
+    source_root: &Path,
+    current: &Path,
+    dest_sidecar_root: &Path,
+) -> Result<usize> {
+    let mut restored = 0;
+    for entry in fs::read_dir(current)
+        .with_context(|| format!("read POSIX sidecar directory {}", current.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            restored +=
+                copy_posix_fake_super_sidecar_manifests(source_root, &path, dest_sidecar_root)?;
+            continue;
+        }
+        if !metadata.is_file() || !is_posix_fake_super_manifest_path(&path) {
+            continue;
+        }
+
+        let manifest = fs::read_to_string(&path)
+            .with_context(|| format!("read POSIX sidecar manifest {}", path.display()))?;
+        parse_posix_fake_super_sidecar_manifest(&manifest)
+            .with_context(|| format!("parse POSIX sidecar manifest {}", path.display()))?;
+        let relative = path.strip_prefix(source_root).with_context(|| {
+            format!("compute POSIX sidecar relative path for {}", path.display())
+        })?;
+        let target = dest_sidecar_root.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, manifest)
+            .with_context(|| format!("write POSIX sidecar manifest {}", target.display()))?;
+        restored += 1;
+    }
+    Ok(restored)
+}
+
+fn sidecar_roots_overlap(source_sidecar_root: &Path, dest_sidecar_root: &Path) -> bool {
+    match (
+        fs::canonicalize(source_sidecar_root),
+        fs::canonicalize(dest_sidecar_root),
+    ) {
+        (Ok(source), Ok(dest)) => source == dest || dest.starts_with(&source),
+        _ => false,
+    }
+}
+
+fn is_posix_fake_super_manifest_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".posix.meta"))
 }
 
 fn capture_posix_fake_super_sidecar(
@@ -2818,6 +3172,29 @@ fn append_sources_summary(output: &mut String, sources: &[PathBuf]) {
     }
 }
 
+fn append_push_destination_summary(output: &mut String, plan: &TransferPlan) -> Result<()> {
+    if let Some(daemon) = &plan.daemon_operand {
+        let module = daemon
+            .module
+            .as_ref()
+            .context("daemon push requires a module")?;
+        let path = daemon
+            .path
+            .as_ref()
+            .map(|path| format!("/{path}"))
+            .unwrap_or_else(String::new);
+        output.push_str(&format!("destination: {}::{module}{path}\n", daemon.host));
+        return Ok(());
+    }
+
+    let remote = plan
+        .remote_operand
+        .as_ref()
+        .context("remote operand was not planned")?;
+    output.push_str(&format!("destination: {}:{}\n", remote.host, remote.path));
+    Ok(())
+}
+
 fn append_pull_sources_summary(output: &mut String, plan: &TransferPlan) -> Result<()> {
     if let Some(daemon) = &plan.daemon_operand {
         let module = daemon
@@ -2989,6 +3366,32 @@ fn local_source_collect_options<'a>(
         preserve_executability: plan.preserve_executability,
         preserve_hard_links: plan.hard_links,
         chmod_rules: plan.chmod_rules.as_ref(),
+    }
+}
+
+fn rsync31_file_list_options_from_plan(
+    plan: &TransferPlan,
+    include_checksums: bool,
+    include_metadata: bool,
+    fake_super_uses_xattrs: bool,
+) -> RsyncFileListOptions {
+    if !include_metadata {
+        return RsyncFileListOptions {
+            include_checksums,
+            ..RsyncFileListOptions::default()
+        };
+    }
+
+    RsyncFileListOptions {
+        include_checksums,
+        preserve_owner: plan.preserve_owner,
+        preserve_group: plan.preserve_group,
+        numeric_ids: plan.numeric_ids,
+        acls: plan.preserve_acls,
+        xattrs: plan.preserve_xattrs || (fake_super_uses_xattrs && plan.fake_super),
+        fake_super: plan.fake_super,
+        atimes: plan.atimes,
+        crtimes: plan.crtimes,
     }
 }
 
@@ -5914,10 +6317,6 @@ fn add_mode_gating_diagnostics(
 
     match transfer_mode {
         TransferMode::DaemonServer => {
-            report.error(
-                "E_UNSUPPORTED_MODE",
-                "daemon server mode is parsed and gated but not implemented by this build",
-            );
             if has_remote_shell_syntax || has_daemon_syntax || !cli.paths.is_empty() {
                 report.error(
                     "E_MODE_CONFLICT",
@@ -5952,12 +6351,24 @@ fn add_mode_gating_diagnostics(
                     "--password-file applies to rsync daemon authentication, not remote-shell mode",
                 );
             }
+            if cli.daemon_no_motd {
+                report.warn(
+                    "W_MODE_SCOPED_OPTION",
+                    "--no-motd applies to rsync daemon module listing, not remote-shell mode",
+                );
+            }
         }
         TransferMode::Local => {
             if cli.password_file.is_some() {
                 report.warn(
                     "W_MODE_SCOPED_OPTION",
                     "--password-file applies to rsync daemon authentication, not local mode",
+                );
+            }
+            if cli.daemon_no_motd {
+                report.warn(
+                    "W_MODE_SCOPED_OPTION",
+                    "--no-motd applies to rsync daemon module listing, not local mode",
                 );
             }
         }
@@ -5995,7 +6406,10 @@ fn plan_daemon_operands(
         return (None, None, true);
     }
 
-    let (index, operand) = operands.remove(0);
+    let (index, mut operand) = operands.remove(0);
+    if let Some(port) = cli.daemon_port {
+        operand.port = port;
+    }
     if cli.paths.len() == 1 {
         if cli.list_only && operand.module.is_none() {
             return (Some(operand), Some(TransferDirection::Pull), true);
@@ -6019,10 +6433,13 @@ fn plan_daemon_operands(
     }
 
     if index == cli.paths.len() - 1 {
-        report.error(
-            "E_DAEMON_PUSH_UNSUPPORTED",
-            "daemon push is out of scope for this MVP; use a remote-shell destination or pull from a daemon module",
-        );
+        if operand.module.is_none() {
+            report.error(
+                "E_DAEMON_OPERANDS",
+                "daemon push requires a module, e.g. host::module/path",
+            );
+            return (Some(operand), None, true);
+        }
         return (Some(operand), Some(TransferDirection::Push), true);
     }
 
@@ -6125,6 +6542,36 @@ fn remote_shell_options_from_cli(
         excludes,
         filters,
     }
+}
+
+fn daemon_remote_shell_options_from_cli(
+    cli: &Cli,
+    direction: TransferDirection,
+    recursive: bool,
+    preserve_times: bool,
+    symlink_mode: SymlinkMode,
+) -> RemoteShellOptions {
+    let mut options =
+        remote_shell_options_from_cli(cli, direction, recursive, preserve_times, symlink_mode);
+    if direction == TransferDirection::Pull {
+        options.executability = cli.executability;
+        options.preserve_owner = cli_preserve_owner(cli);
+        options.preserve_group = cli_preserve_group(cli);
+        options.numeric_ids = cli.numeric_ids;
+        options.user_maps = cli.user_maps.clone();
+        options.group_maps = cli.group_maps.clone();
+        options.chown = cli.chown.clone();
+        options.chmod = cli.chmod.clone();
+        options.acls = cli.acls;
+        options.xattrs = cli.xattrs;
+        options.fake_super = cli.fake_super;
+        options.atimes = cli.atimes;
+        options.crtimes = cli.crtimes;
+    }
+    if options.fake_super {
+        options.xattrs = true;
+    }
+    options
 }
 
 fn remote_compress_choice_for_argv(compress: bool, choice: Option<&str>) -> Option<String> {
@@ -6911,17 +7358,14 @@ fn ensure_daemon_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
     if cli.remote_shell.is_some() {
         bail!("daemon client mode does not use --rsh/-e; omit the remote-shell option");
     }
-    if plan.daemon_direction != Some(TransferDirection::Pull) {
-        bail!("daemon client MVP currently supports module listing and pull only");
-    }
     if daemon.module.is_none() && !cli.list_only {
         bail!("daemon module listing requires --list-only host::");
     }
     if daemon.module.is_none() && cli.paths.len() != 1 {
         bail!("daemon module listing takes exactly one daemon operand");
     }
-    if daemon.module.is_some() && cli.paths.len() != 2 {
-        bail!("daemon pull requires one daemon source and one local destination");
+    if daemon.module.is_some() && cli.paths.len() < 2 {
+        bail!("daemon transfer requires at least one source and one destination");
     }
     if cli.list_only && daemon.module.is_some() {
         bail!("daemon --list-only currently supports module listing only; use a destination for pull dry runs");
@@ -6932,16 +7376,8 @@ fn ensure_daemon_execution_options_supported(cli: &Cli, plan: &TransferPlan) -> 
     if cli.metadata_policy != CliMetadataPolicy::Portable {
         bail!("daemon client MVP currently supports only --metadata-policy=portable");
     }
-    if cli.preserve_owner
-        || cli.preserve_group
-        || cli.acls
-        || cli.xattrs
-        || cli.fake_super
-        || cli.vss
-    {
-        bail!(
-            "daemon execution does not yet support owner/group, ACL, xattr, fake-super, or VSS metadata options; run with --plan for diagnostics"
-        );
+    if cli.vss {
+        bail!("daemon execution does not yet support VSS metadata options; run with --plan for diagnostics");
     }
 
     Ok(())
@@ -9079,6 +9515,22 @@ mod tests {
     }
 
     #[test]
+    fn daemon_password_falls_back_to_rsync_password_env() {
+        assert_eq!(
+            daemon_password_from_vars([("RSYNC_PASSWORD", Some("env-secret".to_string()))])
+                .unwrap(),
+            "env-secret"
+        );
+        assert_eq!(
+            daemon_password_from_vars([
+                ("RSYNC_PASSWORD", Some(String::new())),
+                ("OTHER", Some("ignored".to_string())),
+            ]),
+            None
+        );
+    }
+
+    #[test]
     fn daemon_password_file_rejects_non_regular_paths() {
         let root = unique_temp_dir("rsync-cli-password-file-dir");
         fs::create_dir_all(&root).unwrap();
@@ -9156,6 +9608,119 @@ mod tests {
         if root.exists() {
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn daemon_destination_operands_route_to_push_plan() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--plan",
+            "-r",
+            "local-src",
+            "host::module/upload",
+        ]);
+
+        assert!(output.contains("daemon mode: client"));
+        assert!(output.contains("daemon direction: upload (local -> daemon)"));
+        assert!(output.contains("daemon module: module"));
+        assert!(output.contains("daemon path: upload"));
+        assert!(!output.contains("E_DAEMON_PUSH_UNSUPPORTED"));
+    }
+
+    #[test]
+    fn daemon_client_plan_applies_connection_options() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--plan",
+            "--port",
+            "8873",
+            "--address",
+            "127.0.0.1",
+            "--sockopts",
+            "TCP_NODELAY,SO_KEEPALIVE",
+            "--contimeout",
+            "7",
+            "--no-motd",
+            "host::module/path",
+            "dest",
+        ]);
+
+        assert!(output.contains("daemon endpoint: host:8873"));
+        assert!(output.contains("daemon bind address: 127.0.0.1"));
+        assert!(output.contains("daemon socket options: TCP_NODELAY,SO_KEEPALIVE"));
+        assert!(output.contains("daemon connect timeout: 7s"));
+        assert!(output.contains("daemon motd: disabled"));
+        assert!(!output.contains("W_UNSUPPORTED_OPTION"));
+    }
+
+    #[test]
+    fn daemon_push_uses_remote_receiver_path() {
+        let root = unique_temp_dir("rsync-cli-daemon-push");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), b"hello").unwrap();
+        let cli = options::parse_cli([
+            "rsync-win",
+            "-n",
+            "-r",
+            &source.to_string_lossy(),
+            "host::module/upload",
+        ])
+        .unwrap();
+        let plan = TransferPlan::from_cli(&cli);
+        let mut input = b"@RSYNCD: 31.0\n@RSYNCD: OK\n".to_vec();
+        input.extend_from_slice(&remote_push_dry_run_input());
+        let mut transport = TestTransport::with_input(input);
+
+        let output = execute_daemon_sync_with_transport(&cli, &plan, &mut transport).unwrap();
+
+        assert!(output.contains("rsync-win daemon push"));
+        assert!(output.contains("direction: upload (local -> daemon)"));
+        assert!(output.contains("destination: host::module/upload"));
+        assert!(transport
+            .written
+            .starts_with(b"@RSYNCD: 31.0 md5 md4\nmodule\n--server\0"));
+        assert!(!transport
+            .written
+            .windows(b"--sender".len())
+            .any(|window| window == b"--sender"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn daemon_server_plan_accepts_core_daemon_options() {
+        let output = parse_and_render([
+            "rsync-win",
+            "--plan",
+            "--daemon",
+            "--no-detach",
+            "--config",
+            "rsyncd.conf",
+            "--dparam",
+            "public.comment=Overridden",
+            "--address",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--sockopts",
+            "TCP_NODELAY",
+            "--log-file",
+            "daemon.log",
+            "--log-file-format",
+            "%m %f",
+            "--bwlimit",
+            "128",
+        ]);
+
+        assert!(output.contains("daemon mode: server"));
+        assert!(output.contains("daemon config: rsyncd.conf"));
+        assert!(output.contains("daemon dparam: public.comment=Overridden"));
+        assert!(output.contains("daemon listen: 127.0.0.1:0"));
+        assert!(output.contains("daemon no detach: true"));
+        assert!(output.contains("daemon log file: daemon.log"));
+        assert!(output.contains("daemon bwlimit: 128"));
+        assert!(!output.contains("E_UNSUPPORTED_MODE"));
+        assert!(!output.contains("W_UNSUPPORTED_OPTION"));
     }
 
     #[test]
@@ -9300,6 +9865,56 @@ mod tests {
         assert!(manifests
             .iter()
             .any(|manifest| manifest.contains("fake_super=true")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_fake_super_restores_existing_source_sidecar_manifest() {
+        let root = unique_temp_dir("rsync-cli-posix-sidecar-restore");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        let source_sidecar_root = source.join(".rsync-win.fake-super");
+        fs::create_dir_all(&source_sidecar_root).unwrap();
+        fs::write(source.join("file.txt"), b"data").unwrap();
+        fs::write(
+            source_sidecar_root.join("restored.posix.meta"),
+            [
+                "rsync-win posix fake-super sidecar v1",
+                "path=file.txt",
+                "mode=100644",
+                "uid=1000",
+                "gid=1001",
+                "user_name=alice",
+                "group_name=staff",
+                "access_time=none",
+                "creation_time=none",
+                "acls=0",
+                "xattrs=0",
+                "fake_super=true",
+                "",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let output = parse_and_execute([
+            "rsync-win",
+            "-r",
+            "--fake-super",
+            &source.to_string_lossy(),
+            &dest.to_string_lossy(),
+        ])
+        .unwrap();
+
+        assert!(output.contains("restored 1"), "{output}");
+        let restored = fs::read_to_string(
+            dest.join(".rsync-win.fake-super")
+                .join("restored.posix.meta"),
+        )
+        .unwrap();
+        assert!(restored.contains("user_name=alice"));
+        assert!(restored.contains("fake_super=true"));
 
         fs::remove_dir_all(root).unwrap();
     }

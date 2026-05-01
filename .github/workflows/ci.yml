@@ -21,5 +21,14 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --workspace --all-features -- -D warnings
+      - name: Parser golden tests
+        run: cargo test -p rsync-cli --test options --all-features
+      - name: Security regression tests
+        run: cargo test -p rsync-cli --test security_remote_peer --all-features
+      - name: Interop fixture matrix
+        run: cargo test -p rsync-cli --test rsync_compat --all-features
       - name: Test
         run: cargo test --workspace --all-features
+      - name: Package smoke test
+        shell: pwsh
+        run: .\scripts\package-release.ps1 -Tag v0.1.5

@@ -6,11 +6,11 @@ This matrix describes the current development build behavior. It is intentionall
 
 | Peer or mode | Current status | Notes |
 | --- | --- | --- |
-| Linux rsync 3.2.x/3.4.x over SSH | Experimental ordinary-file push/pull | Protocol 31 path is preferred, with protocol 27 fallback logic retained for older interop work. Use `--plan` and small smoke tests before real data. |
-| Homebrew/macOS rsync 3.x over SSH | Experimental ordinary-file push/pull | Expected to follow the Linux rsync path when protocol 31 is available. Older protocol behavior remains best-effort. |
+| Upstream rsync over SSH | Experimental ordinary-file push/pull | Protocol 31 path is preferred, with protocol 27 fallback logic retained for older interop work. Use `--plan` and small smoke tests before real data. |
+| macOS/Homebrew rsync-compatible peers over SSH | Experimental ordinary-file push/pull | Expected to follow the upstream rsync path when protocol 31 is available. Older protocol behavior remains best-effort. |
 | macOS stock rsync 2.6.9 | Best-effort, not release-grade | Older protocol and option behavior is not a first-class target yet. |
 | openrsync | Best-effort, not release-grade | Option and wire behavior may diverge from upstream rsync; test before use. |
-| rsync daemon `host::module` / `rsync://` | Experimental client MVP | Module listing, no-auth ordinary-file pull, and `--password-file` auth are implemented. Daemon push, encrypted transport, and broad option parity are not implemented. |
+| rsync daemon `host::module` / `rsync://` | Experimental client/server ordinary-file workflows | Module listing, no-auth and `--password-file` pull, daemon push to writable modules, local daemon-server module listing/pull/push, client connection controls, `RSYNC_PROXY`, `RSYNC_CONNECT_PROG`, daemon-server logging format, socket options, and `--bwlimit` are implemented for tested paths. Encrypted daemon transport, daemon server auth-users/secrets, and advanced `rsyncd.conf` keys are not implemented. |
 | Local Windows-to-Windows portable sync | Implemented for tested ordinary files/directories | Covers recursion, mtimes, deletion, filters, multiple sources, and update modes in the current portable test suite. |
 
 ## Metadata Modes
@@ -28,19 +28,23 @@ This matrix describes the current development build behavior. It is intentionall
 | --- | --- |
 | Local file data | Local copy, append, checksum comparison, and prefix comparison use bounded streaming IO. The local filesystem copy path uses a fixed 64 KiB buffer. |
 | Remote whole-file tokens | Upload and download literal token IO streams through fixed 32 KiB buffers and checksums received data before finalizing. |
-| Remote file-list paths | Remote pull validates all received file-list paths before filtering or writing, rejecting parent escapes, absolute paths, reserved Windows names, invalid characters, trailing dots/spaces, and case/normalization collisions. |
+| Remote file-list paths | Protocol file-list readers reject parent escapes, absolute paths, Windows prefixes, reserved Windows names, invalid characters, and trailing dots/spaces before the CLI maps entries to a destination. Remote pull still performs destination preflight for case/normalization collisions before filtering or writing. |
 | Remote pull selection | Filters and `--files-from` are applied locally after receiving the remote sender file-list. Remote push routes include/exclude/filter rules to the remote receiver for delete protection; `--files-from` is not routed to the receiver yet. |
 | Remote token lengths | Remote pull rejects literal token streams that exceed or undershoot the advertised file-list length and removes temporary receive files on error. |
 | File-list size | Remote file-list readers enforce a 100,000 entry limit and 32 KiB path limit for the current non-incremental receive path. Full incremental recursion is still future work. |
 | Multiplexing | Data frames are streamed; remote error messages are surfaced; unsupported multiplex tags are rejected. |
 | Compression | `-z/--compress` negotiates and applies zlib/zlibx token compression on the remote protocol 31 transfer path, including `--compress-choice`, `--compress-level`, and `--skip-compress`. Local Windows-to-Windows copies are not compressed, and `--compress-threads` is parsed/forwarded but does not add a parallel local compressor. |
-| Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow. |
+| Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow, then runs staged `--version`, `--help`, and a disposable local sync smoke test. |
 | Benchmarks | `cargo bench -p rsync-fs --bench local_sync` runs local sync scenarios for a 128-file tree, many small files, and one large ordinary file. |
+
+## Option Status
+
+The packaged option table is in [`docs/OPTION-STATUS.md`](OPTION-STATUS.md). It classifies upstream client options, daemon/server options, and project-specific options as implemented, explicit diagnostic, or planned diagnostic. Planned diagnostic entries are accepted by the parser but are not counted as behavioral compatibility.
 
 ## Known Not Implemented
 
-- Daemon push is not implemented.
 - Daemon auth is not transport encryption; `--password-file` only answers the rsync daemon challenge-response prompt.
+- Daemon server `auth users`, `secrets file`, and advanced `rsyncd.conf` keys are not implemented.
 - VSS snapshot reads are not implemented.
 - NTFS security descriptor restore, sparse range preservation, and arbitrary reparse restore are not implemented.
 - Alternate data stream payload copying is implemented only for named streams in explicit `ntfs-native` local Windows syncs.
@@ -53,17 +57,20 @@ Run these against disposable directories before using a new build:
 ```powershell
 cargo test --workspace --all-features
 cargo clippy --workspace --all-features -- -D warnings
+cargo test -p rsync-cli --test options --all-features
+cargo test -p rsync-cli --test security_remote_peer --all-features
+cargo test -p rsync-cli --test rsync_compat --all-features -- --nocapture
 cargo bench -p rsync-fs --bench local_sync
 rsync-win -rt --delete .\source .\dest
 $env:RSYNC_WIN_SSH_TARGET = "user@host"
 $env:RSYNC_WIN_SSH_TMP_ROOT = "/tmp"
-cargo test -p rsync-cli --test interop_discovery --all-features -- --nocapture
+cargo test -p rsync-cli --test rsync_compat --all-features -- --nocapture
 $env:RSYNC_WIN_DAEMON_URL = "rsync://host:873"
 $env:RSYNC_WIN_DAEMON_MODULE = "module"
 $env:RSYNC_WIN_DAEMON_PATH = "path/to/readable-fixture"
 cargo test -p rsync-cli --test daemon --all-features -- --nocapture
 ```
 
-`RSYNC_WIN_SSH_TARGET` enables disposable remote-shell smoke tests against the configured SSH host. The tests create and remove `rsync-win-*` directories under `RSYNC_WIN_SSH_TMP_ROOT`, which defaults to `/tmp`; use a path reserved for test data. `RSYNC_WIN_SSH_PROTOCOL27_TARGET` is optional and should only be set to a peer that explicitly exercises protocol 27 fallback behavior.
+`RSYNC_WIN_SSH_TARGET` enables disposable remote-shell smoke tests against the configured SSH host. The tests create and remove `rsync-win-*` directories under `RSYNC_WIN_SSH_TMP_ROOT`, which defaults to `/tmp`; use a path reserved for test data. `RSYNC_WIN_MACOS_RSYNC_TARGET`, `RSYNC_WIN_OPENRSYNC_TARGET`, `RSYNC_WIN_CYGWIN_TARGET`, and `RSYNC_WIN_MSYS2_TARGET` enable optional peer version probes. `RSYNC_WIN_SSH_PROTOCOL27_TARGET` is optional and should only be set to a peer that explicitly exercises protocol 27 fallback behavior.
 
 `RSYNC_WIN_DAEMON_URL` enables daemon module listing smoke tests. Set `RSYNC_WIN_DAEMON_MODULE` and `RSYNC_WIN_DAEMON_PATH` only for a controlled no-auth readable fixture; the daemon test writes only to a local disposable destination.

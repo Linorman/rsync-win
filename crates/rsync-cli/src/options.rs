@@ -142,7 +142,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
         OptionScope::Client,
         P,
     ),
-    flag("no-motd", None, P),
+    flag("no-motd", None, I),
     flag("checksum", Some('c'), I),
     flag("archive", Some('a'), I),
     flag("recursive", Some('r'), I),
@@ -229,7 +229,7 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     append_value("groupmap", None, I),
     value("chown", None, I),
     value("timeout", None, P),
-    value("contimeout", None, P),
+    value("contimeout", None, I),
     flag("ignore-times", Some('I'), I),
     flag("size-only", None, I),
     value("modify-window", Some('@'), I),
@@ -261,9 +261,9 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("protect-args", None, I),
     flag("trust-sender", None, I),
     value("copy-as", None, P),
-    value("address", None, P),
-    value("port", None, P),
-    value("sockopts", None, P),
+    value("address", None, I),
+    value("port", None, I),
+    value("sockopts", None, I),
     flag("blocking-io", None, I),
     value("outbuf", None, P),
     flag("stats", None, I),
@@ -312,7 +312,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::Forbid,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "address",
@@ -321,7 +321,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "bwlimit",
@@ -330,7 +330,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "config",
@@ -339,7 +339,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "dparam",
@@ -348,7 +348,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::Append,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "no-detach",
@@ -357,7 +357,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "port",
@@ -366,7 +366,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "log-file",
@@ -375,7 +375,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "log-file-format",
@@ -384,7 +384,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "sockopts",
@@ -393,7 +393,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "verbose",
@@ -411,7 +411,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "ipv6",
@@ -420,7 +420,7 @@ static DAEMON_OPTIONS: &[OptionSpec] = &[
         RepeatBehavior::LastWins,
         false,
         OptionScope::Daemon,
-        P,
+        I,
     ),
     spec(
         "help",
@@ -707,6 +707,17 @@ impl Default for Cli {
             omit_link_times: false,
             vss: false,
             daemon_server: false,
+            daemon_config: None,
+            daemon_params: Vec::new(),
+            daemon_no_detach: false,
+            daemon_address: None,
+            daemon_port: None,
+            daemon_sockopts: None,
+            daemon_connect_timeout_secs: None,
+            daemon_no_motd: false,
+            daemon_log_file: None,
+            daemon_log_file_format: None,
+            daemon_bwlimit: None,
             internal_server: false,
             internal_sender: false,
             includes: Vec::new(),
@@ -953,6 +964,9 @@ fn apply_short_option(cli: &mut Cli, option: char, value: Option<&str>) -> Resul
             cli.progress = true;
         }
         'i' => cli.itemize_changes = true,
+        'M' if cli.daemon_server => cli
+            .daemon_params
+            .push(value.expect("value checked").to_string()),
         'M' => cli
             .remote_options
             .push(value.expect("value checked").to_string()),
@@ -1226,13 +1240,27 @@ fn apply_long_option(cli: &mut Cli, name: &str, value: Option<&str>) -> Result<(
             cli.ipv4 = false;
         }
         "password-file" => cli.password_file = Some(PathBuf::from(required_value(name, value)?)),
+        "address" => cli.daemon_address = Some(required_value(name, value)?.to_string()),
+        "port" => cli.daemon_port = Some(parse_u16(required_value(name, value)?, name)?),
+        "sockopts" => cli.daemon_sockopts = Some(required_value(name, value)?.to_string()),
+        "contimeout" => {
+            cli.daemon_connect_timeout_secs = Some(parse_u64(required_value(name, value)?, name)?)
+        }
+        "no-motd" => cli.daemon_no_motd = true,
+        "config" => cli.daemon_config = Some(PathBuf::from(required_value(name, value)?)),
+        "dparam" => cli
+            .daemon_params
+            .push(required_value(name, value)?.to_string()),
+        "no-detach" => cli.daemon_no_detach = true,
+        "log-file" => cli.daemon_log_file = Some(PathBuf::from(required_value(name, value)?)),
+        "log-file-format" => {
+            cli.daemon_log_file_format = Some(required_value(name, value)?.to_string())
+        }
+        "bwlimit" => cli.daemon_bwlimit = Some(required_value(name, value)?.to_string()),
         "list-only" => cli.list_only = true,
         "stats" => cli.stats = true,
         "fsync" => cli.fsync = true,
-        "daemon" => {
-            cli.daemon_server = true;
-            remember_unsupported(cli, "--daemon");
-        }
+        "daemon" => cli.daemon_server = true,
         "server" => {
             cli.internal_server = true;
             remember_unsupported(cli, "--server");
@@ -1266,8 +1294,16 @@ fn apply_standalone_no_prefixed_or_compat_alias(cli: &mut Cli, name: &str) -> Re
             cli.old_args = false;
             Ok(true)
         }
-        "no-motd" | "msgs2stderr" | "no-msgs2stderr" | "inc-recursive" | "i-r"
-        | "no-inc-recursive" | "no-i-r" | "no-detach" => {
+        "no-motd" => {
+            cli.daemon_no_motd = true;
+            Ok(true)
+        }
+        "no-detach" => {
+            cli.daemon_no_detach = true;
+            Ok(true)
+        }
+        "msgs2stderr" | "no-msgs2stderr" | "inc-recursive" | "i-r" | "no-inc-recursive"
+        | "no-i-r" => {
             if find_long_spec(name).is_none() {
                 bail!("unknown option --{name}");
             }
@@ -1452,6 +1488,18 @@ fn parse_i32(value: &str, option: &str) -> Result<i32> {
 }
 
 fn parse_u32(value: &str, option: &str) -> Result<u32> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("option --{option} expects a non-negative integer"))
+}
+
+fn parse_u16(value: &str, option: &str) -> Result<u16> {
+    value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("option --{option} expects a 16-bit integer"))
+}
+
+fn parse_u64(value: &str, option: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| anyhow::anyhow!("option --{option} expects a non-negative integer"))

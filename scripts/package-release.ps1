@@ -22,6 +22,7 @@ $assetPath = Join-Path $distDir $assetName
 $checksumPath = "$assetPath.sha256"
 $binaryPath = Join-Path $repoRoot "target\$Target\release\rsync-win.exe"
 $releaseNotesTemplate = Join-Path $repoRoot "docs\RELEASE-NOTES-TEMPLATE.md"
+$optionStatus = Join-Path $repoRoot "docs\OPTION-STATUS.md"
 
 if (-not $SkipBuild) {
     Push-Location $repoRoot
@@ -50,6 +51,7 @@ Copy-Item (Join-Path $repoRoot "LICENSE-APACHE") (Join-Path $packageDir "LICENSE
 Copy-Item (Join-Path $repoRoot "THIRD-PARTY-NOTICES.md") (Join-Path $packageDir "THIRD-PARTY-NOTICES.md")
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "docs") | Out-Null
 Copy-Item (Join-Path $repoRoot "docs\COMPATIBILITY.md") (Join-Path $packageDir "docs\COMPATIBILITY.md")
+Copy-Item $optionStatus (Join-Path $packageDir "docs\OPTION-STATUS.md")
 Copy-Item $releaseNotesTemplate (Join-Path $packageDir "docs\RELEASE-NOTES-TEMPLATE.md")
 
 $expectedPackageFiles = @(
@@ -60,6 +62,7 @@ $expectedPackageFiles = @(
     "LICENSE-APACHE",
     "THIRD-PARTY-NOTICES.md",
     "docs\COMPATIBILITY.md",
+    "docs\OPTION-STATUS.md",
     "docs\RELEASE-NOTES-TEMPLATE.md"
 )
 
@@ -88,6 +91,35 @@ if (($versionOutput -join "`n") -notmatch "rsync-win") {
     throw "Packaged rsync-win.exe --version output did not identify rsync-win: $($versionOutput -join "`n")"
 }
 
+$helpOutput = & $packagedBinary --help 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "Packaged rsync-win.exe --help failed with exit code $LASTEXITCODE`: $($helpOutput -join "`n")"
+}
+if (($helpOutput -join "`n") -notmatch "--archive") {
+    throw "Packaged rsync-win.exe --help output did not include rsync options: $($helpOutput -join "`n")"
+}
+
+$smokeRoot = Join-Path $packageDir "package-smoke"
+$smokeSource = Join-Path $smokeRoot "source"
+$smokeDest = Join-Path $smokeRoot "dest"
+if (Test-Path -LiteralPath $smokeRoot) {
+    Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $smokeSource "dir") | Out-Null
+Set-Content -Path (Join-Path $smokeSource "dir\file.txt") -Value "package smoke" -NoNewline -Encoding utf8
+$syncOutput = & $packagedBinary -rt $smokeSource $smokeDest 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "Packaged rsync-win.exe local sync smoke failed with exit code $LASTEXITCODE`: $($syncOutput -join "`n")"
+}
+$smokeFile = Join-Path $smokeDest "dir\file.txt"
+if (-not (Test-Path -LiteralPath $smokeFile -PathType Leaf)) {
+    throw "Packaged rsync-win.exe local sync smoke did not create '$smokeFile'. Output: $($syncOutput -join "`n")"
+}
+if ((Get-Content -Raw $smokeFile) -ne "package smoke") {
+    throw "Packaged rsync-win.exe local sync smoke copied unexpected file contents."
+}
+Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [System.IO.Compression.ZipFile]::OpenRead($assetPath)
 try {
@@ -113,4 +145,4 @@ if ($checksumText -notmatch $checksumPattern) {
 
 Write-Output "Created $assetPath"
 Write-Output "Created $checksumPath"
-Write-Output "Verified package contents and rsync-win.exe --version"
+Write-Output "Verified package contents, rsync-win.exe --version, --help, and local sync smoke"

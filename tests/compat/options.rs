@@ -3,6 +3,7 @@ use std::fs;
 
 use rsync_cli::options::{
     daemon_option_specs, parse_options, project_option_specs, upstream_client_option_specs,
+    ImplementationStatus,
 };
 use rsync_cli::{parse_and_execute, parse_and_render, parse_and_render_result};
 
@@ -228,6 +229,35 @@ fn daemon_and_project_options_are_classified_separately() {
 }
 
 #[test]
+fn chunk10_daemon_options_are_marked_implemented() {
+    let daemon = daemon_option_specs()
+        .iter()
+        .map(|spec| (spec.long, spec.status))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for option in [
+        "daemon",
+        "config",
+        "dparam",
+        "no-detach",
+        "log-file",
+        "log-file-format",
+        "address",
+        "port",
+        "sockopts",
+        "ipv4",
+        "ipv6",
+        "bwlimit",
+    ] {
+        assert_eq!(
+            daemon.get(option).copied(),
+            Some(ImplementationStatus::Implemented),
+            "daemon --{option} should be implemented for chunk10"
+        );
+    }
+}
+
+#[test]
 fn parser_accepts_rsync_short_clusters_and_plans_implications() {
     let output = parse_and_render([
         "rsync-win",
@@ -367,7 +397,7 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
 
     let daemon_output =
         parse_and_render_result(["rsync-win", "--plan", "--daemon", "--no-detach"]).unwrap();
-    assert!(daemon_output.contains("--no-detach"));
+    assert!(daemon_output.contains("daemon no detach: true"));
 }
 
 #[test]
@@ -920,7 +950,7 @@ fn transfer_plan_reports_mode_gating_for_all_modes() {
         "{daemon_server}"
     );
     assert!(
-        daemon_server.contains("E_UNSUPPORTED_MODE"),
+        !daemon_server.contains("E_UNSUPPORTED_MODE"),
         "{daemon_server}"
     );
 

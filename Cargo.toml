@@ -22,5 +22,6 @@ authors = ["rsync-win contributors"]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 filetime = "0.2"
+socket2 = "0.5"
 thiserror = "2.0"
 unicode-normalization = "0.1"
