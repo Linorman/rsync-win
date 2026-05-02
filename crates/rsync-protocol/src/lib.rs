@@ -20,10 +20,11 @@ pub use flist::{
     write_rsync31_file_list, write_rsync31_file_list_batch,
     write_rsync31_file_list_batch_with_metadata, write_rsync31_file_list_with_metadata,
     write_rsync31_file_list_with_options, write_rsync_long, AllocationBudget, FileListBatch,
-    FileListBatchBuilder, FileListEntry, FileListError, RsyncFileListEntry, RsyncFileListMetadata,
-    RsyncFileListOptions, RsyncHardLinkGroup, RsyncXattrPayload, WireFileType,
-    DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN, RSYNC_DIRECTORY_MODE,
-    RSYNC_REGULAR_FILE_MODE, RSYNC_SYMLINK_MODE,
+    FileListBatchBuilder, FileListEntry, FileListError, Rsync27FileListWriter,
+    Rsync31FileListWriter, RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions,
+    RsyncHardLinkGroup, RsyncXattrPayload, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
+    DEFAULT_MAX_FILE_LIST_PATH_LEN, RSYNC_DIRECTORY_MODE, RSYNC_REGULAR_FILE_MODE,
+    RSYNC_SYMLINK_MODE,
 };
 pub use io::{
     read_i32_le, read_rsync_index, read_u16_le, read_u8, read_varlong, read_vstring, write_i32_le,

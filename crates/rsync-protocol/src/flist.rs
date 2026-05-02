@@ -404,60 +404,100 @@ pub fn write_rsync27_file_list_with_options<W: Write>(
     entries: &[RsyncFileListEntry],
     include_checksums: bool,
 ) -> Result<(), FileListError> {
-    let mut last_mode = None::<u32>;
-    let mut last_mtime = None::<i64>;
+    let mut list_writer = Rsync27FileListWriter::new(include_checksums);
+    list_writer.write_batch(writer, entries)?;
+    list_writer.finish(writer)
+}
 
-    for entry in entries {
-        let path = wire_path_bytes(&entry.path);
-        let mut status = XMIT_LONG_NAME;
+#[derive(Debug, Clone)]
+pub struct Rsync27FileListWriter {
+    include_checksums: bool,
+    last_mode: Option<u32>,
+    last_mtime: Option<i64>,
+    finished: bool,
+}
 
-        if last_mode == Some(entry.mode) {
-            status |= XMIT_SAME_MODE;
+impl Rsync27FileListWriter {
+    pub fn new(include_checksums: bool) -> Self {
+        Self {
+            include_checksums,
+            last_mode: None,
+            last_mtime: None,
+            finished: false,
         }
-        if last_mtime == Some(entry.mtime_unix) {
-            status |= XMIT_SAME_TIME;
-        }
-        if entry.file_type == WireFileType::Directory && entry.path == Path::new(".") {
-            status |= XMIT_TOP_DIR;
-        }
-
-        write_u8(writer, status)?;
-        if status & XMIT_LONG_NAME != 0 {
-            let len =
-                i32::try_from(path.len()).map_err(|_| FileListError::PathTooLong(path.len()))?;
-            write_i32_le(writer, len)?;
-        } else {
-            write_u8(writer, path.len() as u8)?;
-        }
-        writer.write_all(&path)?;
-        write_rsync_long(writer, entry.len)?;
-        if status & XMIT_SAME_TIME == 0 {
-            let mtime = i32::try_from(entry.mtime_unix).map_err(|_| {
-                FileListError::Io(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "mtime is outside protocol 27 time_t range",
-                ))
-            })?;
-            write_i32_le(writer, mtime)?;
-        }
-        if status & XMIT_SAME_MODE == 0 {
-            write_i32_le(writer, entry.mode as i32)?;
-        }
-        if include_checksums && entry.file_type == WireFileType::File {
-            writer.write_all(
-                entry
-                    .checksum
-                    .as_ref()
-                    .ok_or_else(|| FileListError::MissingChecksum(entry.path.clone()))?,
-            )?;
-        }
-
-        last_mode = Some(entry.mode);
-        last_mtime = Some(entry.mtime_unix);
     }
 
-    write_u8(writer, 0)?;
-    Ok(())
+    pub fn write_batch<W: Write>(
+        &mut self,
+        writer: &mut W,
+        entries: &[RsyncFileListEntry],
+    ) -> Result<(), FileListError> {
+        if self.finished {
+            return Err(FileListError::Io(io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot write entries after finishing file-list",
+            )));
+        }
+
+        for entry in entries {
+            let path = wire_path_bytes(&entry.path);
+            let mut status = XMIT_LONG_NAME;
+
+            if self.last_mode == Some(entry.mode) {
+                status |= XMIT_SAME_MODE;
+            }
+            if self.last_mtime == Some(entry.mtime_unix) {
+                status |= XMIT_SAME_TIME;
+            }
+            if entry.file_type == WireFileType::Directory && entry.path == Path::new(".") {
+                status |= XMIT_TOP_DIR;
+            }
+
+            write_u8(writer, status)?;
+            if status & XMIT_LONG_NAME != 0 {
+                let len = i32::try_from(path.len())
+                    .map_err(|_| FileListError::PathTooLong(path.len()))?;
+                write_i32_le(writer, len)?;
+            } else {
+                write_u8(writer, path.len() as u8)?;
+            }
+            writer.write_all(&path)?;
+            write_rsync_long(writer, entry.len)?;
+            if status & XMIT_SAME_TIME == 0 {
+                let mtime = i32::try_from(entry.mtime_unix).map_err(|_| {
+                    FileListError::Io(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "mtime is outside protocol 27 time_t range",
+                    ))
+                })?;
+                write_i32_le(writer, mtime)?;
+            }
+            if status & XMIT_SAME_MODE == 0 {
+                write_i32_le(writer, entry.mode as i32)?;
+            }
+            if self.include_checksums && entry.file_type == WireFileType::File {
+                writer.write_all(
+                    entry
+                        .checksum
+                        .as_ref()
+                        .ok_or_else(|| FileListError::MissingChecksum(entry.path.clone()))?,
+                )?;
+            }
+
+            self.last_mode = Some(entry.mode);
+            self.last_mtime = Some(entry.mtime_unix);
+        }
+
+        Ok(())
+    }
+
+    pub fn finish<W: Write>(&mut self, writer: &mut W) -> Result<(), FileListError> {
+        if !self.finished {
+            write_u8(writer, 0)?;
+            self.finished = true;
+        }
+        Ok(())
+    }
 }
 
 pub fn read_rsync27_file_list<R: Read>(
@@ -606,178 +646,228 @@ pub fn write_rsync31_file_list_with_metadata<W: Write>(
     entries: &[RsyncFileListEntry],
     options: RsyncFileListOptions,
 ) -> Result<(), FileListError> {
-    let mut last_path = Vec::<u8>::new();
-    let mut last_mode = None::<u32>;
-    let mut last_mtime = None::<i64>;
-    let mut last_uid = None::<u32>;
-    let mut last_gid = None::<u32>;
-    let mut last_atime = None::<i64>;
-    let mut hardlink_groups = BTreeMap::<RsyncHardLinkGroup, usize>::new();
+    let mut list_writer = Rsync31FileListWriter::new(options);
+    list_writer.write_batch(writer, entries)?;
+    list_writer.finish(writer)
+}
 
-    for (index, entry) in entries.iter().enumerate() {
-        let path = wire_path_bytes(&entry.path);
-        let inherited = common_prefix_len(&last_path, &path);
-        let suffix = &path[inherited..];
-        let mut flags = 0;
-        let mut hardlink_reference = None;
-        let uid = entry.metadata.uid.unwrap_or(0);
-        let gid = entry.metadata.gid.unwrap_or(0);
-        let user_name = entry.metadata.user_name.as_deref();
-        let group_name = entry.metadata.group_name.as_deref();
-        let atime = entry.metadata.atime_unix.unwrap_or(entry.mtime_unix);
-        let crtime = entry.metadata.crtime_unix.unwrap_or(entry.mtime_unix);
+#[derive(Debug, Clone)]
+pub struct Rsync31FileListWriter {
+    options: RsyncFileListOptions,
+    last_path: Vec<u8>,
+    last_mode: Option<u32>,
+    last_mtime: Option<i64>,
+    last_uid: Option<u32>,
+    last_gid: Option<u32>,
+    last_atime: Option<i64>,
+    hardlink_groups: BTreeMap<RsyncHardLinkGroup, usize>,
+    next_index: usize,
+    finished: bool,
+}
 
-        if entry.file_type == WireFileType::Directory && entry.path == Path::new(".") {
-            flags |= XMIT31_TOP_DIR;
+impl Rsync31FileListWriter {
+    pub fn new(options: RsyncFileListOptions) -> Self {
+        Self {
+            options,
+            last_path: Vec::new(),
+            last_mode: None,
+            last_mtime: None,
+            last_uid: None,
+            last_gid: None,
+            last_atime: None,
+            hardlink_groups: BTreeMap::new(),
+            next_index: 0,
+            finished: false,
         }
-        if entry.file_type == WireFileType::File {
-            if let Some(group) = entry.hardlink_group {
-                flags |= XMIT31_HLINKED;
-                if let Some(first_index) = hardlink_groups.get(&group) {
-                    hardlink_reference = Some(*first_index);
-                } else {
-                    hardlink_groups.insert(group, index);
-                    flags |= XMIT31_HLINK_FIRST;
+    }
+
+    pub fn write_batch<W: Write>(
+        &mut self,
+        writer: &mut W,
+        entries: &[RsyncFileListEntry],
+    ) -> Result<(), FileListError> {
+        if self.finished {
+            return Err(FileListError::Io(io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot write entries after finishing file-list",
+            )));
+        }
+
+        for entry in entries {
+            let path = wire_path_bytes(&entry.path);
+            let inherited = common_prefix_len(&self.last_path, &path);
+            let suffix = &path[inherited..];
+            let mut flags = 0;
+            let mut hardlink_reference = None;
+            let uid = entry.metadata.uid.unwrap_or(0);
+            let gid = entry.metadata.gid.unwrap_or(0);
+            let user_name = entry.metadata.user_name.as_deref();
+            let group_name = entry.metadata.group_name.as_deref();
+            let atime = entry.metadata.atime_unix.unwrap_or(entry.mtime_unix);
+            let crtime = entry.metadata.crtime_unix.unwrap_or(entry.mtime_unix);
+
+            if entry.file_type == WireFileType::Directory && entry.path == Path::new(".") {
+                flags |= XMIT31_TOP_DIR;
+            }
+            if entry.file_type == WireFileType::File {
+                if let Some(group) = entry.hardlink_group {
+                    flags |= XMIT31_HLINKED;
+                    if let Some(first_index) = self.hardlink_groups.get(&group) {
+                        hardlink_reference = Some(*first_index);
+                    } else {
+                        self.hardlink_groups.insert(group, self.next_index);
+                        flags |= XMIT31_HLINK_FIRST;
+                    }
                 }
             }
-        }
-        if last_mode == Some(entry.mode) {
-            flags |= XMIT31_SAME_MODE;
-        }
-        if last_mtime == Some(entry.mtime_unix) {
-            flags |= XMIT31_SAME_TIME;
-        }
-        if !options.preserve_owner || last_uid == Some(uid) {
-            flags |= XMIT31_SAME_UID;
-        } else if !options.numeric_ids && user_name.is_some() {
-            flags |= XMIT31_USER_NAME_FOLLOWS;
-        }
-        if !options.preserve_group || last_gid == Some(gid) {
-            flags |= XMIT31_SAME_GID;
-        } else if !options.numeric_ids && group_name.is_some() {
-            flags |= XMIT31_GROUP_NAME_FOLLOWS;
-        }
-        if options.atimes && entry.file_type != WireFileType::Directory && last_atime == Some(atime)
-        {
-            flags |= XMIT31_SAME_ATIME;
-        }
-        if options.crtimes && crtime == entry.mtime_unix {
-            flags |= XMIT31_CRTIME_EQ_MTIME;
-        }
-        if inherited > 0 {
-            flags |= XMIT31_SAME_NAME;
-        }
-        if suffix.len() > u8::MAX as usize {
-            flags |= XMIT31_LONG_NAME;
-        }
-        if flags == 0 {
-            flags = XMIT31_EXTENDED_FLAGS;
+            if self.last_mode == Some(entry.mode) {
+                flags |= XMIT31_SAME_MODE;
+            }
+            if self.last_mtime == Some(entry.mtime_unix) {
+                flags |= XMIT31_SAME_TIME;
+            }
+            if !self.options.preserve_owner || self.last_uid == Some(uid) {
+                flags |= XMIT31_SAME_UID;
+            } else if !self.options.numeric_ids && user_name.is_some() {
+                flags |= XMIT31_USER_NAME_FOLLOWS;
+            }
+            if !self.options.preserve_group || self.last_gid == Some(gid) {
+                flags |= XMIT31_SAME_GID;
+            } else if !self.options.numeric_ids && group_name.is_some() {
+                flags |= XMIT31_GROUP_NAME_FOLLOWS;
+            }
+            if self.options.atimes
+                && entry.file_type != WireFileType::Directory
+                && self.last_atime == Some(atime)
+            {
+                flags |= XMIT31_SAME_ATIME;
+            }
+            if self.options.crtimes && crtime == entry.mtime_unix {
+                flags |= XMIT31_CRTIME_EQ_MTIME;
+            }
+            if inherited > 0 {
+                flags |= XMIT31_SAME_NAME;
+            }
+            if suffix.len() > u8::MAX as usize {
+                flags |= XMIT31_LONG_NAME;
+            }
+            if flags == 0 {
+                flags = XMIT31_EXTENDED_FLAGS;
+            }
+
+            write_varint(writer, flags)?;
+            if flags & XMIT31_SAME_NAME != 0 {
+                write_u8(writer, inherited as u8)?;
+            }
+            if flags & XMIT31_LONG_NAME != 0 {
+                let len = u32::try_from(suffix.len())
+                    .map_err(|_| FileListError::PathTooLong(suffix.len()))?;
+                write_varint(writer, len)?;
+            } else {
+                write_u8(writer, suffix.len() as u8)?;
+            }
+            writer.write_all(suffix)?;
+            if let Some(first_index) = hardlink_reference {
+                let first_index = u32::try_from(first_index).map_err(|_| {
+                    FileListError::Io(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "hardlink file-list index exceeds protocol 31 varint range",
+                    ))
+                })?;
+                write_varint(writer, first_index)?;
+                write_rsync31_metadata_payloads(writer, entry, self.options)?;
+                self.record_entry_state(path, entry, uid, gid, atime);
+                continue;
+            }
+            write_varlong(writer, entry.len, 3)?;
+            if flags & XMIT31_SAME_TIME == 0 {
+                let mtime = u64::try_from(entry.mtime_unix).map_err(|_| {
+                    FileListError::Io(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "negative mtime is not supported by protocol 31 ordinary-file flist writer",
+                    ))
+                })?;
+                write_varlong(writer, mtime, 4)?;
+            }
+            if flags & XMIT31_SAME_MODE == 0 {
+                write_i32_le(writer, entry.mode as i32)?;
+            }
+            if self.options.crtimes && flags & XMIT31_CRTIME_EQ_MTIME == 0 {
+                write_varlong(writer, nonnegative_time(crtime)?, 4)?;
+            }
+            if self.options.atimes
+                && entry.file_type != WireFileType::Directory
+                && flags & XMIT31_SAME_ATIME == 0
+            {
+                write_varlong(writer, nonnegative_time(atime)?, 4)?;
+            }
+            if self.options.preserve_owner && flags & XMIT31_SAME_UID == 0 {
+                write_varint(writer, uid)?;
+                if flags & XMIT31_USER_NAME_FOLLOWS != 0 {
+                    write_name(writer, user_name.unwrap_or_default())?;
+                }
+            }
+            if self.options.preserve_group && flags & XMIT31_SAME_GID == 0 {
+                write_varint(writer, gid)?;
+                if flags & XMIT31_GROUP_NAME_FOLLOWS != 0 {
+                    write_name(writer, group_name.unwrap_or_default())?;
+                }
+            }
+            if self.options.include_checksums && entry.file_type == WireFileType::File {
+                writer.write_all(
+                    entry
+                        .checksum
+                        .as_ref()
+                        .ok_or_else(|| FileListError::MissingChecksum(entry.path.clone()))?,
+                )?;
+            }
+            write_rsync31_metadata_payloads(writer, entry, self.options)?;
+
+            self.record_entry_state(path, entry, uid, gid, atime);
         }
 
-        write_varint(writer, flags)?;
-        if flags & XMIT31_SAME_NAME != 0 {
-            write_u8(writer, inherited as u8)?;
-        }
-        if flags & XMIT31_LONG_NAME != 0 {
-            let len = u32::try_from(suffix.len())
-                .map_err(|_| FileListError::PathTooLong(suffix.len()))?;
-            write_varint(writer, len)?;
-        } else {
-            write_u8(writer, suffix.len() as u8)?;
-        }
-        writer.write_all(suffix)?;
-        if let Some(first_index) = hardlink_reference {
-            let first_index = u32::try_from(first_index).map_err(|_| {
-                FileListError::Io(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "hardlink file-list index exceeds protocol 31 varint range",
-                ))
-            })?;
-            write_varint(writer, first_index)?;
-            write_rsync31_metadata_payloads(writer, entry, options)?;
-            last_path = path;
-            last_mode = Some(entry.mode);
-            last_mtime = Some(entry.mtime_unix);
-            if options.preserve_owner {
-                last_uid = Some(uid);
-            }
-            if options.preserve_group {
-                last_gid = Some(gid);
-            }
-            if options.atimes && entry.file_type != WireFileType::Directory {
-                last_atime = Some(atime);
-            }
-            continue;
-        }
-        write_varlong(writer, entry.len, 3)?;
-        if flags & XMIT31_SAME_TIME == 0 {
-            let mtime = u64::try_from(entry.mtime_unix).map_err(|_| {
-                FileListError::Io(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "negative mtime is not supported by protocol 31 ordinary-file flist writer",
-                ))
-            })?;
-            write_varlong(writer, mtime, 4)?;
-        }
-        if flags & XMIT31_SAME_MODE == 0 {
-            write_i32_le(writer, entry.mode as i32)?;
-        }
-        if options.crtimes && flags & XMIT31_CRTIME_EQ_MTIME == 0 {
-            write_varlong(writer, nonnegative_time(crtime)?, 4)?;
-        }
-        if options.atimes
-            && entry.file_type != WireFileType::Directory
-            && flags & XMIT31_SAME_ATIME == 0
-        {
-            write_varlong(writer, nonnegative_time(atime)?, 4)?;
-        }
-        if options.preserve_owner && flags & XMIT31_SAME_UID == 0 {
-            write_varint(writer, uid)?;
-            if flags & XMIT31_USER_NAME_FOLLOWS != 0 {
-                write_name(writer, user_name.unwrap_or_default())?;
-            }
-        }
-        if options.preserve_group && flags & XMIT31_SAME_GID == 0 {
-            write_varint(writer, gid)?;
-            if flags & XMIT31_GROUP_NAME_FOLLOWS != 0 {
-                write_name(writer, group_name.unwrap_or_default())?;
-            }
-        }
-        if options.include_checksums && entry.file_type == WireFileType::File {
-            writer.write_all(
-                entry
-                    .checksum
-                    .as_ref()
-                    .ok_or_else(|| FileListError::MissingChecksum(entry.path.clone()))?,
-            )?;
-        }
-        write_rsync31_metadata_payloads(writer, entry, options)?;
-
-        last_path = path;
-        last_mode = Some(entry.mode);
-        last_mtime = Some(entry.mtime_unix);
-        if options.preserve_owner {
-            last_uid = Some(uid);
-        }
-        if options.preserve_group {
-            last_gid = Some(gid);
-        }
-        if options.atimes && entry.file_type != WireFileType::Directory {
-            last_atime = Some(atime);
-        }
+        Ok(())
     }
 
-    write_varint(writer, 0)?;
-    write_varint(writer, 0)?;
-    if !options.numeric_ids {
-        if options.preserve_owner || options.acls {
-            write_id0_name(writer, "root")?;
+    pub fn finish<W: Write>(&mut self, writer: &mut W) -> Result<(), FileListError> {
+        if !self.finished {
+            write_varint(writer, 0)?;
+            write_varint(writer, 0)?;
+            if !self.options.numeric_ids {
+                if self.options.preserve_owner || self.options.acls {
+                    write_id0_name(writer, "root")?;
+                }
+                if self.options.preserve_group || self.options.acls {
+                    write_id0_name(writer, "root")?;
+                }
+            }
+            self.finished = true;
         }
-        if options.preserve_group || options.acls {
-            write_id0_name(writer, "root")?;
-        }
+        Ok(())
     }
-    Ok(())
+
+    fn record_entry_state(
+        &mut self,
+        path: Vec<u8>,
+        entry: &RsyncFileListEntry,
+        uid: u32,
+        gid: u32,
+        atime: i64,
+    ) {
+        self.last_path = path;
+        self.last_mode = Some(entry.mode);
+        self.last_mtime = Some(entry.mtime_unix);
+        if self.options.preserve_owner {
+            self.last_uid = Some(uid);
+        }
+        if self.options.preserve_group {
+            self.last_gid = Some(gid);
+        }
+        if self.options.atimes && entry.file_type != WireFileType::Directory {
+            self.last_atime = Some(atime);
+        }
+        self.next_index += 1;
+    }
 }
 
 fn write_id0_name<W: Write>(writer: &mut W, name: &str) -> Result<(), FileListError> {
@@ -1809,6 +1899,98 @@ mod tests {
                 PathBuf::from("alpha/file.txt"),
             ]
         );
+    }
+
+    #[test]
+    fn streamed_protocol31_batches_match_single_file_list_encoding() {
+        let entries = vec![
+            RsyncFileListEntry {
+                path: PathBuf::from("."),
+                file_type: WireFileType::Directory,
+                len: 0,
+                mtime_unix: 1_700_000_000,
+                mode: RSYNC_DIRECTORY_MODE,
+                checksum: None,
+                hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
+            },
+            RsyncFileListEntry {
+                path: PathBuf::from("alpha"),
+                file_type: WireFileType::Directory,
+                len: 0,
+                mtime_unix: 1_700_000_000,
+                mode: RSYNC_DIRECTORY_MODE,
+                checksum: None,
+                hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
+            },
+            RsyncFileListEntry {
+                path: PathBuf::from("alpha/file.txt"),
+                file_type: WireFileType::File,
+                len: 5,
+                mtime_unix: 1_700_000_001,
+                mode: RSYNC_REGULAR_FILE_MODE,
+                checksum: None,
+                hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
+            },
+        ];
+
+        let mut single = Vec::new();
+        write_rsync31_file_list_with_metadata(
+            &mut single,
+            &entries,
+            RsyncFileListOptions::default(),
+        )
+        .unwrap();
+
+        let mut streamed = Vec::new();
+        let mut writer = Rsync31FileListWriter::new(RsyncFileListOptions::default());
+        writer.write_batch(&mut streamed, &entries[..2]).unwrap();
+        writer.write_batch(&mut streamed, &entries[2..]).unwrap();
+        writer.finish(&mut streamed).unwrap();
+
+        assert_eq!(streamed, single);
+        assert_eq!(
+            read_rsync31_file_list(&mut streamed.as_slice(), 16, 256).unwrap(),
+            entries
+        );
+    }
+
+    #[test]
+    fn streamed_protocol31_batches_preserve_hardlink_indexes_across_batches() {
+        let group = RsyncHardLinkGroup {
+            device: 7,
+            inode: 42,
+        };
+        let mut first = test_file("first.txt");
+        first.hardlink_group = Some(group);
+        let mut second = test_file("second.txt");
+        second.hardlink_group = Some(group);
+        let entries = vec![first, test_file("middle.txt"), second];
+
+        let mut single = Vec::new();
+        write_rsync31_file_list_with_metadata(
+            &mut single,
+            &entries,
+            RsyncFileListOptions::default(),
+        )
+        .unwrap();
+
+        let mut streamed = Vec::new();
+        let mut writer = Rsync31FileListWriter::new(RsyncFileListOptions::default());
+        writer.write_batch(&mut streamed, &entries[..2]).unwrap();
+        writer.write_batch(&mut streamed, &entries[2..]).unwrap();
+        writer.finish(&mut streamed).unwrap();
+
+        assert_eq!(streamed, single);
+        let decoded = read_rsync31_file_list(&mut streamed.as_slice(), 16, 256).unwrap();
+        assert_eq!(
+            decoded.iter().map(|entry| &entry.path).collect::<Vec<_>>(),
+            entries.iter().map(|entry| &entry.path).collect::<Vec<_>>()
+        );
+        assert_eq!(decoded[0].hardlink_group, decoded[2].hardlink_group);
+        assert!(decoded[0].hardlink_group.is_some());
     }
 
     #[test]

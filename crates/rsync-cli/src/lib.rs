@@ -38,18 +38,17 @@ use rsync_protocol::{
     read_multiplexed_long, read_rsync27_file_list_with_options,
     read_rsync31_file_list_with_metadata, read_rsync_index, read_u16_le, read_u8, read_varlong,
     read_vstring, request_module_list, rsync_plain_md4_checksum_reader, select_daemon_module,
-    write_daemon_args, write_i32_le, write_remote_shell_protected_args,
-    write_rsync27_file_list_with_options, write_rsync31_file_list_with_metadata, write_rsync_i32,
+    write_daemon_args, write_i32_le, write_remote_shell_protected_args, write_rsync_i32,
     write_rsync_index, write_rsync_long_value, write_u16_le, write_vstring, AllocationBudget,
     DaemonModuleSelection, DaemonOperand, FileListBatch, MultiplexReadState, MultiplexedReader,
     MultiplexedWriter, Protocol31SetupOptions, RemoteDeleteMode, RemoteSessionError,
-    RemoteShellInvocation, RemoteShellOperand, RemoteShellOptions, RsyncDeflatedToken,
-    RsyncDeflatedTokenMode, RsyncDeflatedTokenReader, RsyncDeflatedTokenWriter, RsyncFileListEntry,
-    RsyncFileListMetadata, RsyncFileListOptions, RsyncHardLinkGroup, RsyncIndexState,
-    RsyncMd4Checksum, SessionError, TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
-    DEFAULT_MAX_FILE_LIST_PATH_LEN, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
-    REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE,
-    RSYNC_INDEX_DONE,
+    RemoteShellInvocation, RemoteShellOperand, RemoteShellOptions, Rsync27FileListWriter,
+    Rsync31FileListWriter, RsyncDeflatedToken, RsyncDeflatedTokenMode, RsyncDeflatedTokenReader,
+    RsyncDeflatedTokenWriter, RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions,
+    RsyncHardLinkGroup, RsyncIndexState, RsyncMd4Checksum, SessionError, TransferDirection,
+    WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
+    MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
+    REMOTE_SHELL_MVP_PROTOCOL, RSYNC_DIRECTORY_MODE, RSYNC_INDEX_DONE,
 };
 use rsync_transport::process::ChildTransport;
 use rsync_transport::remote_shell::{
@@ -2708,21 +2707,6 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     let files_from = load_files_from(cli)?;
     progress.info("building upload file list");
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
-    let (entries, wire_batches) =
-        collect_local_push_source_entries_and_batches(&sources, &collect_options, plan.max_alloc)
-            .context("local upload file-list batch exceeds allocation budget")?;
-    let wire_entries = flatten_file_list_batches(&wire_batches);
-    check_rsync_file_list_budget(&wire_entries, plan.max_alloc)
-        .context("local upload file-list exceeds allocation budget")?;
-    let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
-    progress.info(format!(
-        "upload list: {} files, {}",
-        file_count,
-        format_bytes(total_file_bytes)
-    ));
-    progress.detail(format!("upload list entries: {}", entries.len(),));
-    progress.detail(format!("upload list batches: {}", wire_batches.len()));
-
     let handshake = exchange_remote_shell_mvp_handshake(transport)?;
     progress.detail(format!(
         "protocol: rsync {}",
@@ -2731,13 +2715,28 @@ fn execute_remote_push_protocol27<T: Read + Write>(
     if plan.delete {
         write_rsync_i32(transport, 0)?;
     }
-    write_rsync27_file_list_with_options(
-        transport,
-        &wire_entries,
-        plan.update_mode == UpdateMode::Checksum,
-    )?;
+    let mut file_list_writer = Rsync27FileListWriter::new(plan.update_mode == UpdateMode::Checksum);
+    let (entries, batch_count) = collect_local_push_source_entries_with_batches(
+        &sources,
+        &collect_options,
+        plan.max_alloc,
+        |batch| {
+            file_list_writer.write_batch(transport, &batch.entries)?;
+            Ok(())
+        },
+    )
+    .context("local upload file-list batch exceeds allocation budget")?;
+    file_list_writer.finish(transport)?;
     write_rsync_i32(transport, 0)?;
     transport.flush()?;
+    let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
+    progress.info(format!(
+        "upload list: {} files, {}",
+        file_count,
+        format_bytes(total_file_bytes)
+    ));
+    progress.detail(format!("upload list entries: {}", entries.len(),));
+    progress.detail(format!("upload list batches: {}", batch_count));
 
     let mut mux = MultiplexReadState::default();
     let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
@@ -2803,21 +2802,6 @@ fn execute_remote_push_protocol31<T: Read + Write>(
     let files_from = load_files_from(cli)?;
     progress.info("building upload file list");
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
-    let (entries, wire_batches) =
-        collect_local_push_source_entries_and_batches(&sources, &collect_options, plan.max_alloc)
-            .context("local upload file-list batch exceeds allocation budget")?;
-    let wire_entries = flatten_file_list_batches(&wire_batches);
-    check_rsync_file_list_budget(&wire_entries, plan.max_alloc)
-        .context("local upload file-list exceeds allocation budget")?;
-    let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
-    progress.info(format!(
-        "upload list: {} files, {}",
-        file_count,
-        format_bytes(total_file_bytes)
-    ));
-    progress.detail(format!("upload list entries: {}", entries.len(),));
-    progress.detail(format!("upload list batches: {}", wire_batches.len()));
-
     let handshake = exchange_remote_shell_protocol31_handshake_with_options(
         transport,
         protocol31_setup_options_from_plan(plan),
@@ -2832,21 +2816,41 @@ fn execute_remote_push_protocol31<T: Read + Write>(
         write_i32_le(&mut writer, 0).map_err(protocol31_setup_error)?;
         writer.flush().map_err(protocol31_setup_error)?;
     }
-    {
+    let (entries, batch_count) = {
         let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
-        write_rsync31_file_list_with_metadata(
-            &mut writer,
-            &wire_entries,
-            rsync31_file_list_options_from_plan(
-                plan,
-                plan.update_mode == UpdateMode::Checksum,
-                true,
-                plan.daemon_operand.is_some(),
-            ),
-        )
-        .map_err(protocol31_setup_error)?;
+        let mut file_list_writer = Rsync31FileListWriter::new(rsync31_file_list_options_from_plan(
+            plan,
+            plan.update_mode == UpdateMode::Checksum,
+            true,
+            plan.daemon_operand.is_some(),
+        ));
+        let (collected_entries, collected_batch_count) =
+            collect_local_push_source_entries_with_batches(
+                &sources,
+                &collect_options,
+                plan.max_alloc,
+                |batch| {
+                    file_list_writer
+                        .write_batch(&mut writer, &batch.entries)
+                        .map_err(protocol31_setup_error)?;
+                    Ok(())
+                },
+            )
+            .context("local upload file-list batch exceeds allocation budget")?;
+        file_list_writer
+            .finish(&mut writer)
+            .map_err(protocol31_setup_error)?;
         writer.flush().map_err(protocol31_setup_error)?;
-    }
+        (collected_entries, collected_batch_count)
+    };
+    let (file_count, total_file_bytes) = remote_entries_file_summary(&entries);
+    progress.info(format!(
+        "upload list: {} files, {}",
+        file_count,
+        format_bytes(total_file_bytes)
+    ));
+    progress.detail(format!("upload list entries: {}", entries.len(),));
+    progress.detail(format!("upload list batches: {}", batch_count));
 
     let mut mux = MultiplexReadState::default();
     let remote_compression = RemoteCompressionConfig::for_plan(plan)?;
@@ -4224,25 +4228,38 @@ where
     Ok(())
 }
 
-fn collect_local_push_source_entries_and_batches(
+fn collect_local_push_source_entries_with_batches<F>(
     sources: &[PathBuf],
     options: &LocalSourceCollectOptions<'_>,
     max_alloc: Option<u64>,
-) -> Result<(Vec<RemoteSourceEntry>, Vec<FileListBatch>)> {
+    mut on_batch: F,
+) -> Result<(Vec<RemoteSourceEntry>, usize)>
+where
+    F: FnMut(&FileListBatch) -> Result<()>,
+{
     let mut entries = Vec::new();
-    let mut wire_batches = Vec::new();
+    let mut batch_count = 0_usize;
+    let mut total_alloc = 0_usize;
     collect_local_source_entry_batches(
         sources,
         options,
         REMOTE_FILE_LIST_BATCH_ENTRIES,
         max_alloc,
         |batch| {
-            wire_batches.push(batch.file_list_batch());
+            let wire_batch = batch.file_list_batch();
+            for entry in &wire_batch.entries {
+                total_alloc = total_alloc
+                    .checked_add(estimated_rsync_file_list_entry_alloc(entry))
+                    .context("file-list allocation estimate overflow")?;
+                AllocationBudget::new(max_alloc).check("file-list entries", total_alloc)?;
+            }
+            on_batch(&wire_batch)?;
             entries.extend(batch.entries.iter().cloned());
+            batch_count += 1;
             Ok(())
         },
     )?;
-    Ok((entries, wire_batches))
+    Ok((entries, batch_count))
 }
 
 fn collect_local_source_entries_with_callback<F>(
@@ -4440,13 +4457,6 @@ where
     }
 
     Ok(())
-}
-
-fn flatten_file_list_batches(batches: &[FileListBatch]) -> Vec<RsyncFileListEntry> {
-    batches
-        .iter()
-        .flat_map(|batch| batch.entries.iter().cloned())
-        .collect()
 }
 
 fn collect_local_directory_source_entries_with_callback<F>(
