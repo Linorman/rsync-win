@@ -260,7 +260,7 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 **Scope:**
 
 - Streaming large files without high memory usage.
-- Incremental recursion or memory-bounded file-list handling.
+- Cross-mode incremental recursion or memory-bounded file-list handling; protocol 31 remote pull now handles upstream incremental file-list markers, while remote push remains non-incremental.
 - Multiplexed message handling robustness.
 - Checksum/compression negotiation hardening.
 - Path traversal and malicious peer defenses.
@@ -280,7 +280,7 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 - Local file copy, append, checksum comparison, prefix comparison, and remote whole-file token IO stream through bounded buffers.
 - Remote pull validates all received file-list paths before filtering or writing, rejects destination escapes and Windows-invalid paths, and rejects literal token streams that exceed or undershoot the advertised file length.
 - Protocol file-list readers now reject parent escapes, absolute paths, Windows prefixes, reserved names, invalid characters, and trailing dot/space components before entries reach destination planning.
-- Remote file-list readers enforce entry-count and path-length limits; full incremental recursion remains future work.
+- Remote file-list readers enforce entry-count and path-length limits; protocol 31 remote pull handles upstream incremental file-list batches, while full cross-mode incremental recursion remains future work.
 - Daemon client and minimal daemon server paths cover module listing, ordinary-file pull/push, daemon client connection controls, proxy/connect-program support, formatted daemon logs, socket options, and daemon-server bandwidth limiting in tested paths.
 - Progress logging, concise summaries, itemized changes, and structured stats are available through existing CLI output.
 - `tests/security/remote_peer.rs` covers remote peer path, multiplex, and malformed length regressions as a dedicated security gate.

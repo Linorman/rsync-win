@@ -20,6 +20,7 @@ use rsync_protocol::{
 };
 use rsync_transport::tcp::{TcpAddressFamily, TcpSocketOptions};
 
+use crate::remote::receive::RemoteSenderFileRequest;
 use crate::{
     checked_file_index, collect_local_source_entries, delete_local_extras, read_multiplexed_i32,
     read_multiplexed_rsync31_index, read_remote_block_signatures_from_reader,
@@ -488,16 +489,18 @@ fn serve_daemon_receiver_protocol31<T: Read + Write>(
 
     request_remote_sender_files_protocol31(
         stream,
-        &entries,
-        &transfer_indexes,
-        index_offset,
-        transfer.dry_run,
-        &destination,
-        transfer.block_size,
-        transfer.whole_file,
-        RemoteFileChecksum::PlainMd4,
-        None,
-        None,
+        RemoteSenderFileRequest {
+            entries: &entries,
+            selected_indexes: &transfer_indexes,
+            index_offset,
+            dry_run: transfer.dry_run,
+            dest: &destination,
+            block_size: transfer.block_size,
+            whole_file: transfer.whole_file,
+            checksum: RemoteFileChecksum::PlainMd4,
+            max_alloc: None,
+            stop_deadline: None,
+        },
     )?;
     stream.flush()?;
     receive_remote_sender_files_protocol31(

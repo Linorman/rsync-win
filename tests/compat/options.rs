@@ -477,16 +477,18 @@ fn parser_accepts_no_prefixed_standalone_options_and_compat_aliases() {
         "{output}"
     );
 
-    for option in [
-        "--no-motd",
-        "--inc-recursive",
-        "--i-r",
-        "--no-inc-recursive",
-        "--no-i-r",
-    ] {
+    let option = "--no-motd";
+    assert!(
+        output.contains(option),
+        "missing compatibility diagnostic for {option}: {output}"
+    );
+    assert!(output.contains("incremental recursion: false"), "{output}");
+    for option in ["--inc-recursive", "--i-r", "--no-inc-recursive", "--no-i-r"] {
         assert!(
-            output.contains(option),
-            "missing compatibility diagnostic for {option}: {output}"
+            !output.contains(&format!(
+                "{option} is accepted for rsync option compatibility"
+            )),
+            "incremental recursion option should not be reported as compatibility-only: {output}"
         );
     }
     // --time-limit is now implemented
@@ -1318,7 +1320,7 @@ fn chunk13_registry_status_is_implemented() {
         let spec = specs
             .iter()
             .find(|s| s.long == option)
-            .expect(&format!("missing --{option}"));
+            .unwrap_or_else(|| panic!("missing --{option}"));
         assert_eq!(
             spec.support, support,
             "--{option} should have conservative execution support"

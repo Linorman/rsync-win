@@ -31,7 +31,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Remote file-list paths | Protocol file-list readers reject parent escapes, absolute paths, Windows prefixes, reserved Windows names, invalid characters, and trailing dots/spaces before the CLI maps entries to a destination. Remote pull still performs destination preflight for case/normalization collisions before filtering or writing. |
 | Remote pull selection | Filters and `--files-from` are applied locally after receiving the remote sender file-list. Remote push routes include/exclude/filter rules to the remote receiver for delete protection; `--files-from` is not routed to the receiver yet. |
 | Remote token lengths | Remote pull rejects literal token streams that exceed or undershoot the advertised file-list length and removes temporary receive files on error. |
-| File-list size | Remote file-list readers enforce a 100,000 entry limit and 32 KiB path limit for the current non-incremental receive path. Full incremental recursion is still future work. |
+| File-list size | Remote file-list readers enforce a 100,000 entry limit and 32 KiB path limit. Protocol 31 remote pull can receive upstream incremental file-list markers; remote push still uses `--no-inc-recursive`. |
 | Multiplexing | Data frames are streamed; remote error messages are surfaced; unsupported multiplex tags are rejected. |
 | Compression | `-z/--compress` negotiates and applies zlib/zlibx token compression on the remote protocol 31 transfer path, including `--compress-choice`, `--compress-level`, and `--skip-compress`. Local Windows-to-Windows copies are not compressed, and `--compress-threads` is parsed/forwarded but does not add a parallel local compressor. |
 | Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow, then runs staged `--version`, `--help`, and a disposable local sync smoke test. |
@@ -48,7 +48,7 @@ The packaged option table is in [`docs/OPTION-STATUS.md`](OPTION-STATUS.md). It 
 - VSS snapshot reads are not implemented.
 - NTFS security descriptor restore, sparse range preservation, and arbitrary reparse restore are not implemented.
 - Alternate data stream payload copying is implemented only for named streams in explicit `ntfs-native` local Windows syncs.
-- Full memory-bounded incremental recursion is not implemented.
+- Full cross-mode memory-bounded incremental recursion is not implemented; remote-shell push remains sender-side non-incremental.
 
 ## Recommended Smoke Tests
 

@@ -1570,7 +1570,7 @@ mod tests {
 
     #[test]
     fn round_trips_minimal_file_list() {
-        let entries = vec![
+        let entries = [
             FileListEntry {
                 path: PathBuf::from("dir"),
                 file_type: WireFileType::Directory,
@@ -1818,7 +1818,7 @@ mod tests {
 
     #[test]
     fn writes_and_reads_protocol31_file_list_batches_in_order() {
-        let entries = vec![
+        let entries = [
             RsyncFileListEntry {
                 path: PathBuf::from("."),
                 file_type: WireFileType::Directory,

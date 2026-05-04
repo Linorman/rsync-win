@@ -1040,6 +1040,7 @@ mod tests {
 
     // ── Out-format rendering ───────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     fn make_args<'a>(
         fmt: &'a str,
         fp: &'a str,

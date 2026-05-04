@@ -26,7 +26,7 @@ This is an early development release. Version `v0.1.5` maps to Cargo package ver
 
 See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the current peer, metadata, hardening, and release compatibility matrix. The packaged option status table is maintained in [`docs/OPTION-STATUS.md`](docs/OPTION-STATUS.md).
 
-Known not implemented in this development build: daemon server `auth users`/`secrets file` handling, advanced `rsyncd.conf` keys beyond the safe module subset, encrypted daemon transport, VSS snapshot reads, NTFS security descriptor restore, sparse range preservation, arbitrary reparse restore, and memory-bounded incremental recursion. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport.
+Known not implemented in this development build: daemon server `auth users`/`secrets file` handling, advanced `rsyncd.conf` keys beyond the safe module subset, encrypted daemon transport, VSS snapshot reads, NTFS security descriptor restore, sparse range preservation, arbitrary reparse restore, and sender-side remote push incremental recursion. Protocol 31 remote pull supports upstream incremental file-list markers, but cross-mode memory-bounded incremental recursion is not complete. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport.
 
 ## Install
 

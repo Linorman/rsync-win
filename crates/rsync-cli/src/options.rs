@@ -4,7 +4,11 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use rsync_fs::DeleteMode;
 
-use crate::{Cli, CliMetadataPolicy};
+use crate::cli::{Cli, CliMetadataPolicy};
+
+mod values;
+
+use values::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
@@ -146,10 +150,10 @@ static UPSTREAM_CLIENT_OPTIONS: &[OptionSpec] = &[
     flag("checksum", Some('c'), I),
     flag("archive", Some('a'), I),
     flag("recursive", Some('r'), I),
-    flag("inc-recursive", None, P),
-    flag("i-r", None, P),
-    flag("no-inc-recursive", None, P),
-    flag("no-i-r", None, P),
+    flag("inc-recursive", None, I),
+    flag("i-r", None, I),
+    flag("no-inc-recursive", None, I),
+    flag("no-i-r", None, I),
     flag("relative", Some('R'), I),
     flag("no-implied-dirs", None, I),
     flag("backup", Some('b'), I),
@@ -656,176 +660,6 @@ fn is_program_name(arg: &str) -> bool {
         .unwrap_or(arg)
         .to_ascii_lowercase();
     matches!(name.as_str(), "rsync-win" | "rsync-win.exe")
-}
-
-impl Default for Cli {
-    fn default() -> Self {
-        Self {
-            version: false,
-            protocol_range: false,
-            plan: false,
-            recursive: false,
-            no_recursive: false,
-            preserve_times: false,
-            no_times: false,
-            archive: false,
-            dry_run: false,
-            delete: false,
-            delete_mode: DeleteMode::None,
-            whole_file: false,
-            compress: false,
-            compress_choice: None,
-            compress_level: None,
-            compress_threads: None,
-            skip_compress: Vec::new(),
-            quiet: 0,
-            info_flags: Vec::new(),
-            debug_flags: Vec::new(),
-            msgs2stderr: false,
-            no_msgs2stderr: false,
-            stderr_mode: None,
-            out_format: None,
-            eight_bit_output: false,
-            client_log_file: None,
-            client_log_file_format: None,
-            human_readable: 0,
-            help: false,
-            progress: false,
-            relative: false,
-            implied_dirs: true,
-            transfer_dirs: false,
-            mkpath: false,
-            one_file_system: false,
-            verbosity: 0,
-            itemize_changes: false,
-            stats: false,
-            list_only: false,
-            metadata_policy: CliMetadataPolicy::Portable,
-            fail_on_metadata_loss: false,
-            preserve_permissions: false,
-            no_permissions: false,
-            preserve_owner: false,
-            preserve_group: false,
-            executability: false,
-            acls: false,
-            xattrs: false,
-            fake_super: false,
-            atimes: false,
-            crtimes: false,
-            omit_dir_times: false,
-            omit_link_times: false,
-            vss: false,
-            daemon_server: false,
-            daemon_config: None,
-            daemon_params: Vec::new(),
-            daemon_no_detach: false,
-            daemon_address: None,
-            daemon_port: None,
-            daemon_sockopts: None,
-            daemon_connect_timeout_secs: None,
-            daemon_no_motd: false,
-            daemon_log_file: None,
-            daemon_log_file_format: None,
-            daemon_bwlimit: None,
-            internal_server: false,
-            internal_sender: false,
-            includes: Vec::new(),
-            excludes: Vec::new(),
-            filters: Vec::new(),
-            exclude_from: Vec::new(),
-            include_from: Vec::new(),
-            cvs_exclude: false,
-            files_from: None,
-            from0: false,
-            checksum: false,
-            checksum_choice: None,
-            checksum_seed: None,
-            size_only: false,
-            ignore_times: false,
-            partial: false,
-            partial_dir: None,
-            inplace: false,
-            append_verify: false,
-            append: false,
-            update: false,
-            existing: false,
-            ignore_existing: false,
-            max_size: None,
-            min_size: None,
-            modify_window: 0,
-            ignore_missing_args: false,
-            delete_missing_args: false,
-            delete_excluded: false,
-            ignore_errors: false,
-            force: false,
-            max_delete: None,
-            backup: false,
-            backup_dir: None,
-            suffix: None,
-            temp_dir: None,
-            delay_updates: false,
-            fsync: false,
-            numeric_ids: false,
-            user_maps: Vec::new(),
-            group_maps: Vec::new(),
-            chown: None,
-            no_owner: false,
-            no_group: false,
-            chmod: None,
-            remote_shell: None,
-            password_file: None,
-            copy_links: false,
-            safe_links: false,
-            copy_unsafe_links: false,
-            copy_dirlinks: false,
-            keep_dirlinks: false,
-            munge_links: false,
-            links: false,
-            no_links: false,
-            hard_links: false,
-            devices: false,
-            specials: false,
-            no_devices: false,
-            no_specials: false,
-            copy_devices: false,
-            write_devices: false,
-            block_size: None,
-            remote_options: Vec::new(),
-            rsync_path: None,
-            blocking_io: false,
-            old_args: false,
-            secluded_args: false,
-            trust_sender: false,
-            ipv4: false,
-            ipv6: false,
-            accepted_unsupported_options: Vec::new(),
-            // Chunk 12
-            compare_dest: Vec::new(),
-            copy_dest: Vec::new(),
-            link_dest: Vec::new(),
-            sparse: false,
-            preallocate: false,
-            fuzzy: false,
-            copy_as: None,
-            super_flag: false,
-            write_batch: None,
-            only_write_batch: None,
-            read_batch: None,
-            // Chunk 13
-            bwlimit: None,
-            timeout_secs: None,
-            stop_after_minutes: None,
-            time_limit_minutes: None,
-            stop_at: None,
-            max_alloc: None,
-            early_input: None,
-            outbuf: None,
-            protocol_version: None,
-            iconv: None,
-            open_noatime: false,
-            paths: Vec::new(),
-        }
-    }
 }
 
 fn split_long_option(option: &str) -> (&str, Option<&str>) {
@@ -1444,11 +1278,20 @@ fn apply_standalone_no_prefixed_or_compat_alias(cli: &mut Cli, name: &str) -> Re
             cli.stderr_mode = Some("client".to_string());
             Ok(true)
         }
-        "inc-recursive" | "i-r" | "no-inc-recursive" | "no-i-r" => {
+        "inc-recursive" | "i-r" => {
             if find_long_spec(name).is_none() {
                 bail!("unknown option --{name}");
             }
-            remember_unsupported(cli, &format!("--{name}"));
+            cli.inc_recursive = true;
+            cli.no_inc_recursive = false;
+            Ok(true)
+        }
+        "no-inc-recursive" | "no-i-r" => {
+            if find_long_spec(name).is_none() {
+                bail!("unknown option --{name}");
+            }
+            cli.inc_recursive = false;
+            cli.no_inc_recursive = true;
             Ok(true)
         }
         _ => Ok(false),
@@ -1610,178 +1453,6 @@ fn apply_chown_implications(cli: &mut Cli, chown: &str) {
         cli.preserve_group = true;
         cli.no_group = false;
     }
-}
-
-fn parse_metadata_policy(value: &str) -> Result<CliMetadataPolicy> {
-    match value {
-        "portable" => Ok(CliMetadataPolicy::Portable),
-        "posix" => Ok(CliMetadataPolicy::Posix),
-        "ntfs-native" => Ok(CliMetadataPolicy::NtfsNative),
-        _ => bail!("invalid --metadata-policy value `{value}`"),
-    }
-}
-
-fn parse_i64(value: &str, option: &str) -> Result<i64> {
-    value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("option --{option} expects an integer"))
-}
-
-fn parse_i32(value: &str, option: &str) -> Result<i32> {
-    value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("option --{option} expects a 32-bit integer"))
-}
-
-fn parse_u32(value: &str, option: &str) -> Result<u32> {
-    value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("option --{option} expects a non-negative integer"))
-}
-
-fn parse_u16(value: &str, option: &str) -> Result<u16> {
-    value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("option --{option} expects a 16-bit integer"))
-}
-
-fn parse_u64(value: &str, option: &str) -> Result<u64> {
-    value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("option --{option} expects a non-negative integer"))
-}
-
-fn parse_usize(value: &str, option: &str) -> Result<usize> {
-    value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("option --{option} expects a non-negative integer"))
-}
-
-fn parse_max_delete(value: &str) -> Result<usize> {
-    if value == "-1" {
-        return Ok(0);
-    }
-    value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("option --max-delete expects a non-negative integer or -1"))
-}
-
-fn parse_size(value: &str) -> Result<u64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        bail!("size value cannot be empty");
-    }
-    let split = trimmed
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    let (digits, suffix) = trimmed.split_at(split);
-    let number: u64 = digits
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid size value `{value}`"))?;
-    let multiplier = match suffix.to_ascii_lowercase().as_str() {
-        "" => 1,
-        "k" | "kb" => 1024,
-        "m" | "mb" => 1024 * 1024,
-        "g" | "gb" => 1024 * 1024 * 1024,
-        _ => bail!("invalid size suffix in `{value}`"),
-    };
-    Ok(number.saturating_mul(multiplier))
-}
-
-fn parse_bwlimit_value(value: &str) -> Result<Option<u64>> {
-    let bytes = parse_scaled_number(value, 1024.0, "--bwlimit")?;
-    if bytes == 0 {
-        return Ok(None);
-    }
-    Ok(Some(bytes))
-}
-
-fn parse_max_alloc_value(value: &str) -> Result<Option<u64>> {
-    let bytes = parse_scaled_number(value, 1.0, "--max-alloc")?;
-    if bytes == 0 {
-        return Ok(None);
-    }
-    Ok(Some(bytes))
-}
-
-fn parse_scaled_number(value: &str, default_multiplier: f64, option: &str) -> Result<u64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        bail!("{option} value cannot be empty");
-    }
-    let split = trimmed
-        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
-        .unwrap_or(trimmed.len());
-    let (digits, suffix) = trimmed.split_at(split);
-    if digits.is_empty() || digits == "." {
-        bail!("{option} value `{value}` is not a valid size");
-    }
-    let number = digits
-        .parse::<f64>()
-        .map_err(|_| anyhow::anyhow!("{option} value `{value}` is not a valid size"))?;
-    if !number.is_finite() || number < 0.0 {
-        bail!("{option} value `{value}` must be non-negative");
-    }
-    let multiplier = match suffix.to_ascii_lowercase().as_str() {
-        "" => default_multiplier,
-        "b" => 1.0,
-        "k" | "kb" | "kib" => 1024.0,
-        "m" | "mb" | "mib" => 1024.0 * 1024.0,
-        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "p" | "pb" | "pib" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => bail!("{option} value `{value}` has an unsupported size suffix"),
-    };
-    let bytes = (number * multiplier).round();
-    if bytes > u64::MAX as f64 {
-        bail!("{option} value `{value}` exceeds the supported range");
-    }
-    Ok(bytes as u64)
-}
-
-fn parse_outbuf_value(value: &str) -> Result<String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "n" | "none" | "unbuffered" => Ok("N".to_string()),
-        "l" | "line" => Ok("L".to_string()),
-        "b" | "block" | "full" => Ok("B".to_string()),
-        _ => bail!("--outbuf expects N, L, or B"),
-    }
-}
-
-fn validate_stop_at_value(value: &str) -> Result<()> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        bail!("--stop-at value cannot be empty");
-    }
-    let time = trimmed.rsplit_once('T').map_or(trimmed, |(_, time)| time);
-    if time.contains(':') {
-        validate_stop_at_time(time)?;
-    }
-    Ok(())
-}
-
-fn validate_stop_at_time(value: &str) -> Result<()> {
-    let parts: Vec<_> = value.split(':').collect();
-    if parts.len() < 2 || parts.len() > 3 {
-        bail!("--stop-at time must use HH:MM or HH:MM:SS");
-    }
-    let hour = parts[0]
-        .parse::<u8>()
-        .map_err(|_| anyhow::anyhow!("--stop-at hour is not valid"))?;
-    let minute = parts[1]
-        .parse::<u8>()
-        .map_err(|_| anyhow::anyhow!("--stop-at minute is not valid"))?;
-    let second = if parts.len() == 3 {
-        parts[2]
-            .parse::<u8>()
-            .map_err(|_| anyhow::anyhow!("--stop-at second is not valid"))?
-    } else {
-        0
-    };
-    if hour > 23 || minute > 59 || second > 59 {
-        bail!("--stop-at time is outside the valid clock range");
-    }
-    Ok(())
 }
 
 fn remember_unsupported(cli: &mut Cli, option: &str) {
