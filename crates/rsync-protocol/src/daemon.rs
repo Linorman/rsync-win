@@ -246,6 +246,16 @@ pub fn daemon_auth_response(
     }
 }
 
+pub fn daemon_auth_response_matches(
+    password: &str,
+    challenge: &str,
+    checksum: DaemonAuthChecksum,
+    response: &str,
+) -> bool {
+    let expected = daemon_auth_response(password, challenge, checksum);
+    constant_time_eq(expected.as_bytes(), response.as_bytes())
+}
+
 fn parse_rsync_url(rest: &str) -> Result<DaemonOperand, DaemonError> {
     let (authority, module_path) = rest.split_once('/').unwrap_or((rest, ""));
     if authority.is_empty() {
@@ -435,6 +445,16 @@ fn base64_no_pad(bytes: &[u8]) -> String {
     out
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |acc, (l, r)| acc | (l ^ r))
+        == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +525,24 @@ mod tests {
 
         assert_eq!(response.len(), 22);
         assert!(!response.contains('='));
+    }
+
+    #[test]
+    fn verifies_daemon_auth_response() {
+        let response = daemon_auth_response("secret", "challenge", DaemonAuthChecksum::Md5);
+
+        assert!(daemon_auth_response_matches(
+            "secret",
+            "challenge",
+            DaemonAuthChecksum::Md5,
+            &response
+        ));
+        assert!(!daemon_auth_response_matches(
+            "wrong",
+            "challenge",
+            DaemonAuthChecksum::Md5,
+            &response
+        ));
     }
 
     #[test]

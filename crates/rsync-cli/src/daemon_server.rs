@@ -12,11 +12,12 @@ use rsync_fs::{
     UpdateMode,
 };
 use rsync_protocol::{
-    read_i32_le, read_rsync31_file_list_with_metadata, read_rsync_index, read_u16_le, write_i32_le,
-    write_rsync31_file_list_with_metadata, write_rsync_index, write_u16_le, write_varlong,
-    MultiplexReadState, MultiplexedReader, MultiplexedWriter, RsyncFileListOptions,
-    RsyncIndexState, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN,
-    REMOTE_SHELL_MODERN_PROTOCOL, RSYNC_INDEX_DONE,
+    daemon_auth_response_matches, read_i32_le, read_rsync31_file_list_with_metadata,
+    read_rsync_index, read_u16_le, write_i32_le, write_rsync31_file_list_with_metadata,
+    write_rsync_index, write_u16_le, write_varlong, DaemonAuthChecksum, MultiplexReadState,
+    MultiplexedReader, MultiplexedWriter, RsyncFileListOptions, RsyncIndexState, WireFileType,
+    DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN, REMOTE_SHELL_MODERN_PROTOCOL,
+    RSYNC_INDEX_DONE,
 };
 use rsync_transport::tcp::{TcpAddressFamily, TcpSocketOptions};
 
@@ -46,7 +47,12 @@ struct DaemonServerModule {
     path: PathBuf,
     comment: String,
     read_only: bool,
+    write_only: bool,
     list: bool,
+    auth_users: Vec<String>,
+    secrets_file: Option<PathBuf>,
+    uid: Option<String>,
+    gid: Option<String>,
 }
 
 #[derive(Debug)]
@@ -144,6 +150,10 @@ pub fn run(cli: &Cli) -> Result<String> {
     let mut config = parse_config(&config_text, config_path)?;
     apply_dparams(&mut config, &cli.daemon_params)?;
     validate_config(&config)?;
+    for warning in daemon_config_warnings(&config) {
+        eprintln!("{warning}");
+        log_daemon_message(cli, &warning)?;
+    }
 
     let address = daemon_listen_address(cli);
     let port = cli
@@ -202,7 +212,12 @@ fn parse_config(text: &str, path: &Path) -> Result<DaemonServerConfig> {
                 path: PathBuf::new(),
                 comment: String::new(),
                 read_only: true,
+                write_only: false,
                 list: true,
+                auth_users: Vec::new(),
+                secrets_file: None,
+                uid: None,
+                gid: None,
             });
             continue;
         }
@@ -266,7 +281,12 @@ fn apply_module_param(module: &mut DaemonServerModule, key: &str, value: &str) -
         "path" => module.path = PathBuf::from(value),
         "comment" => module.comment = value.to_string(),
         "read only" => module.read_only = parse_daemon_bool(value)?,
+        "write only" => module.write_only = parse_daemon_bool(value)?,
         "list" => module.list = parse_daemon_bool(value)?,
+        "auth users" => module.auth_users = parse_daemon_user_list(value)?,
+        "secrets file" => module.secrets_file = Some(PathBuf::from(value)),
+        "uid" => module.uid = non_empty_daemon_value(value),
+        "gid" => module.gid = non_empty_daemon_value(value),
         _ => bail!("unsupported daemon module config key `{key}`"),
     }
     Ok(())
@@ -294,8 +314,43 @@ fn validate_config(config: &DaemonServerConfig) -> Result<()> {
                 module.path.display()
             );
         }
+        if !module.auth_users.is_empty() && module.secrets_file.is_none() {
+            bail!(
+                "daemon module `{}` uses auth users but has no secrets file",
+                module.name
+            );
+        }
+        if let Some(secrets_file) = &module.secrets_file {
+            let metadata = fs::symlink_metadata(secrets_file).with_context(|| {
+                format!(
+                    "failed to inspect daemon secrets file for module `{}`",
+                    module.name
+                )
+            })?;
+            if !metadata.file_type().is_file() {
+                bail!(
+                    "daemon secrets file for module `{}` must be a regular file",
+                    module.name
+                );
+            }
+            validate_daemon_secrets_file_permissions(module, &metadata)?;
+        }
     }
     Ok(())
+}
+
+fn daemon_config_warnings(config: &DaemonServerConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for module in &config.modules {
+        if module.uid.is_some() || module.gid.is_some() {
+            warnings.push(format!(
+                "daemon module `{}` parses uid/gid for rsyncd.conf compatibility but does not apply process identity changes",
+                module.name
+            ));
+        }
+        warnings.extend(daemon_secrets_file_warnings(module));
+    }
+    warnings
 }
 
 fn handle_client<T: Read + Write>(
@@ -312,6 +367,7 @@ fn handle_client<T: Read + Write>(
         bail!("invalid daemon client greeting `{greeting}`");
     }
     let peer_protocol = parse_client_greeting_protocol(&greeting)?;
+    let auth_checksum = daemon_auth_checksum_from_client_greeting(&greeting)?;
 
     let request = read_daemon_line(&mut stream, 8192)?.context("client closed before request")?;
     if request == "#list" {
@@ -325,8 +381,12 @@ fn handle_client<T: Read + Write>(
         return Ok(());
     };
 
-    writeln!(stream, "@RSYNCD: OK")?;
-    stream.flush()?;
+    if module.auth_users.is_empty() {
+        writeln!(stream, "@RSYNCD: OK")?;
+        stream.flush()?;
+    } else {
+        authenticate_daemon_client(module, client.clone(), auth_checksum, &mut stream, None)?;
+    }
     let args = read_daemon_args(&mut stream, peer_protocol)?;
     let transfer = DaemonTransferArgs::parse(&args)?;
     let operation = if transfer.sender { "send" } else { "recv" };
@@ -353,6 +413,11 @@ fn handle_client<T: Read + Write>(
 
     if !transfer.sender && module.read_only {
         writeln!(stream, "@ERROR: module '{}' is read only", module.name)?;
+        stream.flush()?;
+        return Ok(());
+    }
+    if transfer.sender && module.write_only {
+        writeln!(stream, "@ERROR: module '{}' is write only", module.name)?;
         stream.flush()?;
         return Ok(());
     }
@@ -550,16 +615,6 @@ fn send_protocol31_setup<T: Write>(stream: &mut T) -> Result<()> {
 }
 
 fn exchange_receiver_protocol31_setup<T: Read + Write>(stream: &mut T) -> Result<()> {
-    rsync_protocol::io::write_u32_le(stream, REMOTE_SHELL_MODERN_PROTOCOL)?;
-    stream.flush()?;
-    let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix)?;
-    let peer_protocol = rsync_protocol::validate_protocol_stream_prefix(&prefix)?;
-    if peer_protocol < REMOTE_SHELL_MODERN_PROTOCOL {
-        bail!(
-            "daemon sender protocol {peer_protocol} is below required protocol {REMOTE_SHELL_MODERN_PROTOCOL}"
-        );
-    }
     send_protocol31_setup(stream)
 }
 
@@ -1005,6 +1060,151 @@ fn parse_client_greeting_protocol(line: &str) -> Result<u32> {
         .with_context(|| format!("invalid daemon client protocol version `{version}`"))
 }
 
+fn daemon_auth_checksum_from_client_greeting(line: &str) -> Result<DaemonAuthChecksum> {
+    let fields = line
+        .strip_prefix("@RSYNCD: ")
+        .context("invalid daemon client greeting")?
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>();
+    if fields.contains(&"md5") {
+        Ok(DaemonAuthChecksum::Md5)
+    } else if fields.contains(&"md4") {
+        Ok(DaemonAuthChecksum::Md4)
+    } else {
+        let protocol = parse_client_greeting_protocol(line)?;
+        if protocol >= 30 {
+            Ok(DaemonAuthChecksum::Md5)
+        } else {
+            Ok(DaemonAuthChecksum::Md4)
+        }
+    }
+}
+
+fn authenticate_daemon_client<T: Read + Write>(
+    module: &DaemonServerModule,
+    client: Option<String>,
+    checksum: DaemonAuthChecksum,
+    stream: &mut T,
+    challenge_override: Option<String>,
+) -> Result<()> {
+    let challenge = challenge_override
+        .unwrap_or_else(|| daemon_auth_challenge(&module.name, client.as_deref()));
+    writeln!(stream, "@RSYNCD: AUTHREQD {challenge}")?;
+    stream.flush()?;
+
+    let response =
+        read_daemon_line(stream, 8192)?.context("daemon client closed before auth response")?;
+    if daemon_auth_response_is_valid(module, &response, &challenge, checksum)? {
+        writeln!(stream, "@RSYNCD: OK")?;
+        stream.flush()?;
+        Ok(())
+    } else {
+        writeln!(
+            stream,
+            "@ERROR: daemon authentication failed for module '{}'",
+            module.name
+        )?;
+        stream.flush()?;
+        bail!("daemon authentication failed for module `{}`", module.name);
+    }
+}
+
+fn daemon_auth_response_is_valid(
+    module: &DaemonServerModule,
+    response_line: &str,
+    challenge: &str,
+    checksum: DaemonAuthChecksum,
+) -> Result<bool> {
+    let Some((user, response)) = response_line.split_once(' ') else {
+        return Ok(false);
+    };
+    let user = user.trim();
+    if user.is_empty()
+        || user.as_bytes().contains(&0)
+        || !module.auth_users.iter().any(|u| u == user)
+    {
+        return Ok(false);
+    }
+    let secrets = read_daemon_secrets(module)?;
+    let Some(password) = secrets
+        .iter()
+        .find_map(|(candidate, password)| (candidate == user).then_some(password))
+    else {
+        return Ok(false);
+    };
+    Ok(daemon_auth_response_matches(
+        password, challenge, checksum, response,
+    ))
+}
+
+fn read_daemon_secrets(module: &DaemonServerModule) -> Result<Vec<(String, String)>> {
+    let path = module
+        .secrets_file
+        .as_ref()
+        .context("daemon module requires auth but has no secrets file")?;
+    let text = fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read daemon secrets file for module `{}`",
+            module.name
+        )
+    })?;
+    parse_daemon_secrets(&module.name, &text)
+}
+
+fn parse_daemon_secrets(module_name: &str, text: &str) -> Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+    for (line_index, raw_line) in text.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((user, password)) = line.split_once(':') else {
+            bail!(
+                "daemon secrets file for module `{module_name}` contains invalid entry at line {line_number}"
+            );
+        };
+        let user = user.trim();
+        if user.is_empty() || user.as_bytes().contains(&0) || password.as_bytes().contains(&0) {
+            bail!(
+                "daemon secrets file for module `{module_name}` contains invalid entry at line {line_number}"
+            );
+        }
+        entries.push((user.to_string(), password.to_string()));
+    }
+    Ok(entries)
+}
+
+fn daemon_auth_challenge(module: &str, client: Option<&str>) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{:x}.{:x}.{}",
+        nanos,
+        std::process::id(),
+        stable_auth_challenge_suffix(module, client)
+    )
+}
+
+fn stable_auth_challenge_suffix(module: &str, client: Option<&str>) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in module
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(client.unwrap_or("-").as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 fn read_daemon_line<T: Read>(stream: &mut T, max_len: usize) -> io::Result<Option<String>> {
     let mut bytes = Vec::new();
     let mut byte = [0_u8; 1];
@@ -1098,6 +1298,72 @@ fn parse_daemon_bool(value: &str) -> Result<bool> {
     }
 }
 
+fn parse_daemon_user_list(value: &str) -> Result<Vec<String>> {
+    let users = value
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .filter_map(|part| {
+            let user = part.trim();
+            (!user.is_empty()).then(|| user.to_string())
+        })
+        .collect::<Vec<_>>();
+    if users.iter().any(|user| user.as_bytes().contains(&0)) {
+        bail!("daemon auth users must not contain NUL bytes");
+    }
+    Ok(users)
+}
+
+fn non_empty_daemon_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(unix)]
+fn validate_daemon_secrets_file_permissions(
+    module: &DaemonServerModule,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "daemon secrets file for module `{}` must not be accessible by group or other users",
+            module.name
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_daemon_secrets_file_permissions(
+    _module: &DaemonServerModule,
+    _metadata: &fs::Metadata,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn daemon_secrets_file_warnings(module: &DaemonServerModule) -> Vec<String> {
+    let Some(path) = &module.secrets_file else {
+        return Vec::new();
+    };
+    match rsync_winfs::password_file_has_broad_access(path) {
+        Ok(true) => vec![format!(
+            "daemon module `{}` secrets file permissions are broad; continuing with a Windows ACL warning",
+            module.name
+        )],
+        Ok(false) => Vec::new(),
+        Err(_) => vec![format!(
+            "daemon module `{}` secrets file permissions could not be inspected; continuing with a Windows ACL warning",
+            module.name
+        )],
+    }
+}
+
+#[cfg(not(windows))]
+fn daemon_secrets_file_warnings(_module: &DaemonServerModule) -> Vec<String> {
+    Vec::new()
+}
+
 fn log_daemon_message(cli: &Cli, message: &str) -> Result<()> {
     log_daemon_record(
         cli,
@@ -1189,16 +1455,83 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_module_keys() {
-        let err = parse_config(
-            "[public]\npath = C:/data\nauth users = alice\n",
+    fn parses_daemon_auth_and_safe_subset_keys() {
+        let config = parse_config(
+            "[private]\npath = C:/data\nauth users = alice, bob\nsecrets file = C:/secrets/rsyncd.secrets\nread only = no\nwrite only = yes\nlist = false\nuid = nobody\ngid = nogroup\n",
             Path::new("rsyncd.conf"),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err
-            .to_string()
-            .contains("unsupported daemon module config key"));
+        let module = &config.modules[0];
+        assert_eq!(module.auth_users, vec!["alice", "bob"]);
+        assert_eq!(
+            module.secrets_file.as_deref(),
+            Some(Path::new("C:/secrets/rsyncd.secrets"))
+        );
+        assert!(!module.read_only);
+        assert!(module.write_only);
+        assert!(!module.list);
+        assert_eq!(module.uid.as_deref(), Some("nobody"));
+        assert_eq!(module.gid.as_deref(), Some("nogroup"));
+    }
+
+    #[test]
+    fn daemon_auth_challenge_accepts_valid_user_and_rejects_bad_credentials() {
+        let temp =
+            std::env::temp_dir().join(format!("rsync-win-daemon-auth-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let module_root = temp.join("module");
+        fs::create_dir_all(&module_root).unwrap();
+        let secrets_file = temp.join("rsyncd.secrets");
+        fs::write(&secrets_file, "alice:secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&secrets_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let config = parse_config(
+            &format!(
+                "[private]\npath = {}\nauth users = alice\nsecrets file = {}\n",
+                module_root.display(),
+                secrets_file.display()
+            ),
+            Path::new("rsyncd.conf"),
+        )
+        .unwrap();
+        validate_config(&config).unwrap();
+
+        let challenge = daemon_auth_challenge("private", Some("127.0.0.1:8730"));
+        let response = rsync_protocol::daemon_auth_response(
+            "secret",
+            &challenge,
+            rsync_protocol::DaemonAuthChecksum::Md5,
+        );
+        authenticate_daemon_client(
+            &config.modules[0],
+            Some("127.0.0.1:8730".to_string()),
+            rsync_protocol::DaemonAuthChecksum::Md5,
+            &mut CursorStream::new(format!("alice {response}\n").into_bytes()),
+            Some(challenge.clone()),
+        )
+        .unwrap();
+
+        let bad_response = rsync_protocol::daemon_auth_response(
+            "wrong",
+            &challenge,
+            rsync_protocol::DaemonAuthChecksum::Md5,
+        );
+        let err = authenticate_daemon_client(
+            &config.modules[0],
+            Some("127.0.0.1:8730".to_string()),
+            rsync_protocol::DaemonAuthChecksum::Md5,
+            &mut CursorStream::new(format!("alice {bad_response}\n").into_bytes()),
+            Some(challenge),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("daemon authentication failed"));
+
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -1259,5 +1592,37 @@ mod tests {
             limiter.delay_after_write(512, start + std::time::Duration::from_millis(1000)),
             std::time::Duration::ZERO
         );
+    }
+
+    #[derive(Debug)]
+    struct CursorStream {
+        input: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl CursorStream {
+        fn new(input: Vec<u8>) -> Self {
+            Self {
+                input: std::io::Cursor::new(input),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for CursorStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for CursorStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

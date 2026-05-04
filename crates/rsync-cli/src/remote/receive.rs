@@ -452,8 +452,12 @@ fn write_received_file_from_path(
         sync_action_len(source_len)?,
         ctx,
     ));
+    let mut final_write_options = ctx.file_write_options.clone();
+    final_write_options.keep_partial = false;
+    final_write_options.partial_dir = None;
+    final_write_options.temp_dir = None;
     ctx.fs
-        .copy_file_with_options(source_path, target, &ctx.file_write_options)?;
+        .copy_file_with_options(source_path, target, &final_write_options)?;
     preserve_remote_mtime(ctx, entry, target)
 }
 
@@ -966,7 +970,7 @@ pub(crate) fn validate_remote_file_list_paths(entries: &[RsyncFileListEntry]) ->
 pub(crate) fn validate_remote_sender_claims(
     plan: &TransferPlan,
     entries: &[RsyncFileListEntry],
-    files_from: Option<&[PathBuf]>,
+    _files_from: Option<&[PathBuf]>,
 ) -> Result<()> {
     if plan.trust_sender {
         return Ok(());
@@ -991,12 +995,6 @@ pub(crate) fn validate_remote_sender_claims(
         {
             bail!(
                 "remote sender sent filtered path `{}`; use --trust-sender to accept remote file-list names",
-                entry.path.display()
-            );
-        }
-        if files_from.is_some_and(|files_from| !files_from_matches(&entry.path, files_from)) {
-            bail!(
-                "remote sender sent path `{}` outside --files-from selection; use --trust-sender to accept remote file-list names",
                 entry.path.display()
             );
         }

@@ -5,10 +5,11 @@ pub mod session;
 pub mod version;
 
 pub use daemon::{
-    authenticate_daemon_module, daemon_auth_response, exchange_daemon_greeting,
-    request_module_list, select_daemon_module, select_no_auth_daemon_module, write_daemon_args,
-    DaemonAuthChecksum, DaemonError, DaemonGreeting, DaemonModule, DaemonModuleList,
-    DaemonModuleSelection, DaemonOperand, DEFAULT_DAEMON_PORT,
+    authenticate_daemon_module, daemon_auth_response, daemon_auth_response_matches,
+    exchange_daemon_greeting, request_module_list, select_daemon_module,
+    select_no_auth_daemon_module, write_daemon_args, DaemonAuthChecksum, DaemonError,
+    DaemonGreeting, DaemonModule, DaemonModuleList, DaemonModuleSelection, DaemonOperand,
+    DEFAULT_DAEMON_PORT,
 };
 pub use flist::{
     check_rsync_file_list_budget, estimated_rsync_file_list_entry_alloc, read_file_list,
@@ -36,9 +37,9 @@ pub use session::{
     build_remote_shell_invocation_for_paths, build_remote_shell_protocol31_argv,
     build_remote_shell_protocol31_argv_for_paths,
     build_remote_shell_protocol31_invocation_for_paths, build_ssh_remote_command,
-    exchange_protocol31_setup, exchange_protocol31_setup_with_options,
-    exchange_remote_shell_handshake, exchange_remote_shell_mvp_handshake,
-    exchange_remote_shell_protocol31_handshake,
+    exchange_protocol31_sender_setup_with_options, exchange_protocol31_setup,
+    exchange_protocol31_setup_with_options, exchange_remote_shell_handshake,
+    exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake,
     exchange_remote_shell_protocol31_handshake_with_options, read_multiplexed_i32,
     read_multiplexed_long, rsync_plain_md4_checksum, rsync_plain_md4_checksum_reader,
     rsync_whole_file_checksum, rsync_whole_file_checksum_reader, validate_protocol_stream_prefix,

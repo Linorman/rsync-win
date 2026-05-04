@@ -906,7 +906,11 @@ pub fn build_remote_shell_protocol31_invocation_for_paths(
     if options.recursive {
         short_args.push('r');
     }
-    short_args.push_str("e.LsfxCIvu");
+    short_args.push_str("e.");
+    if options.incremental_recursion {
+        short_args.push('i');
+    }
+    short_args.push_str("LsfxCIvu");
 
     argv.push(short_args);
     argv.push(".".to_string());
@@ -1221,11 +1225,7 @@ pub fn exchange_protocol31_setup_with_options<T: Read + Write>(
         let checksum_list = read_vstring(transport, 1024)?;
         let checksum_list = String::from_utf8(checksum_list)
             .map_err(|_| RemoteSessionError::InvalidChecksumList)?;
-        let client_list = if options.checksum_choices.is_empty() {
-            RSYNC_PROTOCOL31_CHECKSUM_LIST.to_string()
-        } else {
-            normalized_name_list(&options.checksum_choices.join(",")).join(" ")
-        };
+        let client_list = protocol31_client_checksum_list(&options);
         let checksum_name = select_protocol31_checksum(&client_list, &checksum_list)
             .ok_or(RemoteSessionError::UnsupportedChecksumNegotiation)?;
         write_vstring(transport, checksum_name.as_bytes())?;
@@ -1244,6 +1244,54 @@ pub fn exchange_protocol31_setup_with_options<T: Read + Write>(
         compat_flags: Some(compat_flags),
         checksum_name,
     })
+}
+
+pub fn exchange_protocol31_sender_setup_with_options<T: Read + Write>(
+    transport: &mut T,
+    peer_protocol: u32,
+    options: Protocol31SetupOptions,
+) -> Result<RemoteShellHandshake, RemoteSessionError> {
+    let selected_protocol =
+        negotiate_protocol_version_with_local(peer_protocol, REMOTE_SHELL_MODERN_PROTOCOL)?;
+    if selected_protocol.value() != REMOTE_SHELL_MODERN_PROTOCOL {
+        return Err(RemoteSessionError::UnsupportedProtocol {
+            negotiated: selected_protocol.value(),
+            supported: REMOTE_SHELL_MODERN_PROTOCOL,
+        });
+    }
+
+    let compat_flags = read_varint(transport)?;
+    let checksum_name = if compat_flags & RSYNC_CF_VARINT_FLIST_FLAGS != 0 {
+        let client_list = protocol31_client_checksum_list(&options);
+        write_vstring(transport, client_list.as_bytes())?;
+        transport.flush()?;
+        let checksum_list = read_vstring(transport, 1024)?;
+        let checksum_list = String::from_utf8(checksum_list)
+            .map_err(|_| RemoteSessionError::InvalidChecksumList)?;
+        let checksum_name = select_protocol31_checksum(&client_list, &checksum_list)
+            .ok_or(RemoteSessionError::UnsupportedChecksumNegotiation)?;
+        Some(checksum_name)
+    } else {
+        None
+    };
+    let remote_checksum_seed = read_i32_le(transport)?;
+    let checksum_seed = options.checksum_seed.unwrap_or(remote_checksum_seed);
+
+    Ok(RemoteShellHandshake {
+        peer_protocol,
+        selected_protocol,
+        checksum_seed,
+        compat_flags: Some(compat_flags),
+        checksum_name,
+    })
+}
+
+fn protocol31_client_checksum_list(options: &Protocol31SetupOptions) -> String {
+    if options.checksum_choices.is_empty() {
+        RSYNC_PROTOCOL31_CHECKSUM_LIST.to_string()
+    } else {
+        normalized_name_list(&options.checksum_choices.join(",")).join(" ")
+    }
 }
 
 fn select_protocol31_checksum(client_list: &str, server_list: &str) -> Option<String> {
@@ -1848,6 +1896,7 @@ mod tests {
 
         assert!(!protocol27.contains(&"--no-inc-recursive".to_string()));
         assert!(!protocol31.contains(&"--no-inc-recursive".to_string()));
+        assert!(protocol31.iter().any(|arg| arg.contains("e.iLsfxCIvu")));
     }
 
     #[test]
@@ -1984,6 +2033,24 @@ mod tests {
         assert_eq!(handshake.checksum_name.as_deref(), Some("md5"));
         assert_eq!(handshake.checksum_seed, 77);
         assert_eq!(transport.written, [3, b'm', b'd', b'5']);
+    }
+
+    #[test]
+    fn protocol31_sender_setup_advertises_checksums_without_selected_echo() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&[0x81, 0xff]);
+        input.push(7);
+        input.extend_from_slice(b"md5 md4");
+        input.extend_from_slice(&123_i32.to_le_bytes());
+        let mut transport = TestTransport::with_input(input);
+
+        let handshake =
+            exchange_protocol31_sender_setup_with_options(&mut transport, 31, Default::default())
+                .unwrap();
+
+        assert_eq!(handshake.checksum_name.as_deref(), Some("md4"));
+        assert_eq!(handshake.checksum_seed, 123);
+        assert_eq!(transport.written, [3, b'm', b'd', b'4']);
     }
 
     #[test]

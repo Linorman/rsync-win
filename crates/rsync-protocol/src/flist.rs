@@ -726,6 +726,7 @@ impl Rsync31FileListWriter {
             if self.last_mtime == Some(entry.mtime_unix) {
                 flags |= XMIT31_SAME_TIME;
             }
+            flags |= XMIT31_MOD_NSEC;
             if !self.options.preserve_owner || self.last_uid == Some(uid) {
                 flags |= XMIT31_SAME_UID;
             } else if !self.options.numeric_ids && user_name.is_some() {
@@ -788,6 +789,9 @@ impl Rsync31FileListWriter {
                     ))
                 })?;
                 write_varlong(writer, mtime, 4)?;
+            }
+            if flags & XMIT31_MOD_NSEC != 0 {
+                write_varint(writer, 0)?;
             }
             if flags & XMIT31_SAME_MODE == 0 {
                 write_i32_le(writer, entry.mode as i32)?;
@@ -2068,6 +2072,50 @@ mod tests {
             read_rsync31_file_list_with_options(&mut bytes.as_slice(), 16, 256, true).unwrap(),
             entries
         );
+    }
+
+    #[test]
+    fn protocol31_writer_emits_nsec_for_repeated_mtime() {
+        let entries = vec![
+            RsyncFileListEntry {
+                path: PathBuf::from("."),
+                file_type: WireFileType::Directory,
+                len: 0,
+                mtime_unix: 1_700_000_000,
+                mode: RSYNC_DIRECTORY_MODE,
+                checksum: None,
+                hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
+            },
+            RsyncFileListEntry {
+                path: PathBuf::from("file.txt"),
+                file_type: WireFileType::File,
+                len: 5,
+                mtime_unix: 1_700_000_000,
+                mode: RSYNC_REGULAR_FILE_MODE,
+                checksum: None,
+                hardlink_group: None,
+                metadata: RsyncFileListMetadata::default(),
+            },
+        ];
+
+        let mut bytes = Vec::new();
+        write_rsync31_file_list(&mut bytes, &entries).unwrap();
+        let mut reader = bytes.as_slice();
+
+        let first_flags = read_varint(&mut reader).unwrap();
+        assert_eq!(first_flags & XMIT31_MOD_NSEC, XMIT31_MOD_NSEC);
+        let first_name_len = read_u8(&mut reader).unwrap() as usize;
+        let mut first_name = vec![0; first_name_len];
+        reader.read_exact(&mut first_name).unwrap();
+        read_varlong(&mut reader, 3).unwrap();
+        read_varlong(&mut reader, 4).unwrap();
+        read_varint(&mut reader).unwrap();
+        read_i32_le(&mut reader).unwrap();
+
+        let second_flags = read_varint(&mut reader).unwrap();
+        assert_eq!(second_flags & XMIT31_SAME_TIME, XMIT31_SAME_TIME);
+        assert_eq!(second_flags & XMIT31_MOD_NSEC, XMIT31_MOD_NSEC);
     }
 
     #[test]

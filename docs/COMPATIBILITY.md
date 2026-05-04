@@ -6,11 +6,11 @@ This matrix describes the current development build behavior. It is intentionall
 
 | Peer or mode | Current status | Notes |
 | --- | --- | --- |
-| Upstream rsync over SSH | Experimental ordinary-file push/pull | Protocol 31 path is preferred, with protocol 27 fallback logic retained for older interop work. Use `--plan` and small smoke tests before real data. |
+| Upstream rsync over SSH | Experimental ordinary-file push/pull with external fixture coverage | Protocol 31 path is preferred, with protocol 27 fallback logic retained for older interop work. The gated `rsync_compat` fixture compares rsync-win push and pull results against upstream manifests for `-a --no-o --no-g`, delete/exclude, `--files-from`, `--checksum`, `--partial-dir`, `--inplace`, `--append-verify`, zlibx compression, multiple sources, and names with spaces/Unicode. Use `--plan` and small smoke tests before real data. |
 | macOS/Homebrew rsync-compatible peers over SSH | Experimental ordinary-file push/pull | Expected to follow the upstream rsync path when protocol 31 is available. Older protocol behavior remains best-effort. |
 | macOS stock rsync 2.6.9 | Best-effort, not release-grade | Older protocol and option behavior is not a first-class target yet. |
 | openrsync | Best-effort, not release-grade | Option and wire behavior may diverge from upstream rsync; test before use. |
-| rsync daemon `host::module` / `rsync://` | Experimental client/server ordinary-file workflows | Module listing, no-auth and `--password-file` pull, daemon push to writable modules, local daemon-server module listing/pull/push, client connection controls, `RSYNC_PROXY`, `RSYNC_CONNECT_PROG`, daemon-server logging format, socket options, and `--bwlimit` are implemented for tested paths. Encrypted daemon transport, daemon server auth-users/secrets, and advanced `rsyncd.conf` keys are not implemented. |
+| rsync daemon `host::module` / `rsync://` | Experimental client/server ordinary-file workflows with auth fixture coverage | Module listing, no-auth and authenticated pull, daemon push to writable modules, local daemon-server module listing/pull/push, daemon-server `auth users`/`secrets file`, `read only`, `write only`, `list`, `uid`, and `gid` parsing, client connection controls, `RSYNC_PROXY`, `RSYNC_CONNECT_PROG`, daemon-server logging format, socket options, and `--bwlimit` are implemented for tested paths. Daemon auth is rsync challenge-response only, not transport encryption; advanced `rsyncd.conf` keys remain unsupported. |
 | Local Windows-to-Windows portable sync | Implemented for tested ordinary files/directories | Covers recursion, mtimes, deletion, filters, multiple sources, and update modes in the current portable test suite. |
 
 ## Metadata Modes
@@ -33,6 +33,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Remote token lengths | Remote pull rejects literal token streams that exceed or undershoot the advertised file-list length and removes temporary receive files on error. |
 | File-list size | Remote file-list readers enforce a 100,000 entry limit and 32 KiB path limit. Protocol 31 remote pull can receive upstream incremental file-list markers; remote push still uses `--no-inc-recursive`. |
 | Multiplexing | Data frames are streamed; remote error messages are surfaced; unsupported multiplex tags are rejected. |
+| SSH process lifecycle | Child stderr is drained for diagnostics, hung child processes can be terminated through the transport timeout path, and dropped child transports close stdin and kill still-running children. Remote-shell startup failures such as command-not-found and SSH auth errors map to rsync start-protocol exit code 5; unsupported protocol maps to 2; checksum/protocol-stream errors map to 12; timeout maps to 30. |
 | Compression | `-z/--compress` negotiates and applies zlib/zlibx token compression on the remote protocol 31 transfer path, including `--compress-choice`, `--compress-level`, and `--skip-compress`. Local Windows-to-Windows copies are not compressed, and `--compress-threads` is parsed/forwarded but does not add a parallel local compressor. |
 | Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow, then runs staged `--version`, `--help`, and a disposable local sync smoke test. |
 | Benchmarks | `cargo bench -p rsync-fs --bench local_sync` runs local sync scenarios for a 128-file tree, many small files, and one large ordinary file. |
@@ -43,8 +44,8 @@ The packaged option table is in [`docs/OPTION-STATUS.md`](OPTION-STATUS.md). It 
 
 ## Known Not Implemented
 
-- Daemon auth is not transport encryption; `--password-file` only answers the rsync daemon challenge-response prompt.
-- Daemon server `auth users`, `secrets file`, and advanced `rsyncd.conf` keys are not implemented.
+- Daemon auth is not transport encryption; `--password-file` only answers the rsync daemon challenge-response prompt, and daemon server secrets files are parsed without logging password material or full secrets paths.
+- Advanced daemon-server `rsyncd.conf` keys beyond `path`, `comment`, `auth users`, `secrets file`, `read only`, `write only`, `list`, `uid`, and `gid` are not implemented. `uid` and `gid` are parsed for compatibility diagnostics but process identity changes are not applied.
 - VSS snapshot reads are not implemented.
 - NTFS security descriptor restore, sparse range preservation, and arbitrary reparse restore are not implemented.
 - Alternate data stream payload copying is implemented only for named streams in explicit `ntfs-native` local Windows syncs.
@@ -68,9 +69,14 @@ cargo test -p rsync-cli --test rsync_compat --all-features -- --nocapture
 $env:RSYNC_WIN_DAEMON_URL = "rsync://host:873"
 $env:RSYNC_WIN_DAEMON_MODULE = "module"
 $env:RSYNC_WIN_DAEMON_PATH = "path/to/readable-fixture"
+$env:RSYNC_WIN_DAEMON_AUTH_MODULE = "auth-module"
+$env:RSYNC_WIN_DAEMON_AUTH_PATH = "path/to/auth-readable-fixture"
+$env:RSYNC_WIN_DAEMON_WRITABLE_MODULE = "writable-module"
+$env:RSYNC_WIN_DAEMON_USER = "user"
+$env:RSYNC_WIN_DAEMON_PASSWORD_FILE = "C:\path\to\daemon-password.txt"
 cargo test -p rsync-cli --test daemon --all-features -- --nocapture
 ```
 
 `RSYNC_WIN_SSH_TARGET` enables disposable remote-shell smoke tests against the configured SSH host. The tests create and remove `rsync-win-*` directories under `RSYNC_WIN_SSH_TMP_ROOT`, which defaults to `/tmp`; use a path reserved for test data. `RSYNC_WIN_MACOS_RSYNC_TARGET`, `RSYNC_WIN_OPENRSYNC_TARGET`, `RSYNC_WIN_CYGWIN_TARGET`, and `RSYNC_WIN_MSYS2_TARGET` enable optional peer version probes. `RSYNC_WIN_SSH_PROTOCOL27_TARGET` is optional and should only be set to a peer that explicitly exercises protocol 27 fallback behavior.
 
-`RSYNC_WIN_DAEMON_URL` enables daemon module listing smoke tests. Set `RSYNC_WIN_DAEMON_MODULE` and `RSYNC_WIN_DAEMON_PATH` only for a controlled no-auth readable fixture; the daemon test writes only to a local disposable destination.
+`RSYNC_WIN_DAEMON_URL` enables daemon module listing and connection-control smoke tests. Set `RSYNC_WIN_DAEMON_MODULE` and `RSYNC_WIN_DAEMON_PATH` for a controlled no-auth readable fixture. Set `RSYNC_WIN_DAEMON_AUTH_MODULE` and `RSYNC_WIN_DAEMON_AUTH_PATH` for an authenticated readable fixture; if omitted, auth tests fall back to `RSYNC_WIN_DAEMON_MODULE` and `RSYNC_WIN_DAEMON_PATH`. Set `RSYNC_WIN_DAEMON_USER` and `RSYNC_WIN_DAEMON_PASSWORD_FILE` to exercise authenticated pull and auth-failure paths. Set `RSYNC_WIN_DAEMON_WRITABLE_MODULE` only for a controlled writable fixture; the push test writes a small `rsync-win-auth-push-*` directory and attempts to clean its contents after the run.

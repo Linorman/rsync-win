@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{discover_tools, skip_external_test, FixtureTempDir};
 use rsync_cli::parse_and_render_result;
+use rsync_fs::{LocalFileSystem, PortableFileSystem};
 
 const SSH_TARGET_ENV: &str = "RSYNC_WIN_SSH_TARGET";
 const SSH_TMP_ROOT_ENV: &str = "RSYNC_WIN_SSH_TMP_ROOT";
@@ -236,6 +237,246 @@ fn upstream_rsync_over_ssh_copy_links_pulls_posix_symlink_referent() {
 }
 
 #[test]
+fn upstream_rsync_over_ssh_command_family_matrix_matches_upstream_manifests() {
+    let Some((target, ssh)) = ssh_fixture("upstream rsync SSH command-family matrix") else {
+        return;
+    };
+    let rsync_win = rsync_win_binary();
+    let temp = FixtureTempDir::new("rsync-win-compat-ssh-matrix").unwrap();
+    let remote = RemoteTempDir::new("ssh-matrix", &ssh, &target);
+    let remote_source = remote.join("source");
+    let remote_files_from = remote.join("files-from.txt");
+    let local_files_from = temp.path().join("files-from.txt");
+
+    run_remote_command(
+        &ssh,
+        &target,
+        &remote_fixture_source_command(&remote_source),
+    );
+    run_remote_command(
+        &ssh,
+        &target,
+        &format!(
+            "printf '%s\n%s\n' {} {} > {}",
+            shell_quote("keep.txt"),
+            shell_quote("dir/nested.txt"),
+            shell_quote(&remote_files_from)
+        ),
+    );
+    fs::write(&local_files_from, b"keep.txt\ndir/nested.txt\n").unwrap();
+
+    let files_from_arg = local_files_from.to_string_lossy().into_owned();
+    let cases = vec![
+        PullManifestCase {
+            name: "archive-no-owner-group",
+            win_options: strings(&["-a", "--no-o", "--no-g", "--whole-file"]),
+            upstream_options: strings(&["-a", "--no-o", "--no-g"]),
+            remote_sources: vec![format!("{remote_source}/")],
+            prepopulate: Vec::new(),
+        },
+        PullManifestCase {
+            name: "delete-exclude",
+            win_options: strings(&["-rt", "--delete", "--exclude=*.tmp", "--whole-file"]),
+            upstream_options: strings(&["-rt", "--delete", "--exclude=*.tmp"]),
+            remote_sources: vec![format!("{remote_source}/")],
+            prepopulate: vec![
+                ("stale.txt", "delete-me"),
+                ("drop.tmp", "receiver-protected"),
+            ],
+        },
+        PullManifestCase {
+            name: "files-from",
+            win_options: vec![
+                "-rt".to_string(),
+                "--files-from".to_string(),
+                files_from_arg,
+            ],
+            upstream_options: vec![
+                "-rt".to_string(),
+                format!("--files-from={remote_files_from}"),
+            ],
+            remote_sources: vec![format!("{remote_source}/")],
+            prepopulate: Vec::new(),
+        },
+        PullManifestCase {
+            name: "checksum",
+            win_options: strings(&["-rt", "--checksum", "--whole-file"]),
+            upstream_options: strings(&["-rt", "--checksum"]),
+            remote_sources: vec![format!("{remote_source}/")],
+            prepopulate: vec![("checksum.txt", "same-size-old")],
+        },
+        PullManifestCase {
+            name: "partial-dir",
+            win_options: strings(&["-rt", "--partial", "--partial-dir=.rsync-partial"]),
+            upstream_options: strings(&["-rt", "--partial", "--partial-dir=.rsync-partial"]),
+            remote_sources: vec![format!("{remote_source}/")],
+            prepopulate: Vec::new(),
+        },
+        PullManifestCase {
+            name: "inplace",
+            win_options: strings(&["-rt", "--inplace"]),
+            upstream_options: strings(&["-rt", "--inplace"]),
+            remote_sources: vec![format!("{remote_source}/")],
+            prepopulate: vec![("keep.txt", "old")],
+        },
+        PullManifestCase {
+            name: "append-verify",
+            win_options: strings(&["-rt", "--append-verify"]),
+            upstream_options: strings(&["-rt", "--append-verify"]),
+            remote_sources: vec![format!("{remote_source}/")],
+            prepopulate: vec![("append.txt", "prefix")],
+        },
+        PullManifestCase {
+            name: "compress-zlibx",
+            win_options: strings(&["-rt", "--compress", "--compress-choice=zlibx"]),
+            upstream_options: strings(&["-rt", "--compress", "--compress-choice=zlibx"]),
+            remote_sources: vec![format!("{remote_source}/")],
+            prepopulate: Vec::new(),
+        },
+        PullManifestCase {
+            name: "multiple-sources-spaces-unicode",
+            win_options: strings(&["-rt"]),
+            upstream_options: strings(&["-rt"]),
+            remote_sources: vec![
+                format!("{remote_source}/name with spaces.txt"),
+                format!("{remote_source}/unicode-\u{4e2d}.txt"),
+            ],
+            prepopulate: Vec::new(),
+        },
+    ];
+
+    for case in cases {
+        run_pull_manifest_case(&rsync_win, &target, &ssh, &remote, temp.path(), case);
+    }
+
+    let local_push_source = temp.path().join("push-source");
+    let remote_push_source = remote.join("push-source");
+    create_local_fixture_source(&local_push_source);
+    run_remote_command(
+        &ssh,
+        &target,
+        &remote_fixture_source_command(&remote_push_source),
+    );
+    let local_push_files_from = temp.path().join("push-files-from.txt");
+    let remote_push_files_from = remote.join("push-files-from.txt");
+    fs::write(&local_push_files_from, b"keep.txt\ndir/nested.txt\n").unwrap();
+    run_remote_command(
+        &ssh,
+        &target,
+        &format!(
+            "printf '%s\n%s\n' {} {} > {}",
+            shell_quote("keep.txt"),
+            shell_quote("dir/nested.txt"),
+            shell_quote(&remote_push_files_from)
+        ),
+    );
+
+    let local_source_arg = format!("{}/", local_push_source.to_string_lossy());
+    let remote_source_arg = format!("{remote_push_source}/");
+    let push_files_from_arg = local_push_files_from.to_string_lossy().into_owned();
+    let push_cases = vec![
+        PushManifestCase {
+            name: "push-archive-no-owner-group",
+            win_options: strings(&["-a", "--no-o", "--no-g", "--whole-file"]),
+            upstream_options: strings(&["-a", "--no-o", "--no-g"]),
+            win_sources: vec![local_source_arg.clone()],
+            upstream_sources: vec![remote_source_arg.clone()],
+            prepopulate: Vec::new(),
+        },
+        PushManifestCase {
+            name: "push-delete-exclude",
+            win_options: strings(&["-rt", "--delete", "--exclude=*.tmp", "--whole-file"]),
+            upstream_options: strings(&["-rt", "--delete", "--exclude=*.tmp"]),
+            win_sources: vec![local_source_arg.clone()],
+            upstream_sources: vec![remote_source_arg.clone()],
+            prepopulate: vec![
+                ("stale.txt", "delete-me"),
+                ("drop.tmp", "receiver-protected"),
+            ],
+        },
+        PushManifestCase {
+            name: "push-files-from",
+            win_options: vec![
+                "-rt".to_string(),
+                "--files-from".to_string(),
+                push_files_from_arg,
+            ],
+            upstream_options: vec![
+                "-rt".to_string(),
+                format!("--files-from={remote_push_files_from}"),
+            ],
+            win_sources: vec![local_source_arg.clone()],
+            upstream_sources: vec![remote_source_arg.clone()],
+            prepopulate: Vec::new(),
+        },
+        PushManifestCase {
+            name: "push-checksum",
+            win_options: strings(&["-rt", "--checksum", "--whole-file"]),
+            upstream_options: strings(&["-rt", "--checksum"]),
+            win_sources: vec![local_source_arg.clone()],
+            upstream_sources: vec![remote_source_arg.clone()],
+            prepopulate: vec![("checksum.txt", "same-size-old")],
+        },
+        PushManifestCase {
+            name: "push-partial-dir",
+            win_options: strings(&["-rt", "--partial", "--partial-dir=.rsync-partial"]),
+            upstream_options: strings(&["-rt", "--partial", "--partial-dir=.rsync-partial"]),
+            win_sources: vec![local_source_arg.clone()],
+            upstream_sources: vec![remote_source_arg.clone()],
+            prepopulate: Vec::new(),
+        },
+        PushManifestCase {
+            name: "push-inplace",
+            win_options: strings(&["-rt", "--inplace"]),
+            upstream_options: strings(&["-rt", "--inplace"]),
+            win_sources: vec![local_source_arg.clone()],
+            upstream_sources: vec![remote_source_arg.clone()],
+            prepopulate: vec![("keep.txt", "old")],
+        },
+        PushManifestCase {
+            name: "push-append-verify",
+            win_options: strings(&["-rt", "--append-verify"]),
+            upstream_options: strings(&["-rt", "--append-verify"]),
+            win_sources: vec![local_source_arg.clone()],
+            upstream_sources: vec![remote_source_arg.clone()],
+            prepopulate: vec![("append.txt", "prefix")],
+        },
+        PushManifestCase {
+            name: "push-compress-zlibx",
+            win_options: strings(&["-rt", "--compress", "--compress-choice=zlibx"]),
+            upstream_options: strings(&["-rt", "--compress", "--compress-choice=zlibx"]),
+            win_sources: vec![local_source_arg.clone()],
+            upstream_sources: vec![remote_source_arg.clone()],
+            prepopulate: Vec::new(),
+        },
+        PushManifestCase {
+            name: "push-multiple-sources-spaces-unicode",
+            win_options: strings(&["-rt"]),
+            upstream_options: strings(&["-rt"]),
+            win_sources: vec![
+                local_push_source
+                    .join("name with spaces.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+                local_push_source
+                    .join("unicode-\u{4e2d}.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            upstream_sources: vec![
+                format!("{remote_push_source}/name with spaces.txt"),
+                format!("{remote_push_source}/unicode-\u{4e2d}.txt"),
+            ],
+            prepopulate: Vec::new(),
+        },
+    ];
+
+    for case in push_cases {
+        run_push_manifest_case(&rsync_win, &target, &ssh, &remote, case);
+    }
+}
+
+#[test]
 fn update_predicates_match_upstream_rsync_fixture_where_available() {
     let Some((target, ssh)) = ssh_fixture("upstream rsync SSH update predicate comparison") else {
         return;
@@ -452,6 +693,332 @@ fn assert_command_success(name: &str, output: &std::process::Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+struct PullManifestCase {
+    name: &'static str,
+    win_options: Vec<String>,
+    upstream_options: Vec<String>,
+    remote_sources: Vec<String>,
+    prepopulate: Vec<(&'static str, &'static str)>,
+}
+
+struct PushManifestCase {
+    name: &'static str,
+    win_options: Vec<String>,
+    upstream_options: Vec<String>,
+    win_sources: Vec<String>,
+    upstream_sources: Vec<String>,
+    prepopulate: Vec<(&'static str, &'static str)>,
+}
+
+struct RemoteTempDir {
+    ssh: PathBuf,
+    target: String,
+    root: String,
+}
+
+impl RemoteTempDir {
+    fn new(label: &str, ssh: &Path, target: &str) -> Self {
+        let root = remote_temp_root(label);
+        let temp = Self {
+            ssh: ssh.to_path_buf(),
+            target: target.to_string(),
+            root,
+        };
+        run_remote_command(
+            &temp.ssh,
+            &temp.target,
+            &format!(
+                "rm -rf {}; mkdir -p {}",
+                shell_quote(&temp.root),
+                shell_quote(&temp.root)
+            ),
+        );
+        temp
+    }
+
+    fn join(&self, path: &str) -> String {
+        format!("{}/{}", self.root, path.trim_start_matches('/'))
+    }
+}
+
+impl Drop for RemoteTempDir {
+    fn drop(&mut self) {
+        let _ = remote_command_output(
+            &self.ssh,
+            &self.target,
+            &format!("rm -rf {}", shell_quote(&self.root)),
+        );
+    }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_string()).collect()
+}
+
+fn run_pull_manifest_case(
+    rsync_win: &Path,
+    target: &str,
+    ssh: &Path,
+    remote: &RemoteTempDir,
+    temp_root: &Path,
+    case: PullManifestCase,
+) {
+    let local_dest = temp_root.join(format!("pull-{}", case.name));
+    let upstream_dest = remote.join(&format!("upstream-{}", case.name));
+    fs::create_dir_all(&local_dest).unwrap();
+    run_remote_command(
+        ssh,
+        target,
+        &format!(
+            "rm -rf {}; mkdir -p {}",
+            shell_quote(&upstream_dest),
+            shell_quote(&upstream_dest)
+        ),
+    );
+    prepopulate_local_dest(&local_dest, &case.prepopulate);
+    if !case.prepopulate.is_empty() {
+        run_remote_command(
+            ssh,
+            target,
+            &remote_prepopulate_command(&upstream_dest, &case.prepopulate),
+        );
+    }
+
+    let mut upstream_args = case.upstream_options.clone();
+    upstream_args.extend(case.remote_sources.clone());
+    upstream_args.push(format!("{upstream_dest}/"));
+    run_remote_command(ssh, target, &shell_command_words("rsync", &upstream_args));
+
+    let mut command = Command::new(rsync_win);
+    command.args(&case.win_options);
+    for source in &case.remote_sources {
+        command.arg(format!("{target}:{source}"));
+    }
+    command.arg(&local_dest);
+    let output = command.output().unwrap();
+    assert_command_success(case.name, &output);
+
+    let local = local_tree_manifest(&local_dest);
+    let upstream = remote_tree_manifest(ssh, target, &upstream_dest);
+    assert_eq!(local, upstream, "{} manifest mismatch", case.name);
+}
+
+fn run_push_manifest_case(
+    rsync_win: &Path,
+    target: &str,
+    ssh: &Path,
+    remote: &RemoteTempDir,
+    case: PushManifestCase,
+) {
+    let win_dest = remote.join(&format!("win-{}", case.name));
+    let upstream_dest = remote.join(&format!("upstream-{}", case.name));
+    run_remote_command(
+        ssh,
+        target,
+        &format!(
+            "rm -rf {} {}; mkdir -p {} {}",
+            shell_quote(&win_dest),
+            shell_quote(&upstream_dest),
+            shell_quote(&win_dest),
+            shell_quote(&upstream_dest)
+        ),
+    );
+    if !case.prepopulate.is_empty() {
+        run_remote_command(
+            ssh,
+            target,
+            &remote_prepopulate_command(&win_dest, &case.prepopulate),
+        );
+        run_remote_command(
+            ssh,
+            target,
+            &remote_prepopulate_command(&upstream_dest, &case.prepopulate),
+        );
+    }
+
+    let mut upstream_args = case.upstream_options.clone();
+    upstream_args.extend(case.upstream_sources.clone());
+    upstream_args.push(format!("{upstream_dest}/"));
+    run_remote_command(ssh, target, &shell_command_words("rsync", &upstream_args));
+
+    let mut command = Command::new(rsync_win);
+    command.args(&case.win_options);
+    command.args(&case.win_sources);
+    command.arg(format!("{target}:{win_dest}/"));
+    let output = command.output().unwrap();
+    assert_command_success(case.name, &output);
+
+    let win_manifest = remote_tree_manifest(ssh, target, &win_dest);
+    let upstream_manifest = remote_tree_manifest(ssh, target, &upstream_dest);
+    assert_eq!(
+        win_manifest, upstream_manifest,
+        "{} manifest mismatch",
+        case.name
+    );
+}
+
+fn create_local_fixture_source(root: &Path) {
+    let mut fs_adapter = LocalFileSystem;
+    for (relative, content, mtime) in fixture_source_files() {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content.as_bytes()).unwrap();
+        fs_adapter
+            .set_mtime(&path, UNIX_EPOCH + std::time::Duration::from_secs(mtime))
+            .unwrap();
+    }
+}
+
+fn prepopulate_local_dest(root: &Path, files: &[(&str, &str)]) {
+    let mut fs_adapter = LocalFileSystem;
+    for (relative, content) in files {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content.as_bytes()).unwrap();
+        fs_adapter
+            .set_mtime(
+                &path,
+                UNIX_EPOCH + std::time::Duration::from_secs(PREPOPULATE_MTIME),
+            )
+            .unwrap();
+    }
+}
+
+const PREPOPULATE_MTIME: u64 = 1_699_999_000;
+
+fn remote_prepopulate_command(root: &str, files: &[(&str, &str)]) -> String {
+    let mut command = String::new();
+    for (relative, content) in files {
+        push_remote_file_command(&mut command, root, relative, content, PREPOPULATE_MTIME);
+    }
+    command
+}
+
+fn remote_fixture_source_command(root: &str) -> String {
+    let mut command = format!(
+        "rm -rf {}; mkdir -p {}",
+        shell_quote(root),
+        shell_quote(root)
+    );
+    for (relative, content, mtime) in fixture_source_files() {
+        push_remote_file_command(&mut command, root, relative, content, mtime);
+    }
+    command
+}
+
+fn fixture_source_files() -> [(&'static str, &'static str, u64); 8] {
+    [
+        ("keep.txt", "keep-v1", 1_700_000_001),
+        ("drop.tmp", "drop-source", 1_700_000_002),
+        ("dir/nested.txt", "nested-v1", 1_700_000_003),
+        ("checksum.txt", "checksum-new", 1_700_000_004),
+        ("partial.txt", "partial-v1", 1_700_000_005),
+        ("append.txt", "prefix-suffix", 1_700_000_006),
+        ("name with spaces.txt", "space-name", 1_700_000_007),
+        ("unicode-\u{4e2d}.txt", "unicode-name", 1_700_000_008),
+    ]
+}
+
+fn push_remote_file_command(
+    command: &mut String,
+    root: &str,
+    relative: &str,
+    content: &str,
+    mtime: u64,
+) {
+    let path = format!("{root}/{relative}");
+    let parent = Path::new(relative)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| format!("{root}/{}", parent.to_string_lossy().replace('\\', "/")))
+        .unwrap_or_else(|| root.to_string());
+    if !command.is_empty() {
+        command.push_str("; ");
+    }
+    command.push_str(&format!(
+        "mkdir -p {}; printf %s {} > {}; touch -m -d @{} {}",
+        shell_quote(&parent),
+        shell_quote(content),
+        shell_quote(&path),
+        mtime,
+        shell_quote(&path)
+    ));
+}
+
+fn shell_command_words(program: &str, args: &[String]) -> String {
+    let mut command = shell_quote(program);
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    command
+}
+
+fn local_tree_manifest(root: &Path) -> String {
+    let mut lines = Vec::new();
+    collect_local_manifest(root, root, &mut lines);
+    sorted_lines(lines)
+}
+
+fn collect_local_manifest(root: &Path, current: &Path, lines: &mut Vec<String>) {
+    let mut entries: Vec<_> = fs::read_dir(current)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let metadata = fs::metadata(&path).unwrap();
+        if metadata.is_dir() {
+            lines.push(format!("dir\t{relative}"));
+            collect_local_manifest(root, &path, lines);
+        } else if metadata.is_file() {
+            let mtime = metadata
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let content = fs::read_to_string(&path).unwrap();
+            lines.push(format!("file\t{relative}\t{mtime}\t{content}"));
+        }
+    }
+}
+
+fn remote_tree_manifest(ssh: &Path, target: &str, root: &str) -> String {
+    let output = remote_command_output(ssh, target, &remote_manifest_command(root));
+    assert_command_success("remote manifest", &output);
+    let lines = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    sorted_lines(lines)
+}
+
+fn sorted_lines(mut lines: Vec<String>) -> String {
+    lines.sort();
+    let mut output = lines.join("\n");
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output
+}
+
+fn remote_manifest_command(root: &str) -> String {
+    format!(
+        "ROOT={}; cd \"$ROOT\" && find . -mindepth 1 -print | LC_ALL=C sort | while IFS= read -r p; do rel=${{p#./}}; if test -d \"$p\"; then printf 'dir\\t%s\\n' \"$rel\"; elif test -f \"$p\"; then printf 'file\\t%s\\t%s\\t' \"$rel\" \"$(stat -c %Y \"$p\")\"; cat \"$p\"; printf '\\n'; fi; done",
+        shell_quote(root)
+    )
 }
 
 fn local_manifest(root: &Path, names: &[&str]) -> String {

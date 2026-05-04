@@ -115,7 +115,7 @@ fn inc_recursive_remote_plan_omits_no_inc_recursive() {
     ]);
 
     assert!(output.contains("incremental recursion: true"), "{output}");
-    assert!(output.contains("remote --server argv: rsync --server --sender -tre.LsfxCIvu"));
+    assert!(output.contains("remote --server argv: rsync --server --sender -tre.iLsfxCIvu"));
     assert!(!output.contains("W_UNIMPLEMENTED_OPTION"), "{output}");
     assert!(!output.contains("--no-inc-recursive"), "{output}");
 }
@@ -1856,6 +1856,43 @@ fn remote_pull_files_from_retains_needed_parent_dirs_only() {
 }
 
 #[test]
+fn remote_pull_files_from_accepts_full_sender_list_before_local_selection() {
+    let root = unique_temp_dir("rsync-cli-remote-pull-files-from-full-list");
+    let dest = root.join("dest");
+    let files_from = root.join("files-from.txt");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(&files_from, b"dir/keep.txt\n").unwrap();
+
+    let cli = options::parse_cli(vec![
+        "rsync-win".to_string(),
+        "--dry-run".to_string(),
+        "--files-from".to_string(),
+        files_from.to_string_lossy().into_owned(),
+        "host:/tmp/source/".to_string(),
+        dest.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let plan = TransferPlan::from_cli(&cli);
+    let entries = vec![
+        test_remote_entry(".", WireFileType::Directory),
+        test_remote_entry("dir", WireFileType::Directory),
+        test_remote_entry("dir/keep.txt", WireFileType::File),
+        test_remote_entry("dir/drop.txt", WireFileType::File),
+        test_remote_entry("other", WireFileType::Directory),
+        test_remote_entry("other/file.txt", WireFileType::File),
+    ];
+    let mut transport =
+        TestTransport::with_input(remote_pull_dry_run_input_with_entries(&entries, 1));
+
+    let output = execute_remote_pull(&cli, &plan, &mut transport).unwrap();
+
+    assert!(output.contains("rsync-win remote-shell pull"), "{output}");
+    assert!(!output.contains("dir/drop.txt"), "{output}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn daemon_operands_route_to_daemon_plan_without_remote_shell_argv() {
     let output = parse_and_render(["rsync-win", "--plan", "host::module/path", "dest"]);
 
@@ -2094,7 +2131,7 @@ fn daemon_push_uses_remote_receiver_path() {
     .unwrap();
     let plan = TransferPlan::from_cli(&cli);
     let mut input = b"@RSYNCD: 31.0\n@RSYNCD: OK\n".to_vec();
-    input.extend_from_slice(&remote_push_dry_run_input());
+    input.extend_from_slice(&daemon_push_dry_run_input());
     let mut transport = TestTransport::with_input(input);
 
     let output = execute_daemon_sync_with_transport(&cli, &plan, &mut transport).unwrap();
@@ -2105,10 +2142,30 @@ fn daemon_push_uses_remote_receiver_path() {
     assert!(transport
         .written
         .starts_with(b"@RSYNCD: 31.0 md5 md4\nmodule\n--server\0"));
+    assert!(
+        transport
+            .written
+            .windows(b"md4".len())
+            .filter(|window| *window == b"md4")
+            .count()
+            >= 2
+    );
     assert!(!transport
         .written
         .windows(b"--sender".len())
         .any(|window| window == b"--sender"));
+    assert!(transport
+        .written
+        .windows(b"--no-inc-recursive".len())
+        .any(|window| window == b"--no-inc-recursive"));
+    assert!(transport
+        .written
+        .windows(b"e.LsfxCIvu".len())
+        .any(|window| window == b"e.LsfxCIvu"));
+    assert!(!transport
+        .written
+        .windows(b"e.iLsfxCIvu".len())
+        .any(|window| window == b"e.iLsfxCIvu"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3373,22 +3430,32 @@ fn test_remote_block_signatures(
 
 fn remote_push_dry_run_input() -> Vec<u8> {
     let mut input = remote_handshake_input();
+    append_remote_push_dry_run_response(&mut input);
+    input
+}
+
+fn daemon_push_dry_run_input() -> Vec<u8> {
+    let mut input = daemon_protocol31_setup_input();
+    append_remote_push_dry_run_response(&mut input);
+    input
+}
+
+fn append_remote_push_dry_run_response(input: &mut Vec<u8>) {
     append_mux_payload(
-        &mut input,
+        input,
         &[
             1,
             (RSYNC_ITEM_IS_NEW | RSYNC_ITEM_LOCAL_CHANGE) as u8,
             ((RSYNC_ITEM_IS_NEW | RSYNC_ITEM_LOCAL_CHANGE) >> 8) as u8,
         ],
     );
-    append_mux_payload(&mut input, &[0]);
-    append_mux_payload(&mut input, &[0]);
-    append_mux_payload(&mut input, &[0]);
-    append_mux_payload(&mut input, &[0]);
-    append_mux_payload(&mut input, &[0]);
-    append_mux_payload(&mut input, &[0]);
-    append_mux_payload(&mut input, &[0]);
-    input
+    append_mux_payload(input, &[0]);
+    append_mux_payload(input, &[0]);
+    append_mux_payload(input, &[0]);
+    append_mux_payload(input, &[0]);
+    append_mux_payload(input, &[0]);
+    append_mux_payload(input, &[0]);
+    append_mux_payload(input, &[0]);
 }
 
 fn remote_push_transfer_request_input(index: i32) -> Vec<u8> {

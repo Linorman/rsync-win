@@ -36,6 +36,23 @@ pub fn exit_code_from_error(err: &anyhow::Error) -> i32 {
     if lower.contains("timed out") || lower.contains("timeout") {
         return EXIT_TIMEOUT;
     }
+    if lower.contains("remote-shell")
+        && (lower.contains("permission denied")
+            || lower.contains("publickey")
+            || lower.contains("authentication failed")
+            || lower.contains("auth failure")
+            || lower.contains("command not found")
+            || lower.contains("not recognized as")
+            || lower.contains("no such file or directory"))
+    {
+        return EXIT_START_PROTOCOL;
+    }
+    if lower.contains("unsupported protocol")
+        || lower.contains("protocol incompat")
+        || lower.contains("protocol version mismatch")
+    {
+        return EXIT_PROTOCOL;
+    }
     if lower.contains("source") && lower.contains("vanished") {
         return EXIT_VANISHED;
     }
@@ -851,6 +868,12 @@ mod tests {
     #[test]
     fn exit_code_protocol() {
         let err = anyhow::anyhow!("protocol version mismatch");
+        assert_eq!(exit_code_from_error(&err), EXIT_PROTOCOL);
+    }
+
+    #[test]
+    fn exit_code_protocol_stream() {
+        let err = anyhow::anyhow!("protocol stream ended during checksum read");
         assert_eq!(exit_code_from_error(&err), EXIT_PROTOCOL_STREAM);
     }
 

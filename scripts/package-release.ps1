@@ -118,12 +118,56 @@ if (-not (Test-Path -LiteralPath $smokeFile -PathType Leaf)) {
 if ((Get-Content -Raw $smokeFile) -ne "package smoke") {
     throw "Packaged rsync-win.exe local sync smoke copied unexpected file contents."
 }
+
+$daemonUrl = $env:RSYNC_WIN_DAEMON_URL
+if (-not [string]::IsNullOrWhiteSpace($daemonUrl)) {
+    $daemonBase = $daemonUrl.TrimEnd("/")
+    $daemonListOutput = & $packagedBinary --list-only "$daemonBase/" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Packaged rsync-win.exe daemon module list smoke failed with exit code $LASTEXITCODE`: $($daemonListOutput -join "`n")"
+    }
+    if (($daemonListOutput -join "`n") -notmatch "rsync-win daemon module list") {
+        throw "Packaged rsync-win.exe daemon module list smoke returned unexpected output: $($daemonListOutput -join "`n")"
+    }
+
+    $daemonModule = $env:RSYNC_WIN_DAEMON_MODULE
+    $daemonPath = $env:RSYNC_WIN_DAEMON_PATH
+    if (-not [string]::IsNullOrWhiteSpace($daemonModule) -and -not [string]::IsNullOrWhiteSpace($daemonPath)) {
+        $daemonDest = Join-Path $smokeRoot "daemon-pull"
+        $daemonSource = "$daemonBase/$($daemonModule.Trim('/'))/$($daemonPath.TrimStart('/'))"
+        $daemonPullOutput = & $packagedBinary -r --whole-file $daemonSource $daemonDest 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Packaged rsync-win.exe daemon pull smoke failed with exit code $LASTEXITCODE`: $($daemonPullOutput -join "`n")"
+        }
+    }
+
+    $daemonUser = $env:RSYNC_WIN_DAEMON_USER
+    $daemonPasswordFile = $env:RSYNC_WIN_DAEMON_PASSWORD_FILE
+    $daemonAuthModule = if ([string]::IsNullOrWhiteSpace($env:RSYNC_WIN_DAEMON_AUTH_MODULE)) { $daemonModule } else { $env:RSYNC_WIN_DAEMON_AUTH_MODULE }
+    $daemonAuthPath = if ([string]::IsNullOrWhiteSpace($env:RSYNC_WIN_DAEMON_AUTH_PATH)) { $daemonPath } else { $env:RSYNC_WIN_DAEMON_AUTH_PATH }
+    if (-not [string]::IsNullOrWhiteSpace($daemonAuthModule) -and
+        -not [string]::IsNullOrWhiteSpace($daemonAuthPath) -and
+        -not [string]::IsNullOrWhiteSpace($daemonUser) -and
+        -not [string]::IsNullOrWhiteSpace($daemonPasswordFile)) {
+        $authBase = if ($daemonBase.StartsWith("rsync://")) {
+            "rsync://$daemonUser@$($daemonBase.Substring("rsync://".Length))"
+        } else {
+            "$daemonUser@$daemonBase"
+        }
+        $authDest = Join-Path $smokeRoot "daemon-auth-pull"
+        $authSource = "$authBase/$($daemonAuthModule.Trim('/'))/$($daemonAuthPath.TrimStart('/'))"
+        $daemonAuthOutput = & $packagedBinary -r --whole-file --password-file $daemonPasswordFile $authSource $authDest 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Packaged rsync-win.exe daemon auth pull smoke failed with exit code $LASTEXITCODE`: $($daemonAuthOutput -join "`n")"
+        }
+    }
+}
 Remove-Item -LiteralPath $smokeRoot -Recurse -Force
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [System.IO.Compression.ZipFile]::OpenRead($assetPath)
 try {
-    $zipEntries = @($zip.Entries | ForEach-Object { $_.FullName })
+    $zipEntries = @($zip.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
 } finally {
     $zip.Dispose()
 }
@@ -145,4 +189,4 @@ if ($checksumText -notmatch $checksumPattern) {
 
 Write-Output "Created $assetPath"
 Write-Output "Created $checksumPath"
-Write-Output "Verified package contents, rsync-win.exe --version, --help, and local sync smoke"
+Write-Output "Verified package contents, rsync-win.exe --version, --help, local sync smoke, and optional daemon smoke"

@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use rsync_fs::UpdateMode;
 use rsync_protocol::{
     exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake_with_options,
-    write_i32_le, write_rsync_i32, MultiplexReadState, MultiplexedWriter, Rsync27FileListWriter,
-    Rsync31FileListWriter,
+    write_i32_le, write_rsync_i32, MultiplexReadState, MultiplexedWriter, RemoteShellHandshake,
+    Rsync27FileListWriter, Rsync31FileListWriter,
 };
 
 use crate::cli::Cli;
@@ -131,6 +131,20 @@ pub(crate) fn execute_remote_push_protocol31<T: Read + Write>(
     plan: &TransferPlan,
     transport: &mut T,
 ) -> Result<String> {
+    let handshake = exchange_remote_shell_protocol31_handshake_with_options(
+        transport,
+        protocol31_setup_options_from_plan(plan),
+    )
+    .map_err(protocol31_setup_error)?;
+    execute_remote_push_protocol31_with_handshake(cli, plan, transport, handshake)
+}
+
+pub(crate) fn execute_remote_push_protocol31_with_handshake<T: Read + Write>(
+    cli: &Cli,
+    plan: &TransferPlan,
+    transport: &mut T,
+    handshake: RemoteShellHandshake,
+) -> Result<String> {
     let progress = ProgressLog::from_cli(cli);
     let mut client_log = output::TransferLog::from_cli(cli)?;
     let sources = local_source_paths(cli);
@@ -138,11 +152,6 @@ pub(crate) fn execute_remote_push_protocol31<T: Read + Write>(
     let files_from = load_files_from(cli)?;
     progress.info("building upload file list");
     let collect_options = local_source_collect_options(plan, files_from.as_deref());
-    let handshake = exchange_remote_shell_protocol31_handshake_with_options(
-        transport,
-        protocol31_setup_options_from_plan(plan),
-    )
-    .map_err(protocol31_setup_error)?;
     progress.detail(format!(
         "protocol: rsync {}",
         handshake.selected_protocol.value()
@@ -153,7 +162,7 @@ pub(crate) fn execute_remote_push_protocol31<T: Read + Write>(
         writer.flush().map_err(protocol31_setup_error)?;
     }
     let (mut entries, batch_count) = {
-        let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
+        let mut file_list_bytes = Vec::new();
         let mut file_list_writer = Rsync31FileListWriter::new(rsync31_file_list_options_from_plan(
             plan,
             plan.update_mode == UpdateMode::Checksum,
@@ -167,14 +176,18 @@ pub(crate) fn execute_remote_push_protocol31<T: Read + Write>(
                 plan.max_alloc,
                 |batch| {
                     file_list_writer
-                        .write_batch(&mut writer, &batch.entries)
+                        .write_batch(&mut file_list_bytes, &batch.entries)
                         .map_err(protocol31_setup_error)?;
                     Ok(())
                 },
             )
             .context("local upload file-list batch exceeds allocation budget")?;
         file_list_writer
-            .finish(&mut writer)
+            .finish(&mut file_list_bytes)
+            .map_err(protocol31_setup_error)?;
+        let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
+        writer
+            .write_all(&file_list_bytes)
             .map_err(protocol31_setup_error)?;
         writer.flush().map_err(protocol31_setup_error)?;
         (collected_entries, collected_batch_count)

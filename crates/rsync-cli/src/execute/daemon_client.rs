@@ -9,9 +9,9 @@ use anyhow::{bail, Context, Result};
 use rsync_protocol::{
     authenticate_daemon_module, build_remote_shell_argv_for_paths,
     build_remote_shell_protocol31_argv_for_paths, exchange_daemon_greeting,
-    exchange_protocol31_setup_with_options, request_module_list, select_daemon_module,
-    write_daemon_args, DaemonModuleSelection, DaemonOperand, TransferDirection,
-    REMOTE_SHELL_MODERN_PROTOCOL,
+    exchange_protocol31_sender_setup_with_options, exchange_protocol31_setup_with_options,
+    request_module_list, select_daemon_module, write_daemon_args, DaemonModuleSelection,
+    DaemonOperand, TransferDirection, REMOTE_SHELL_MODERN_PROTOCOL,
 };
 use rsync_transport::process::ChildTransport;
 use rsync_transport::tcp::{TcpAddressFamily, TcpConnectOptions, TcpSocketOptions, TcpTransport};
@@ -23,7 +23,9 @@ use crate::plan::*;
 use crate::remote::pull::{
     execute_remote_pull_protocol27, execute_remote_pull_protocol31_with_handshake,
 };
-use crate::remote::push::{execute_remote_push_protocol27, execute_remote_push_protocol31};
+use crate::remote::push::{
+    execute_remote_push_protocol27, execute_remote_push_protocol31_with_handshake,
+};
 use crate::ProgressLog;
 
 pub(crate) fn execute_daemon_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
@@ -262,7 +264,13 @@ pub(crate) fn execute_daemon_sync_with_transport<T: Read + Write>(
 
     if direction == TransferDirection::Push {
         return if daemon_wire_protocol == RemoteWireProtocol::Modern31 {
-            execute_remote_push_protocol31(cli, plan, transport)
+            let handshake = exchange_protocol31_sender_setup_with_options(
+                transport,
+                greeting.peer_protocol,
+                protocol31_setup_options_from_plan(plan),
+            )
+            .context("daemon protocol 31 setup failed")?;
+            execute_remote_push_protocol31_with_handshake(cli, plan, transport, handshake)
         } else {
             execute_remote_push_protocol27(cli, plan, transport)
         };
