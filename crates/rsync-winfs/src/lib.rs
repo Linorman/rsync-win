@@ -13,9 +13,10 @@ pub use links::{
     LinkCapabilities, ReparsePointKind,
 };
 pub use metadata::{
-    capture_ntfs_native_sidecar, read_windows_metadata, restore_safe_windows_attributes,
-    WindowsAttributeRestore, WindowsMetadata, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN,
-    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM, SAFE_RESTORE_ATTRIBUTE_MASK,
+    capture_ntfs_native_sidecar, read_windows_metadata, restore_creation_time,
+    restore_safe_windows_attributes, WindowsAttributeRestore, WindowsMetadata,
+    FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+    SAFE_RESTORE_ATTRIBUTE_MASK,
 };
 pub use path::{
     preflight_destination_paths, to_long_path_safe, validate_portable_component,
@@ -34,4 +35,4 @@ pub use streams::{
     copy_alternate_data_streams, enumerate_alternate_data_streams, AlternateDataStream,
     AlternateDataStreamCopyReport,
 };
-pub use vss::{vss_snapshot_status, VssSnapshotStatus};
+pub use vss::{vss_snapshot_status, VssSnapshot, VssSnapshotStatus};

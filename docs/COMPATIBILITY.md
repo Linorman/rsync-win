@@ -19,8 +19,26 @@ This matrix describes the current development build behavior. It is intentionall
 | --- | --- | --- |
 | `portable` | Default | Copies ordinary files/directories, compares size, applies mtime where requested, and applies explicit delete/filter behavior in tested paths. |
 | `posix` | Sidecar/reporting path with remote metadata mapping | POSIX permissions/executability requests are represented. `--chmod` accepts rsync-style symbolic and numeric forms for remote upload mode bits. `--executability` infers peer execute bits from Windows script/executable extensions; it does not enforce NTFS execute permissions. Owner/group mapping, protocol 31 ACL/xattr/time payload framing, fake-super sidecar manifests, and `--omit-dir-times` are implemented in tested paths. Native Windows restoration of POSIX owner/group/ACL/xattr semantics remains sidecar/reporting-only unless a remote POSIX peer applies them. |
-| `ntfs-native` | Narrow local restore path | Writes a parseable sidecar with security descriptor summary, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Local Windows syncs restore the tested readonly/hidden/archive/system attribute subset and copy named alternate data stream payloads. Security descriptor restore, sparse range preservation, arbitrary reparse restore, and cross-platform NTFS restore are degraded. |
-| VSS snapshot mode | Rejected with diagnostics | `--vss` is parsed and reported, but snapshot reads are not implemented. See `docs/VSS-DESIGN.md` for the required source abstraction before any VSS calls are added. |
+| `ntfs-native` | Narrow local restore path | Writes a parseable sidecar with security descriptor summary, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Local Windows syncs restore creation time, the tested readonly/hidden/archive/system attribute subset, and named alternate data stream payloads. Security descriptor restore, sparse range preservation, arbitrary reparse restore, and cross-platform NTFS restore are degraded. |
+| VSS snapshot mode | Explicit local source snapshot path | `--vss` is accepted only with `--metadata-policy=ntfs-native` for local Windows syncs. The executor creates a runtime VSS snapshot per source root, reads file data from the snapshot path, and deletes the shadow copy when the transfer finishes. Snapshot creation failures stop before mutation with a diagnostic. |
+
+## Metadata Class Contract
+
+| Metadata class | `portable` | `posix` | `ntfs-native` |
+| --- | --- | --- | --- |
+| POSIX mode bits | Reports unsupported archive/perms requests; ordinary file data still copies. | Stores or maps mode intent in fake-super sidecars and tested remote POSIX upload metadata. | Reports POSIX mode requests as non-native; NTFS attributes are the native path. |
+| owner/group | Reports unsupported local owner/group preservation. | Stores mapping intent in fake-super sidecars or remote POSIX metadata; local Windows ownership is not changed. | Captures identity/security summaries, but owner/group restore is degraded. |
+| ACLs | Reports unsupported ACL preservation. | Stores ACL intent in fake-super sidecars and protocol metadata where supported by remote peers. | Captures security descriptor summaries; descriptor restore remains degraded. |
+| xattrs | Reports unsupported xattr preservation. | Stores xattr intent in fake-super sidecars and protocol metadata where supported by remote peers. | ADS is handled separately; POSIX xattr restore is degraded. |
+| symlinks | Skips, copies referents, preserves, safe-links, or munges according to explicit link options. | Same link execution path, plus POSIX mode reporting. | Safe symlink preservation uses the portable link path when capability is present; unsafe reparse behavior is rejected. |
+| hardlinks | Applies tested hardlink preservation when `--hard-links` is explicit and the filesystem supports hard links. | Same hardlink execution path, plus POSIX metadata reporting. | Uses Windows file identity to group hardlinks and applies tested hardlink preservation when `--hard-links` is explicit. |
+| mtimes/atimes/crtimes | Applies mtimes for `-t`; atimes/crtimes are reported unsupported. | Stores atime/crtime intent in fake-super sidecars; mtimes apply through the portable path. | Applies mtimes and creation times in local Windows syncs; atime restore remains degraded. |
+| Windows attributes | Ignored except readonly affects the portable permission view. | Reported through sidecars only. | Restores readonly/hidden/archive/system and reports unsupported bits as degraded. |
+| ADS | Ignored. | Not treated as POSIX xattrs. | Copies named ADS payloads for files in explicit local `ntfs-native` syncs and records stream summaries in sidecars. |
+| security descriptors | Ignored. | Stored as reporting records only when POSIX sidecar options request ACL-like data. | Captures descriptor length/hash summaries; restore is degraded unless a future elevated restore path is added. |
+| sparse ranges | Sparse creation is requested by `--sparse` where supported, but range fidelity is not guaranteed. | Same as portable. | Detects sparse files and can mark sparse output with `--sparse`; exact sparse range preservation is degraded. |
+| reparse points | Non-symlink reparse points are not traversed by default. | Same as portable. | Symlink reparse points follow explicit link options; arbitrary reparse point restore is rejected. |
+| VSS | Rejected unless `ntfs-native` is explicit. | Rejected unless `ntfs-native` is explicit. | `--vss` creates explicit runtime source snapshots for local Windows reads and fails before mutation if VSS is unavailable. |
 
 ## Hardening Status
 
@@ -36,7 +54,24 @@ This matrix describes the current development build behavior. It is intentionall
 | SSH process lifecycle | Child stderr is drained for diagnostics, hung child processes can be terminated through the transport timeout path, and dropped child transports close stdin and kill still-running children. Remote-shell startup failures such as command-not-found and SSH auth errors map to rsync start-protocol exit code 5; unsupported protocol maps to 2; checksum/protocol-stream errors map to 12; timeout maps to 30. |
 | Compression | `-z/--compress` negotiates and applies zlib/zlibx token compression on the remote protocol 31 transfer path, including `--compress-choice`, `--compress-level`, and `--skip-compress`. Local Windows-to-Windows copies are not compressed, and `--compress-threads` is parsed/forwarded but does not add a parallel local compressor. |
 | Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow, then runs staged `--version`, `--help`, and a disposable local sync smoke test. |
-| Benchmarks | `cargo bench -p rsync-fs --bench local_sync` runs local sync scenarios for a 128-file tree, many small files, and one large ordinary file. |
+| Benchmarks | `cargo bench -p rsync-fs --bench local_sync` covers 10,000 small files, 100,000 empty files, a 1 GiB ordinary file, small edits in a large file, many filter rules, and delete-heavy receivers. `cargo bench -p rsync-cli --bench remote_protocol` covers file-list and token protocol workloads. |
+
+## Benchmark Baseline
+
+Measured on 2026-05-05 with `RSYNC_WIN_BENCH_ITERS=1` on the current Windows workspace. These are development-machine numbers, not release promises.
+
+| Benchmark | Scenario | Elapsed |
+| --- | --- | --- |
+| `local_sync` | 10,000 small files, 5.12 MB copied | 15.201 s |
+| `local_sync` | 100,000 empty files | 150.017 s |
+| `local_sync` | 1 GiB ordinary file | 0.540 s |
+| `local_sync` | small edits in 64 MiB large file | 0.061 s |
+| `local_sync` | 10,000 files with 1,024 filter rules | 24.674 s |
+| `local_sync` | delete-heavy receiver tree with 10,000 stale files | 5.248 s |
+| `remote_protocol` | protocol 31 file list for 10,000 small files | 0.006 s |
+| `remote_protocol` | protocol 31 file list for 100,000 empty files | 0.066 s |
+| `remote_protocol` | 1 GiB literal token stream to sink | 0.095 s |
+| `remote_protocol` | small-edit delta over 16 MiB buffer | 0.300 s |
 
 ## Option Status
 
@@ -46,7 +81,6 @@ The packaged option table is in [`docs/OPTION-STATUS.md`](OPTION-STATUS.md). It 
 
 - Daemon auth is not transport encryption; `--password-file` only answers the rsync daemon challenge-response prompt, and daemon server secrets files are parsed without logging password material or full secrets paths.
 - Advanced daemon-server `rsyncd.conf` keys beyond `path`, `comment`, `auth users`, `secrets file`, `read only`, `write only`, `list`, `uid`, and `gid` are not implemented. `uid` and `gid` are parsed for compatibility diagnostics but process identity changes are not applied.
-- VSS snapshot reads are not implemented.
 - NTFS security descriptor restore, sparse range preservation, and arbitrary reparse restore are not implemented.
 - Alternate data stream payload copying is implemented only for named streams in explicit `ntfs-native` local Windows syncs.
 - Full cross-mode memory-bounded incremental recursion is not implemented; remote-shell push remains sender-side non-incremental.
@@ -62,6 +96,7 @@ cargo test -p rsync-cli --test options --all-features
 cargo test -p rsync-cli --test security_remote_peer --all-features
 cargo test -p rsync-cli --test rsync_compat --all-features -- --nocapture
 cargo bench -p rsync-fs --bench local_sync
+cargo bench -p rsync-cli --bench remote_protocol
 rsync-win -rt --delete .\source .\dest
 $env:RSYNC_WIN_SSH_TARGET = "user@host"
 $env:RSYNC_WIN_SSH_TMP_ROOT = "/tmp"

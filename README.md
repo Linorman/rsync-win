@@ -21,12 +21,12 @@ This is an early development release. Version `v0.1.5` maps to Cargo package ver
 | Daemon mode | Experimental client/server support for module listing, no-auth and `--password-file` daemon pull, daemon push to writable modules, and local daemon-server module pull/push tests. Daemon client connection controls (`--address`, `--port`, `--sockopts`, `--contimeout`, `--no-motd`, `RSYNC_PROXY`, `RSYNC_CONNECT_PROG`) and daemon-server `--log-file`, `--log-file-format`, `--sockopts`, and `--bwlimit` are wired for tested paths. |
 | Logging | Default output is a concise summary with file counts, byte counts, and change totals; `-v` prints per-file transfer progress and `-vv` expands detailed actions. |
 | POSIX metadata | `--metadata-policy=portable\|posix\|ntfs-native`, `-p/-o/-g`, `--executability`, symbolic/numeric `--chmod`, `--acls`, `--xattrs`, `--fake-super`, `--atimes`, `--crtimes`, `--omit-dir-times`, and `--omit-link-times` are parsed and reported. `--executability`, `--chmod`, owner/group mapping, and protocol metadata payloads affect supported remote upload paths; local POSIX fidelity is represented through fake-super sidecar manifests or explicit degradation rather than native NTFS POSIX enforcement. |
-| Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request reporting are captured or reported through a parseable NTFS sidecar. Local Windows syncs restore the tested readonly/hidden/archive/system attribute subset and copy named ADS payloads when `--metadata-policy=ntfs-native` is explicit. |
-| Release hardening | Remote pull rejects path escapes and corrupt literal lengths, release packaging is scripted, and a small local-sync benchmark is available. |
+| Windows-native metadata | Long path, collision, link, metadata policy, security descriptor summary, ADS enumeration, sparse/reparse status, Windows attributes, and VSS request status are captured or reported through a parseable NTFS sidecar. Local Windows syncs restore creation time, the tested readonly/hidden/archive/system attribute subset, and named ADS payloads when `--metadata-policy=ntfs-native` is explicit. |
+| Release hardening | Remote pull rejects path escapes and corrupt literal lengths, release packaging is scripted, and local/protocol production workload benchmarks are available. |
 
 See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the current peer, metadata, hardening, and release compatibility matrix. The packaged option status table is maintained in [`docs/OPTION-STATUS.md`](docs/OPTION-STATUS.md).
 
-Known not implemented in this development build: daemon server `auth users`/`secrets file` handling, advanced `rsyncd.conf` keys beyond the safe module subset, encrypted daemon transport, VSS snapshot reads, NTFS security descriptor restore, sparse range preservation, arbitrary reparse restore, and sender-side remote push incremental recursion. Protocol 31 remote pull supports upstream incremental file-list markers, but cross-mode memory-bounded incremental recursion is not complete. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport.
+Known not implemented in this development build: advanced `rsyncd.conf` keys beyond the safe module subset, encrypted daemon transport, NTFS security descriptor restore, sparse range preservation, arbitrary reparse restore, and sender-side remote push incremental recursion. Protocol 31 remote pull supports upstream incremental file-list markers, but cross-mode memory-bounded incremental recursion is not complete. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport. VSS reads require explicit `--metadata-policy=ntfs-native --vss` and a Windows environment where VSS snapshot creation is permitted.
 
 ## Install
 
@@ -67,6 +67,7 @@ Run the local sync benchmark:
 
 ```powershell
 cargo bench -p rsync-fs --bench local_sync
+cargo bench -p rsync-cli --bench remote_protocol
 ```
 
 Build a release zip and SHA-256 checksum locally:
@@ -107,10 +108,10 @@ Preview POSIX metadata compatibility:
 rsync-win --plan --metadata-policy posix -p --executability --acls --xattrs --fake-super .\source .\dest
 ```
 
-Run NTFS-native sidecar mode and preview VSS diagnostics:
+Run NTFS-native sidecar mode and request VSS snapshot reads:
 
 ```powershell
-rsync-win --plan --metadata-policy ntfs-native --vss .\source .\dest
+rsync-win --metadata-policy ntfs-native --vss .\source .\dest
 ```
 
 Use filters:
@@ -169,6 +170,8 @@ The tests create disposable directories named `rsync-win-*` below `RSYNC_WIN_SSH
 
 Use `-v` for concise live progress. The command prints a compact final summary by default, for example file counts, byte counts, and a `changes:` line. Use `--dry-run` or `-vv` when you need the full action list, and `--stats` for structured counters.
 
+For scripts, prefer `--out-format`, `--log-file`, `--log-file-format`, and `--stats`. The `--out-format` and `--log-file-format` token expansion is the parseable contract for per-path records; `--stats` emits stable counter labels. The default summary, verbose/progress stderr messages, and diagnostic prose are human-facing and may change between development builds.
+
 ## Project Layout
 
 | Path | Purpose |
@@ -180,7 +183,7 @@ Use `-v` for concise live progress. The command prints a compact final summary b
 | `crates/rsync-fs` | Portable filesystem model and local sync engine. |
 | `crates/rsync-protocol` | Rsync protocol encoding, file list handling, checksums, and session primitives. |
 | `crates/rsync-transport` | SSH subprocess and TCP transport helpers. |
-| `crates/rsync-winfs` | Windows path, metadata, security descriptor summary, alternate stream enumeration, VSS status, and link behavior helpers. |
+| `crates/rsync-winfs` | Windows path, metadata, security descriptor summary, alternate stream enumeration/copy, VSS snapshot source mapping, and link behavior helpers. |
 | `tests/interop` | Tests that discover optional real `rsync` and `ssh` peers. |
 | `tests/security` | Remote peer and wire-format hardening regressions. |
 | `docs/COMPATIBILITY.md` | Current peer, metadata, hardening, and release compatibility matrix. |

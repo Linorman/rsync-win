@@ -307,7 +307,7 @@ fn render_transfer_plan_with(cli: &Cli, plan: &TransferPlan) -> String {
     ));
     if plan.metadata_policy == MetadataPolicy::NtfsNative || plan.vss {
         output.push_str(&format!(
-            "ntfs-native metadata: sidecar-capture prototype, vss={}\n",
+            "ntfs-native metadata: sidecar-capture restore path, vss={}\n",
             plan.vss
         ));
     }

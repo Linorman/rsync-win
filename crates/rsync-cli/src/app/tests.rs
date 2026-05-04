@@ -2258,7 +2258,7 @@ fn nonportable_metadata_policy_reports_loss_without_archive_mode() {
     assert!(output.contains("metadata policy: ntfs-native"));
     assert!(output.contains("[error] E_METADATA_LOSS"));
     assert!(output.contains("metadata-policy=ntfs-native requests NTFS security descriptor"));
-    assert!(output.contains("metadata-policy=ntfs-native requests creation time"));
+    assert!(!output.contains("metadata-policy=ntfs-native requests creation time"));
 }
 
 #[test]
@@ -2418,7 +2418,7 @@ fn numeric_ids_alone_is_reported_without_metadata_loss_error() {
 }
 
 #[test]
-fn ntfs_native_plan_reports_sidecar_and_vss_rejection() {
+fn ntfs_native_plan_reports_sidecar_and_vss_runtime_path() {
     let output = parse_and_render([
         "rsync-win",
         "--metadata-policy",
@@ -2430,10 +2430,74 @@ fn ntfs_native_plan_reports_sidecar_and_vss_rejection() {
     ]);
 
     assert!(output.contains("metadata policy: ntfs-native"));
-    assert!(output.contains("ntfs-native metadata: sidecar-capture prototype, vss=true"));
+    assert!(output.contains("ntfs-native metadata: sidecar-capture restore path, vss=true"));
     assert!(output.contains("security-descriptor metadata degraded"));
     assert!(output.contains("alternate-data-stream metadata degraded"));
-    assert!(output.contains("[error] E_METADATA_LOSS: vss-snapshot metadata rejected"));
+    assert!(!output.contains("vss-snapshot metadata rejected"));
+}
+
+#[test]
+fn local_execute_rejects_vss_without_ntfs_native_before_mutating() {
+    let root = unique_temp_dir("rsync-cli-vss-policy");
+    let source = root.join("source");
+    let dest = root.join("dest");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(source.join("file.txt"), b"payload").unwrap();
+
+    let err = parse_and_execute(vec![
+        "rsync-win".to_string(),
+        "-r".to_string(),
+        "--vss".to_string(),
+        source.to_string_lossy().into_owned(),
+        dest.to_string_lossy().into_owned(),
+    ])
+    .unwrap_err();
+
+    assert!(
+        format!("{err:#}").contains("--vss requires --metadata-policy=ntfs-native"),
+        "{err:#}"
+    );
+    assert!(!dest.join("file.txt").exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn local_ntfs_native_vss_sync_reads_snapshot_or_skips_cleanly() {
+    let root = unique_temp_dir("rsync-cli-vss-sync");
+    let source = root.join("source");
+    let dest = root.join("dest");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(source.join("file.txt"), b"snapshot payload").unwrap();
+
+    let result = parse_and_execute(vec![
+        "rsync-win".to_string(),
+        "-r".to_string(),
+        "--metadata-policy".to_string(),
+        "ntfs-native".to_string(),
+        "--vss".to_string(),
+        source.to_string_lossy().into_owned(),
+        dest.to_string_lossy().into_owned(),
+    ]);
+
+    match result {
+        Ok(output) => {
+            assert!(output.contains("vss snapshots: active 1"), "{output}");
+            assert_eq!(
+                fs::read(dest.join("file.txt")).unwrap(),
+                b"snapshot payload"
+            );
+        }
+        Err(err) if format!("{err:#}").contains("create VSS snapshot") => {
+            eprintln!("SKIP: VSS snapshot creation unavailable in this environment: {err:#}");
+        }
+        Err(err) => panic!("unexpected VSS execution error: {err:#}"),
+    }
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

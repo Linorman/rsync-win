@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::PathBuf;
 
 use rsync_cli::options::{
     daemon_option_specs, parse_options, project_option_specs, upstream_client_option_specs,
@@ -1324,6 +1325,41 @@ fn chunk13_registry_status_is_implemented() {
         assert_eq!(
             spec.support, support,
             "--{option} should have conservative execution support"
+        );
+    }
+}
+
+#[test]
+fn compatibility_doc_lists_metadata_contract_for_each_supported_class() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let compatibility = std::fs::read_to_string(manifest_dir.join("../../docs/COMPATIBILITY.md"))
+        .expect("read compatibility matrix");
+
+    for required in [
+        "POSIX mode bits",
+        "owner/group",
+        "ACLs",
+        "xattrs",
+        "symlinks",
+        "hardlinks",
+        "mtimes/atimes/crtimes",
+        "Windows attributes",
+        "ADS",
+        "security descriptors",
+        "sparse ranges",
+        "reparse points",
+        "VSS",
+    ] {
+        assert!(
+            compatibility.contains(required),
+            "metadata contract should mention {required}"
+        );
+    }
+
+    for mode in ["`portable`", "`posix`", "`ntfs-native`"] {
+        assert!(
+            compatibility.contains(mode),
+            "metadata contract should mention {mode}"
         );
     }
 }

@@ -7,8 +7,8 @@ use rsync_cli::output::{
 };
 use rsync_protocol::{
     read_rsync31_file_list, read_rsync_long, write_rsync31_file_list_with_options, FileListError,
-    MultiplexReadState, MultiplexedReader, RsyncFileListEntry, RsyncFileListMetadata, WireFileType,
-    RSYNC_REGULAR_FILE_MODE,
+    MultiplexReadState, MultiplexedReader, RsyncDeflatedTokenMode, RsyncDeflatedTokenReader,
+    RsyncFileListEntry, RsyncFileListMetadata, WireFileType, RSYNC_REGULAR_FILE_MODE,
 };
 use rsync_transport::process::ChildTransport;
 
@@ -61,6 +61,46 @@ fn protocol31_reader_rejects_excessive_path_lengths() {
     .unwrap_err();
 
     assert!(err.to_string().contains("exceeds limit 4"), "{err}");
+}
+
+#[test]
+fn protocol31_reader_rejects_oversized_entry_counts_before_entries() {
+    let err = read_rsync31_file_list(
+        &mut encoded_protocol31_path("dir/file.txt").as_slice(),
+        0,
+        256,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("file list entry count exceeds limit"),
+        "{err}"
+    );
+}
+
+#[test]
+fn protocol_varint_reader_rejects_malformed_overwide_values() {
+    let mut bytes = [0xff, 0xff, 0xff, 0xff, 0xff].as_slice();
+
+    let err = rsync_protocol::io::read_varint(&mut bytes).unwrap_err();
+
+    assert!(err.to_string().contains("exceeds u32 width"), "{err}");
+}
+
+#[test]
+fn compressed_token_reader_rejects_corrupt_literal_payloads() {
+    let stream = vec![0x40, 0x01, 0x06, 0x00];
+    let mut reader = RsyncDeflatedTokenReader::new(RsyncDeflatedTokenMode::Zlibx);
+
+    let err = reader.next_token(&mut stream.as_slice()).unwrap_err();
+
+    assert!(
+        err.to_string().contains("inflate")
+            || err.to_string().contains("deflate")
+            || err.to_string().contains("zlib"),
+        "{err}"
+    );
 }
 
 #[test]

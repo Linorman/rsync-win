@@ -123,6 +123,13 @@ pub fn restore_safe_windows_attributes(
     platform_restore_safe_windows_attributes(path, attributes)
 }
 
+pub fn restore_creation_time(
+    path: &Path,
+    creation_time: Option<SystemTime>,
+) -> std::io::Result<bool> {
+    platform_restore_creation_time(path, creation_time)
+}
+
 #[cfg(windows)]
 fn platform_creation_time(metadata: &fs::Metadata) -> Option<SystemTime> {
     use std::os::windows::fs::MetadataExt;
@@ -133,6 +140,68 @@ fn platform_creation_time(metadata: &fs::Metadata) -> Option<SystemTime> {
 #[cfg(not(windows))]
 fn platform_creation_time(_metadata: &fs::Metadata) -> Option<SystemTime> {
     None
+}
+
+#[cfg(windows)]
+fn platform_restore_creation_time(
+    path: &Path,
+    creation_time: Option<SystemTime>,
+) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, SetFileTime, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+    };
+
+    let Some(creation_time) = creation_time else {
+        return Ok(false);
+    };
+    let filetime = system_time_to_windows_filetime(creation_time)?;
+    let creation = FILETIME {
+        dwLowDateTime: filetime as u32,
+        dwHighDateTime: (filetime >> 32) as u32,
+    };
+    let path = crate::path::to_long_path_safe(path);
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ok = unsafe { SetFileTime(handle, &creation, null(), null()) };
+    let close_result = unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if close_result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn platform_restore_creation_time(
+    path: &Path,
+    _creation_time: Option<SystemTime>,
+) -> std::io::Result<bool> {
+    let _ = fs::metadata(path)?;
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -307,6 +376,20 @@ fn windows_filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_nanos(unix_100ns.saturating_mul(100)))
 }
 
+#[cfg(windows)]
+fn system_time_to_windows_filetime(time: SystemTime) -> std::io::Result<u64> {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+    let duration = time.duration_since(UNIX_EPOCH).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "creation time predates the Unix epoch",
+        )
+    })?;
+    Ok(WINDOWS_TO_UNIX_EPOCH_100NS
+        + duration.as_secs().saturating_mul(10_000_000)
+        + u64::from(duration.subsec_nanos() / 100))
+}
+
 #[cfg(not(windows))]
 #[allow(dead_code)]
 fn windows_filetime_to_system_time(_filetime: u64) -> Option<SystemTime> {
@@ -415,6 +498,22 @@ mod tests {
         assert_eq!(file_metadata.volume_serial, link_metadata.volume_serial);
         assert!(file_metadata.link_count.is_some_and(|count| count >= 2));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_creation_time_restore_applies_requested_time() {
+        let root = unique_temp_dir("rsync-winfs-creation-time");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file.txt");
+        fs::write(&file, b"abc").unwrap();
+        let requested = UNIX_EPOCH + Duration::from_secs(1_600_000_123);
+
+        assert!(restore_creation_time(&file, Some(requested)).unwrap());
+
+        let restored = read_windows_metadata(&file).unwrap().creation_time.unwrap();
+        assert_eq!(restored, requested);
         fs::remove_dir_all(root).unwrap();
     }
 

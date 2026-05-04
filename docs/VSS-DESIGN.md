@@ -1,13 +1,14 @@
 # VSS Snapshot Source Design Note
 
-`--vss` remains explicitly rejected until rsync-win has a real snapshot-backed source abstraction.
+`--vss` is an explicit local Windows source mode. It is accepted only with `--metadata-policy=ntfs-native` so snapshot reads are never enabled by default or implied by portable/POSIX compatibility options.
 
-The future implementation should introduce a source filesystem wrapper that:
+The implementation keeps VSS isolated from ordinary file IO:
 
-- Creates a VSS snapshot before walking source paths.
-- Maps each requested source path to its snapshot device path.
-- Keeps all file-list, checksum, and literal reads on the snapshot path.
-- Releases the snapshot only after transfer completion or failure cleanup.
-- Reports snapshot creation, path mapping, and teardown failures as metadata loss when requested.
+- The local executor validates `--metadata-policy=ntfs-native --vss` before mutation.
+- `rsync-winfs::VssSnapshot` creates a runtime shadow copy for each source root through Windows VSS/WMI.
+- Source operands are mapped to their snapshot device paths before the portable sync engine walks or reads them.
+- The original source paths are still used for user-facing summaries and NTFS sidecar capture.
+- Shadow copies are deleted by `Drop` after transfer completion or failure.
+- Snapshot creation and path mapping failures stop the transfer before receiver mutation.
 
-Do not add direct VSS calls to ordinary file read paths. The portable and ntfs-native source APIs should stay explicit about whether bytes came from the live filesystem or from a snapshot.
+This design keeps the portable filesystem abstraction free of direct VSS calls while making the byte source explicit at the local executor boundary.

@@ -10,8 +10,9 @@ use rsync_fs::{
 use rsync_protocol::WireFileType;
 use rsync_winfs::{
     capture_ntfs_native_sidecar, copy_alternate_data_streams,
-    parse_posix_fake_super_sidecar_manifest, read_windows_metadata,
+    parse_posix_fake_super_sidecar_manifest, read_windows_metadata, restore_creation_time,
     restore_safe_windows_attributes, PosixAclRecord, PosixFakeSuperSidecar, PosixXattrRecord,
+    VssSnapshot,
 };
 
 use crate::cli::Cli;
@@ -23,6 +24,7 @@ use crate::{batch, output, ProgressLog};
 
 pub(crate) fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     let sources = local_source_paths(cli);
+    let (effective_sources, vss_snapshots) = prepare_vss_sources(&sources, &plan)?;
     let dest = Path::new(cli.paths.last().expect("checked operand count"));
     let files_from = load_files_from(cli)?;
     let ntfs_files_from = files_from.clone();
@@ -36,7 +38,7 @@ pub(crate) fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String
     ));
     let sync_report = sync_sources(
         &mut fs,
-        &sources,
+        &effective_sources,
         dest,
         SyncOptions {
             recursive: plan.recursive,
@@ -115,9 +117,12 @@ pub(crate) fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String
     ));
     if plan.metadata_policy == MetadataPolicy::NtfsNative || plan.vss {
         output.push_str(&format!(
-            "ntfs-native metadata: sidecar-capture prototype, vss={}\n",
+            "ntfs-native metadata: sidecar-capture restore path, vss={}\n",
             plan.vss
         ));
+    }
+    if !vss_snapshots.is_empty() {
+        output.push_str(&format!("vss snapshots: active {}\n", vss_snapshots.len()));
     }
     if let Some(sidecars) = ntfs_sidecars {
         output.push_str(&format!(
@@ -127,6 +132,10 @@ pub(crate) fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String
         output.push_str(&format!(
             "ntfs attributes: applied {}, degraded {}\n",
             sidecars.attributes_applied, sidecars.attributes_degraded
+        ));
+        output.push_str(&format!(
+            "ntfs creation times: applied {}\n",
+            sidecars.creation_times_applied
         ));
         output.push_str(&format!(
             "ntfs streams: copied {}, degraded {}\n",
@@ -163,6 +172,7 @@ struct NtfsSidecarExecution {
     written: usize,
     attributes_applied: usize,
     attributes_degraded: usize,
+    creation_times_applied: usize,
     streams_copied: usize,
     streams_degraded: usize,
 }
@@ -321,6 +331,7 @@ fn handle_ntfs_native_sidecars(
             written: 0,
             attributes_applied: 0,
             attributes_degraded: 0,
+            creation_times_applied: 0,
             streams_copied: 0,
             streams_degraded: 0,
         }));
@@ -330,6 +341,7 @@ fn handle_ntfs_native_sidecars(
     let mut written = 0;
     let mut attributes_applied = 0;
     let mut attributes_degraded = 0;
+    let mut creation_times_applied = 0;
     let mut streams_copied = 0;
     let mut streams_degraded = 0;
     for source_path in &capture_paths {
@@ -337,6 +349,16 @@ fn handle_ntfs_native_sidecars(
             .with_context(|| format!("capture NTFS metadata for {}", source_path.display()))?;
         if let Some(target_path) = ntfs_destination_for_source(sources, dest, source_path) {
             if target_path.exists() {
+                if restore_creation_time(
+                    &target_path,
+                    sidecar
+                        .creation_time_unix_nanos
+                        .and_then(unix_nanos_to_system_time),
+                )
+                .with_context(|| format!("restore creation time for {}", target_path.display()))?
+                {
+                    creation_times_applied += 1;
+                }
                 if sidecar.file_type == FileType::File {
                     let report = copy_alternate_data_streams(source_path, &target_path)
                         .with_context(|| {
@@ -377,9 +399,49 @@ fn handle_ntfs_native_sidecars(
         written,
         attributes_applied,
         attributes_degraded,
+        creation_times_applied,
         streams_copied,
         streams_degraded,
     }))
+}
+
+fn prepare_vss_sources(
+    sources: &[PathBuf],
+    plan: &TransferPlan,
+) -> Result<(Vec<PathBuf>, Vec<VssSnapshot>)> {
+    if !plan.vss {
+        return Ok((sources.to_vec(), Vec::new()));
+    }
+    if plan.metadata_policy != MetadataPolicy::NtfsNative {
+        anyhow::bail!("--vss requires --metadata-policy=ntfs-native");
+    }
+    if plan.dry_run {
+        return Ok((sources.to_vec(), Vec::new()));
+    }
+
+    let mut snapshots = Vec::with_capacity(sources.len());
+    let mut mapped_sources = Vec::with_capacity(sources.len());
+    for source in sources {
+        let snapshot = VssSnapshot::create_for_source(source)
+            .with_context(|| format!("create VSS snapshot for {}", source.display()))?;
+        let mapped = snapshot
+            .map_source_path(source)
+            .with_context(|| format!("map VSS snapshot source {}", source.display()))?;
+        mapped_sources.push(mapped);
+        snapshots.push(snapshot);
+    }
+
+    Ok((mapped_sources, snapshots))
+}
+
+fn unix_nanos_to_system_time(nanos: i128) -> Option<std::time::SystemTime> {
+    if nanos < 0 {
+        return None;
+    }
+    let nanos = u128::try_from(nanos).ok()?;
+    let secs = u64::try_from(nanos / 1_000_000_000).ok()?;
+    let sub = u32::try_from(nanos % 1_000_000_000).ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, sub))
 }
 
 fn handle_posix_fake_super_sidecars(

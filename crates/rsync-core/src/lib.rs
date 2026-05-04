@@ -488,13 +488,7 @@ impl NtfsNativeMetadataRequest {
                 "metadata-policy=ntfs-native copies named alternate data stream payloads for local Windows syncs; default data streams remain ordinary file content and unsupported platforms report this as unavailable",
             ));
         }
-        if self.creation_time {
-            degradations.push(MetadataDegradation::new(
-                MetadataFeature::CreationTime,
-                MetadataAction::Ignored,
-                "metadata-policy=ntfs-native requests creation time preservation; the local executor does not apply creation times yet",
-            ));
-        }
+        let _ = self.creation_time;
         if self.windows_attributes {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::WindowsAttributes,
@@ -516,13 +510,7 @@ impl NtfsNativeMetadataRequest {
                 "metadata-policy=ntfs-native does not preserve arbitrary reparse points yet; unsafe reparse points remain blocked",
             ));
         }
-        if self.vss_snapshot {
-            degradations.push(MetadataDegradation::new(
-                MetadataFeature::VssSnapshot,
-                MetadataAction::Rejected,
-                "--vss requests snapshot source mode; VSS snapshot creation is not implemented in this build",
-            ));
-        }
+        let _ = self.vss_snapshot;
 
         degradations
     }
@@ -602,11 +590,6 @@ pub fn metadata_policy_degradations(policy: MetadataPolicy) -> Vec<MetadataDegra
                 MetadataFeature::AlternateDataStream,
                 MetadataAction::Degraded,
                 "metadata-policy=ntfs-native requests alternate data stream preservation; named ADS payload copy is available for local Windows syncs and unavailable elsewhere",
-            ),
-            MetadataDegradation::new(
-                MetadataFeature::CreationTime,
-                MetadataAction::Ignored,
-                "metadata-policy=ntfs-native requests creation time preservation; the local executor does not apply creation times yet",
             ),
             MetadataDegradation::new(
                 MetadataFeature::WindowsAttributes,
@@ -836,7 +819,7 @@ mod tests {
     fn ntfs_native_metadata_policy_reports_policy_capability_loss() {
         let degradations = metadata_policy_degradations(MetadataPolicy::NtfsNative);
 
-        assert!(degradations
+        assert!(!degradations
             .iter()
             .any(|degradation| degradation.feature == MetadataFeature::CreationTime));
         assert!(degradations
@@ -893,14 +876,13 @@ mod tests {
     }
 
     #[test]
-    fn ntfs_native_request_reports_vss_as_rejected() {
+    fn ntfs_native_request_does_not_report_vss_as_static_policy_loss() {
         let degradations = NtfsNativeMetadataRequest::all()
             .with_vss(true)
             .degradations();
 
-        assert!(degradations.iter().any(|degradation| {
-            degradation.feature == MetadataFeature::VssSnapshot
-                && degradation.action == MetadataAction::Rejected
-        }));
+        assert!(!degradations
+            .iter()
+            .any(|degradation| degradation.feature == MetadataFeature::VssSnapshot));
     }
 }
