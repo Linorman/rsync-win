@@ -22,6 +22,18 @@ This matrix describes the current development build behavior. It is intentionall
 | `ntfs-native` | Narrow local restore path | Writes a parseable sidecar with security descriptor SDDL/hash summaries, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Local Windows syncs restore creation time, the tested readonly/hidden/archive/system attribute subset, named alternate data stream payloads, security descriptors when `--super` is explicit and permissions allow it, and sparse allocated ranges when `--sparse` is explicit. Arbitrary non-symlink reparse restore and cross-platform NTFS restore are rejected or degraded. |
 | VSS snapshot mode | Explicit local source snapshot path | `--vss` is accepted only with `--metadata-policy=ntfs-native` for local Windows syncs. The executor creates a runtime VSS snapshot per source root, reads file data from the snapshot path, and deletes the shadow copy when the transfer finishes. Snapshot creation failures stop before mutation with a diagnostic. |
 
+## Release Candidate Support Matrix
+
+| Dimension | Frozen support for `v0.2.0-rc1` |
+| --- | --- |
+| Windows versions | Windows 10, Windows 11, and Windows Server with the MSVC Rust toolchain. |
+| Filesystems | NTFS is the primary target; ReFS and SMB shares are best-effort for ordinary-file workflows and should be smoke-tested before production use. |
+| Upstream rsync versions | upstream rsync 3.2.x over SSH is the release-grade interop target; protocol 27 fallback remains best-effort. |
+| Daemon modes | Module listing, no-auth pull, authenticated pull, writable-module push, connection controls, and local daemon-server fixtures are covered for ordinary files. |
+| Metadata modes | `portable`, `posix`, and `ntfs-native` are documented in the metadata contract below; unsupported classes degrade explicitly or require `--fail-on-metadata-loss`. |
+| Max tested file size | 1 GiB local benchmark, 3 MiB automated streaming stress, and optional external SSH tests limited to small disposable files by default. |
+| Max tested file count | 100,000 entries in stress tests and local benchmark coverage. |
+
 ## Metadata Class Contract
 
 | Metadata class | `portable` | `posix` | `ntfs-native` |
@@ -53,7 +65,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Multiplexing | Data frames are streamed; remote error messages are surfaced; unsupported multiplex tags are rejected. |
 | SSH process lifecycle | Child stderr is drained for diagnostics, hung child processes can be terminated through the transport timeout path, and dropped child transports close stdin and kill still-running children. Remote-shell startup failures such as command-not-found and SSH auth errors map to rsync start-protocol exit code 5; unsupported protocol maps to 2; checksum/protocol-stream errors map to 12; timeout maps to 30. |
 | Compression | `-z/--compress` negotiates and applies zlib/zlibx token compression on the remote protocol 31 transfer path, including `--compress-choice`, `--compress-level`, and `--skip-compress`. Local Windows-to-Windows copies are not compressed, and `--compress-threads` is parsed/forwarded but does not add a parallel local compressor. |
-| Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow, then runs staged `--version`, `--help`, and a disposable local sync smoke test. |
+| Release package | `scripts/package-release.ps1` builds the Windows zip layout and SHA-256 checksum used by the GitHub release workflow, then runs staged `--version`, `--help`, a disposable local sync smoke, local delete/filter smoke, and optional SSH smoke plus optional daemon smoke when fixture environment variables are set. |
 | Benchmarks | `cargo bench -p rsync-fs --bench local_sync` covers 10,000 small files, 100,000 empty files, a 1 GiB ordinary file, small edits in a large file, many filter rules, and delete-heavy receivers. `cargo bench -p rsync-cli --bench remote_protocol` covers file-list and token protocol workloads. |
 
 ## Benchmark Baseline
@@ -75,7 +87,7 @@ Measured on 2026-05-05 with `RSYNC_WIN_BENCH_ITERS=1` on the current Windows wor
 
 ## Option Status
 
-The packaged option table is in [`docs/OPTION-STATUS.md`](OPTION-STATUS.md). It classifies upstream client options, daemon/server options, and project-specific options as implemented, explicit diagnostic, or planned diagnostic. Planned diagnostic entries are accepted by the parser but are not counted as behavioral compatibility.
+The packaged option table is in [`docs/OPTION-STATUS.md`](OPTION-STATUS.md). It classifies upstream client options, daemon/server options, and project-specific options by execution support level: fully implemented, partially implemented by mode, diagnostic/reporting only, parsed for compatibility only, or planned. Parsed and planned entries are not counted as behavioral compatibility.
 
 ## Known Not Implemented
 

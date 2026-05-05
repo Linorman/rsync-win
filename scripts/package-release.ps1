@@ -119,6 +119,82 @@ if ((Get-Content -Raw $smokeFile) -ne "package smoke") {
     throw "Packaged rsync-win.exe local sync smoke copied unexpected file contents."
 }
 
+$filterSource = Join-Path $smokeRoot "filter-source"
+$filterDest = Join-Path $smokeRoot "filter-dest"
+New-Item -ItemType Directory -Force -Path $filterSource | Out-Null
+New-Item -ItemType Directory -Force -Path $filterDest | Out-Null
+Set-Content -Path (Join-Path $filterSource "keep.txt") -Value "keep" -NoNewline -Encoding utf8
+Set-Content -Path (Join-Path $filterSource "skip.tmp") -Value "source-excluded" -NoNewline -Encoding utf8
+Set-Content -Path (Join-Path $filterDest "stale.txt") -Value "delete-me" -NoNewline -Encoding utf8
+Set-Content -Path (Join-Path $filterDest "skip.tmp") -Value "receiver-protected" -NoNewline -Encoding utf8
+$filterOutput = & $packagedBinary -rt --delete "--exclude=*.tmp" $filterSource $filterDest 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "Packaged rsync-win.exe local delete/filter smoke failed with exit code $LASTEXITCODE`: $($filterOutput -join "`n")"
+}
+if ((Get-Content -Raw (Join-Path $filterDest "keep.txt")) -ne "keep") {
+    throw "Packaged rsync-win.exe local delete/filter smoke did not copy keep.txt."
+}
+if (Test-Path -LiteralPath (Join-Path $filterDest "stale.txt")) {
+    throw "Packaged rsync-win.exe local delete/filter smoke did not delete stale.txt."
+}
+if ((Get-Content -Raw (Join-Path $filterDest "skip.tmp")) -ne "receiver-protected") {
+    throw "Packaged rsync-win.exe local delete/filter smoke did not protect excluded receiver file."
+}
+
+function Invoke-PackageSsh {
+    param(
+        [Parameter(Mandatory = $true)][string]$Target,
+        [Parameter(Mandatory = $true)][string]$Command
+    )
+
+    $sshOutput = & ssh -o BatchMode=yes -o ConnectTimeout=10 $Target $Command 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Package SSH smoke command failed with exit code $LASTEXITCODE`: $Command`n$($sshOutput -join "`n")"
+    }
+    return $sshOutput
+}
+
+$sshTarget = $env:RSYNC_WIN_SSH_TARGET
+if (-not [string]::IsNullOrWhiteSpace($sshTarget)) {
+    $sshTmpRoot = if ([string]::IsNullOrWhiteSpace($env:RSYNC_WIN_SSH_TMP_ROOT)) {
+        "/tmp"
+    } else {
+        $env:RSYNC_WIN_SSH_TMP_ROOT.TrimEnd("/")
+    }
+    if ($sshTmpRoot -notmatch "^/[A-Za-z0-9._/-]+$") {
+        throw "RSYNC_WIN_SSH_TMP_ROOT must be an absolute POSIX path without shell-special characters for package SSH smoke, got '$sshTmpRoot'."
+    }
+    $remoteRoot = "$sshTmpRoot/rsync-win-package-$PID-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+    $sshSource = Join-Path $smokeRoot "ssh-source"
+    $sshPullDest = Join-Path $smokeRoot "ssh-pull"
+    New-Item -ItemType Directory -Force -Path (Join-Path $sshSource "dir") | Out-Null
+    New-Item -ItemType Directory -Force -Path $sshPullDest | Out-Null
+    Set-Content -Path (Join-Path $sshSource "dir\file.txt") -Value "package ssh smoke" -NoNewline -Encoding utf8
+
+    try {
+        Invoke-PackageSsh $sshTarget "rm -rf $remoteRoot; mkdir -p $remoteRoot/dest" | Out-Null
+        $sshCommand = "ssh -o BatchMode=yes -o ConnectTimeout=10"
+        $sshPushOutput = & $packagedBinary -rt --whole-file -e $sshCommand $sshSource "${sshTarget}:$remoteRoot/dest/" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Packaged rsync-win.exe optional SSH smoke push failed with exit code $LASTEXITCODE`: $($sshPushOutput -join "`n")"
+        }
+        Invoke-PackageSsh $sshTarget "test -s $remoteRoot/dest/dir/file.txt" | Out-Null
+        $sshPullOutput = & $packagedBinary -rt --whole-file -e $sshCommand "${sshTarget}:$remoteRoot/dest/" $sshPullDest 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Packaged rsync-win.exe optional SSH smoke pull failed with exit code $LASTEXITCODE`: $($sshPullOutput -join "`n")"
+        }
+        if ((Get-Content -Raw (Join-Path $sshPullDest "dir\file.txt")) -ne "package ssh smoke") {
+            throw "Packaged rsync-win.exe optional SSH smoke pulled unexpected file contents."
+        }
+    } finally {
+        try {
+            Invoke-PackageSsh $sshTarget "rm -rf $remoteRoot" | Out-Null
+        } catch {
+            Write-Warning "Failed to clean optional SSH smoke directory '$remoteRoot': $_"
+        }
+    }
+}
+
 $daemonUrl = $env:RSYNC_WIN_DAEMON_URL
 if (-not [string]::IsNullOrWhiteSpace($daemonUrl)) {
     $daemonBase = $daemonUrl.TrimEnd("/")
@@ -189,4 +265,4 @@ if ($checksumText -notmatch $checksumPattern) {
 
 Write-Output "Created $assetPath"
 Write-Output "Created $checksumPath"
-Write-Output "Verified package contents, rsync-win.exe --version, --help, local sync smoke, and optional daemon smoke"
+Write-Output "Verified package contents, rsync-win.exe --version, --help, local sync smoke, local delete/filter smoke, optional SSH smoke, and optional daemon smoke"

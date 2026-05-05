@@ -6,16 +6,21 @@ on:
 
 jobs:
   test:
-    name: Rust workspace
+    name: Rust workspace (${{ matrix.rust }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.76.0"]
     env:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -31,4 +36,4 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Package smoke test
         shell: pwsh
-        run: .\scripts\package-release.ps1 -Tag v0.1.5
+        run: .\scripts\package-release.ps1 -Tag v0.2.0-rc1

@@ -285,7 +285,7 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 - Progress logging, concise summaries, itemized changes, and structured stats are available through existing CLI output.
 - `tests/security/remote_peer.rs` covers remote peer path, multiplex, and malformed length regressions as a dedicated security gate.
 - `tests/interop/rsync_compat.rs` provides a gated upstream rsync matrix for SSH, optional peer probes, and daemon listing.
-- `scripts/package-release.ps1` produces the Windows x64 release zip and SHA-256 checksum used by the GitHub release workflow; staged package smoke checks cover `--version`, `--help`, and a disposable local sync.
+- `scripts/package-release.ps1` produces the Windows x64 release zip and SHA-256 checksum used by the GitHub release workflow; staged package smoke checks cover `--version`, `--help`, disposable local sync, local delete/filter smoke, and optional SSH/daemon fixture smokes.
 - `cargo bench -p rsync-fs --bench local_sync` provides a small local recursive sync benchmark.
 - `docs/COMPATIBILITY.md` and `docs/OPTION-STATUS.md` document Linux rsync, Homebrew/macOS rsync, macOS stock/openrsync, daemon mode, metadata modes, hardening status, and current option classifications.
 

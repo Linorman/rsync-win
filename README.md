@@ -5,11 +5,11 @@
 
 `rsync-win` is a native Windows rsync-style command line application written in Rust. It aims to provide useful local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
 
-This is an early development release. Version `v0.1.5` maps to Cargo package version `0.1.5` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, POSIX metadata request reporting, and a narrow NTFS-native sidecar restore path.
+This is a production-readiness release candidate. Version `v0.2.0-rc1` maps to Cargo package version `0.2.0-rc1` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, POSIX metadata request reporting, and a narrow NTFS-native sidecar restore path.
 
 ## Status
 
-| Area | v0.1.5 status |
+| Area | v0.2.0-rc1 status |
 | --- | --- |
 | Local Windows sync | Implemented for the tested ordinary-file and directory subset, including multiple source operands. |
 | Recursion and mtimes | `-r`, `-t`, and `-a` planning are available for ordinary-file workflows, with unsupported archive metadata and symlink mtime limitations reported. |
@@ -36,7 +36,7 @@ When a Windows x64 release zip is published, extract it and run:
 .\rsync-win.exe --version
 ```
 
-The release zip also includes the project license files, third-party dependency notice, compatibility matrix, option status table, and release notes template. Packaging runs staged `rsync-win.exe --version`, `--help`, and a disposable local sync smoke test, verifies required zip entries, and writes a SHA-256 checksum file next to the zip.
+The release zip also includes the project license files, third-party dependency notice, compatibility matrix, option status table, and release notes template. Packaging runs staged `rsync-win.exe --version`, `--help`, disposable local sync and local delete/filter smokes, optional SSH and daemon smokes when fixture environment variables are set, verifies required zip entries, and writes a SHA-256 checksum file next to the zip.
 
 ## Build From Source
 
@@ -73,8 +73,10 @@ cargo bench -p rsync-cli --bench remote_protocol
 Build a release zip and SHA-256 checksum locally:
 
 ```powershell
-.\scripts\package-release.ps1 -Tag v0.1.5
+.\scripts\package-release.ps1 -Tag v0.2.0-rc1
 ```
+
+The package script verifies the staged binary with `--version`, `--help`, a disposable local sync, a local delete/filter smoke, zip layout checks, and checksum generation. When `RSYNC_WIN_SSH_TARGET` is set it also runs a small optional SSH push/pull smoke under `RSYNC_WIN_SSH_TMP_ROOT` or `/tmp` and removes the remote test directory.
 
 ## Usage Examples
 

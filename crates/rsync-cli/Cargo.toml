@@ -43,6 +43,10 @@ name = "options"
 path = "../../tests/compat/options.rs"
 
 [[test]]
+name = "release_readiness"
+path = "../../tests/compat/release_readiness.rs"
+
+[[test]]
 name = "security_remote_peer"
 path = "../../tests/security/remote_peer.rs"
 
