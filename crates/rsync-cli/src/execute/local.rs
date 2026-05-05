@@ -11,8 +11,8 @@ use rsync_protocol::WireFileType;
 use rsync_winfs::{
     capture_ntfs_native_sidecar, copy_alternate_data_streams,
     parse_posix_fake_super_sidecar_manifest, read_windows_metadata, restore_creation_time,
-    restore_safe_windows_attributes, PosixAclRecord, PosixFakeSuperSidecar, PosixXattrRecord,
-    VssSnapshot,
+    restore_safe_windows_attributes, restore_security_descriptor, restore_sparse_ranges,
+    PosixAclRecord, PosixFakeSuperSidecar, PosixXattrRecord, VssSnapshot,
 };
 
 use crate::cli::Cli;
@@ -141,6 +141,14 @@ pub(crate) fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String
             "ntfs streams: copied {}, degraded {}\n",
             sidecars.streams_copied, sidecars.streams_degraded
         ));
+        output.push_str(&format!(
+            "ntfs security descriptors: restored {}, degraded {}\n",
+            sidecars.security_restored, sidecars.security_degraded
+        ));
+        output.push_str(&format!(
+            "ntfs sparse ranges: restored {}, degraded {}\n",
+            sidecars.sparse_restored, sidecars.sparse_degraded
+        ));
         output.push_str(&format!("ntfs sidecar root: {}\n", sidecars.root.display()));
     }
     if let Some(sidecars) = posix_sidecars {
@@ -175,6 +183,10 @@ struct NtfsSidecarExecution {
     creation_times_applied: usize,
     streams_copied: usize,
     streams_degraded: usize,
+    security_restored: usize,
+    security_degraded: usize,
+    sparse_restored: usize,
+    sparse_degraded: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,6 +346,10 @@ fn handle_ntfs_native_sidecars(
             creation_times_applied: 0,
             streams_copied: 0,
             streams_degraded: 0,
+            security_restored: 0,
+            security_degraded: 0,
+            sparse_restored: 0,
+            sparse_degraded: 0,
         }));
     }
 
@@ -344,6 +360,10 @@ fn handle_ntfs_native_sidecars(
     let mut creation_times_applied = 0;
     let mut streams_copied = 0;
     let mut streams_degraded = 0;
+    let mut security_restored = 0;
+    let mut security_degraded = 0;
+    let mut sparse_restored = 0;
+    let mut sparse_degraded = 0;
     for source_path in &capture_paths {
         let sidecar = capture_ntfs_native_sidecar(source_path, plan.vss)
             .with_context(|| format!("capture NTFS metadata for {}", source_path.display()))?;
@@ -369,6 +389,46 @@ fn handle_ntfs_native_sidecars(
                         streams_degraded += sidecar.streams.len();
                     }
                 }
+                if sidecar.file_type == FileType::File && sidecar.sparse_file {
+                    if plan.sparse {
+                        let restore = restore_sparse_ranges(
+                            &target_path,
+                            sidecar.len,
+                            &sidecar.sparse_ranges,
+                        )
+                        .with_context(|| {
+                            format!("restore sparse ranges for {}", target_path.display())
+                        })?;
+                        if restore.applied {
+                            sparse_restored += 1;
+                        }
+                        if !restore.available || restore.message.is_some() {
+                            sparse_degraded += 1;
+                        }
+                    } else {
+                        sparse_degraded += 1;
+                    }
+                }
+                if sidecar.security.captured {
+                    if plan.super_flag {
+                        let restore =
+                            restore_security_descriptor(&target_path, &sidecar.security, true)
+                                .with_context(|| {
+                                    format!(
+                                        "restore security descriptor for {}",
+                                        target_path.display()
+                                    )
+                                })?;
+                        if restore.applied {
+                            security_restored += 1;
+                        }
+                        if !restore.available || restore.message.is_some() {
+                            security_degraded += 1;
+                        }
+                    } else {
+                        security_degraded += 1;
+                    }
+                }
                 let restore = restore_safe_windows_attributes(&target_path, sidecar.attributes)
                     .with_context(|| {
                         format!(
@@ -385,6 +445,12 @@ fn handle_ntfs_native_sidecars(
             } else if sidecar.attributes.is_some() {
                 attributes_degraded += 1;
                 streams_degraded += sidecar.streams.len();
+                if sidecar.security.captured {
+                    security_degraded += 1;
+                }
+                if sidecar.sparse_file {
+                    sparse_degraded += 1;
+                }
             }
         }
         let relative = ntfs_sidecar_relative_name(sources, source_path);
@@ -402,6 +468,10 @@ fn handle_ntfs_native_sidecars(
         creation_times_applied,
         streams_copied,
         streams_degraded,
+        security_restored,
+        security_degraded,
+        sparse_restored,
+        sparse_degraded,
     }))
 }
 

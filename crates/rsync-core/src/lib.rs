@@ -478,7 +478,7 @@ impl NtfsNativeMetadataRequest {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::SecurityDescriptor,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native captures security descriptor summaries in a sidecar prototype but does not restore them yet",
+                "metadata-policy=ntfs-native captures security descriptor SDDL payloads and restores them for local Windows syncs when elevated restore is explicit",
             ));
         }
         if self.alternate_data_streams {
@@ -500,14 +500,14 @@ impl NtfsNativeMetadataRequest {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::SparseFile,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native detects sparse files but sparse range preservation is not wired into copying yet",
+                "metadata-policy=ntfs-native captures allocated sparse ranges and restores them for local Windows syncs when --sparse is explicit",
             ));
         }
         if self.reparse_points {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::ReparsePoint,
                 MetadataAction::Rejected,
-                "metadata-policy=ntfs-native does not preserve arbitrary reparse points yet; unsafe reparse points remain blocked",
+                "metadata-policy=ntfs-native intentionally rejects arbitrary non-symlink reparse point restore; unsafe reparse points remain blocked",
             ));
         }
         let _ = self.vss_snapshot;
@@ -584,7 +584,7 @@ pub fn metadata_policy_degradations(policy: MetadataPolicy) -> Vec<MetadataDegra
             MetadataDegradation::new(
                 MetadataFeature::SecurityDescriptor,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native requests NTFS security descriptor preservation; sidecar capture is available but restore is not wired into the local executor yet",
+                "metadata-policy=ntfs-native requests NTFS security descriptor preservation; local restore requires explicit --super and available Windows permissions",
             ),
             MetadataDegradation::new(
                 MetadataFeature::AlternateDataStream,
@@ -599,7 +599,7 @@ pub fn metadata_policy_degradations(policy: MetadataPolicy) -> Vec<MetadataDegra
             MetadataDegradation::new(
                 MetadataFeature::SparseFile,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native requests sparse file preservation; sparse detection is available but sparse range restore is not wired into the local executor yet",
+                "metadata-policy=ntfs-native requests sparse file preservation; exact sparse range restore requires explicit --sparse on local Windows syncs",
             ),
             MetadataDegradation::new(
                 MetadataFeature::ReparsePoint,

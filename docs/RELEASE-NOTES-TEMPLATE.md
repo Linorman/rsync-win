@@ -13,7 +13,7 @@ Windows x64 prebuilt executable for the native Rust rsync-win development build.
 
 - Daemon push.
 - VSS snapshot reads.
-- NTFS security descriptor restore, sparse range preservation, and arbitrary reparse restore.
+- Arbitrary non-symlink reparse restore.
 - Full memory-bounded incremental recursion.
 
 Review the packaged `README.md` and `docs/COMPATIBILITY.md` before using this build on important data.

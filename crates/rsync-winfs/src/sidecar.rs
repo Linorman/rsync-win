@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use rsync_fs::FileType;
 use thiserror::Error;
 
+use crate::metadata::SparseRange;
 use crate::security::SecurityDescriptorSummary;
 use crate::streams::AlternateDataStream;
 use crate::vss::{vss_snapshot_status, VssSnapshotStatus};
@@ -19,6 +20,7 @@ pub struct NtfsNativeSidecar {
     pub creation_time_unix_nanos: Option<i128>,
     pub attributes: Option<u32>,
     pub sparse_file: bool,
+    pub sparse_ranges: Vec<SparseRange>,
     pub reparse_tag: Option<u32>,
     pub file_id: Option<u64>,
     pub volume_serial: Option<u32>,
@@ -98,6 +100,10 @@ impl NtfsNativeSidecar {
         ));
         output.push_str(&format!("attributes={}\n", format_option(self.attributes)));
         output.push_str(&format!("sparse_file={}\n", self.sparse_file));
+        output.push_str(&format!("sparse_ranges={}\n", self.sparse_ranges.len()));
+        for range in &self.sparse_ranges {
+            output.push_str(&format!("sparse_range={},{}\n", range.offset, range.len));
+        }
         output.push_str(&format!(
             "reparse_tag={}\n",
             format_option(self.reparse_tag)
@@ -116,6 +122,10 @@ impl NtfsNativeSidecar {
         output.push_str(&format!(
             "security_hash={}\n",
             self.security.stable_hash.as_deref().unwrap_or("none")
+        ));
+        output.push_str(&format!(
+            "security_sddl={}\n",
+            self.security.sddl.as_deref().unwrap_or("none")
         ));
         output.push_str(&format!("streams={}\n", self.streams.len()));
         for stream in &self.streams {
@@ -198,6 +208,10 @@ pub fn parse_ntfs_native_sidecar_manifest(
             }
             "attributes" => fields.attributes = parse_option_u32("attributes", value)?,
             "sparse_file" => fields.sparse_file = Some(parse_bool("sparse_file", value)?),
+            "sparse_ranges" => {
+                fields.sparse_range_count = Some(parse_u64("sparse_ranges", value)? as usize);
+            }
+            "sparse_range" => fields.sparse_ranges.push(parse_sparse_range(value)?),
             "reparse_tag" => fields.reparse_tag = parse_option_u32("reparse_tag", value)?,
             "file_id" => fields.file_id = parse_option_u64("file_id", value)?,
             "volume_serial" => fields.volume_serial = parse_option_u32("volume_serial", value)?,
@@ -207,6 +221,7 @@ pub fn parse_ntfs_native_sidecar_manifest(
             }
             "security_len" => fields.security_len = parse_option_u32("security_len", value)?,
             "security_hash" => fields.security_hash = parse_option_string(value),
+            "security_sddl" => fields.security_sddl = parse_option_string(value),
             "streams" => fields.stream_count = Some(parse_u64("streams", value)? as usize),
             "stream" => streams.push(parse_stream(value)?),
             "vss_requested" => fields.vss_requested = Some(parse_bool("vss_requested", value)?),
@@ -220,6 +235,14 @@ pub fn parse_ntfs_native_sidecar_manifest(
             return Err(SidecarParseError::InvalidField {
                 field: "streams",
                 value: format!("expected {expected}, found {}", streams.len()),
+            });
+        }
+    }
+    if let Some(expected) = fields.sparse_range_count {
+        if expected != fields.sparse_ranges.len() {
+            return Err(SidecarParseError::InvalidField {
+                field: "sparse_ranges",
+                value: format!("expected {expected}, found {}", fields.sparse_ranges.len()),
             });
         }
     }
@@ -238,6 +261,7 @@ pub fn parse_ntfs_native_sidecar_manifest(
             creation_time_unix_nanos: fields.creation_time,
             attributes: fields.attributes,
             sparse_file: required(fields.sparse_file, "sparse_file")?,
+            sparse_ranges: fields.sparse_ranges,
             reparse_tag: fields.reparse_tag,
             file_id: fields.file_id,
             volume_serial: fields.volume_serial,
@@ -246,6 +270,7 @@ pub fn parse_ntfs_native_sidecar_manifest(
                 captured: required(fields.security_captured, "security_captured")?,
                 byte_len: fields.security_len,
                 stable_hash: fields.security_hash,
+                sddl: fields.security_sddl,
                 message: None,
             },
             streams,
@@ -338,6 +363,8 @@ struct ParsedFields {
     creation_time: Option<i128>,
     attributes: Option<u32>,
     sparse_file: Option<bool>,
+    sparse_ranges: Vec<SparseRange>,
+    sparse_range_count: Option<usize>,
     reparse_tag: Option<u32>,
     file_id: Option<u64>,
     volume_serial: Option<u32>,
@@ -345,6 +372,7 @@ struct ParsedFields {
     security_captured: Option<bool>,
     security_len: Option<u32>,
     security_hash: Option<String>,
+    security_sddl: Option<String>,
     stream_count: Option<usize>,
     vss_requested: Option<bool>,
     vss_available: Option<bool>,
@@ -485,6 +513,18 @@ fn parse_stream(value: &str) -> Result<AlternateDataStream, SidecarParseError> {
     })
 }
 
+fn parse_sparse_range(value: &str) -> Result<SparseRange, SidecarParseError> {
+    let (offset, len) = value
+        .split_once(',')
+        .ok_or_else(|| invalid("sparse_range", value))?;
+    let offset = parse_u64("sparse_range", offset)?;
+    let len = parse_u64("sparse_range", len)?;
+    if len == 0 {
+        return Err(invalid("sparse_range", value));
+    }
+    Ok(SparseRange { offset, len })
+}
+
 fn parse_acl(value: &str) -> Result<PosixAclRecord, SidecarParseError> {
     let parts = value.split(',').collect::<Vec<_>>();
     if parts.len() != 3 || parts[0].is_empty() || parts[2].is_empty() {
@@ -533,6 +573,7 @@ mod tests {
             creation_time_unix_nanos: None,
             attributes: Some(32),
             sparse_file: false,
+            sparse_ranges: Vec::new(),
             reparse_tag: None,
             file_id: Some(99),
             volume_serial: Some(7),
@@ -541,6 +582,7 @@ mod tests {
                 captured: true,
                 byte_len: Some(12),
                 stable_hash: Some("abcd".to_string()),
+                sddl: Some("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_string()),
                 message: None,
             },
             streams: vec![AlternateDataStream {

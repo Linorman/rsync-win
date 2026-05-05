@@ -13,9 +13,10 @@ pub use links::{
     LinkCapabilities, ReparsePointKind,
 };
 pub use metadata::{
-    capture_ntfs_native_sidecar, read_windows_metadata, restore_creation_time,
-    restore_safe_windows_attributes, WindowsAttributeRestore, WindowsMetadata,
-    FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+    capture_ntfs_native_sidecar, query_sparse_allocated_ranges, read_windows_metadata,
+    restore_creation_time, restore_safe_windows_attributes, restore_sparse_ranges, SparseRange,
+    SparseRangeRestore, WindowsAttributeRestore, WindowsMetadata, FILE_ATTRIBUTE_ARCHIVE,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
     SAFE_RESTORE_ATTRIBUTE_MASK,
 };
 pub use path::{
@@ -23,7 +24,8 @@ pub use path::{
     validate_portable_relative_path, WindowsPathError,
 };
 pub use security::{
-    capture_security_descriptor_summary, password_file_has_broad_access, SecurityDescriptorSummary,
+    capture_security_descriptor_summary, password_file_has_broad_access,
+    restore_security_descriptor, SecurityDescriptorRestore, SecurityDescriptorSummary,
 };
 pub use sidecar::{
     parse_ntfs_native_sidecar_manifest, parse_posix_fake_super_sidecar_manifest, NtfsNativeSidecar,

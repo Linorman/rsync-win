@@ -48,6 +48,21 @@ pub struct WindowsAttributeRestore {
     pub available: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseRange {
+    pub offset: u64,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseRangeRestore {
+    pub requested: bool,
+    pub applied: bool,
+    pub available: bool,
+    pub zeroed_ranges: usize,
+    pub message: Option<String>,
+}
+
 pub fn read_windows_metadata(path: &Path) -> std::io::Result<WindowsMetadata> {
     let metadata = fs::symlink_metadata(path)?;
     let identity = platform_file_identity(path);
@@ -95,6 +110,12 @@ pub fn capture_ntfs_native_sidecar(
 ) -> std::io::Result<NtfsNativeSidecar> {
     let metadata = read_windows_metadata(path)?;
     let attributes = metadata.attributes;
+    let sparse_file = attributes.is_some_and(|attrs| attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0);
+    let sparse_ranges = if sparse_file && metadata.portable.file_type == FileType::File {
+        query_sparse_allocated_ranges(path, metadata.portable.len)?
+    } else {
+        Vec::new()
+    };
     Ok(NtfsNativeSidecar {
         path: path.to_path_buf(),
         file_type: metadata.portable.file_type,
@@ -105,7 +126,8 @@ pub fn capture_ntfs_native_sidecar(
             .and_then(system_time_to_unix_nanos),
         creation_time_unix_nanos: metadata.creation_time.and_then(system_time_to_unix_nanos),
         attributes,
-        sparse_file: attributes.is_some_and(|attrs| attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0),
+        sparse_file,
+        sparse_ranges,
         reparse_tag: metadata.reparse_tag,
         file_id: metadata.file_id,
         volume_serial: metadata.volume_serial,
@@ -128,6 +150,22 @@ pub fn restore_creation_time(
     creation_time: Option<SystemTime>,
 ) -> std::io::Result<bool> {
     platform_restore_creation_time(path, creation_time)
+}
+
+pub fn query_sparse_allocated_ranges(
+    path: &Path,
+    file_len: u64,
+) -> std::io::Result<Vec<SparseRange>> {
+    platform_query_sparse_allocated_ranges(path, file_len)
+}
+
+pub fn restore_sparse_ranges(
+    path: &Path,
+    file_len: u64,
+    allocated_ranges: &[SparseRange],
+) -> std::io::Result<SparseRangeRestore> {
+    validate_sparse_ranges(file_len, allocated_ranges)?;
+    platform_restore_sparse_ranges(path, file_len, allocated_ranges)
 }
 
 #[cfg(windows)]
@@ -202,6 +240,305 @@ fn platform_restore_creation_time(
 ) -> std::io::Result<bool> {
     let _ = fs::metadata(path)?;
     Ok(false)
+}
+
+#[cfg(windows)]
+fn platform_query_sparse_allocated_ranges(
+    path: &Path,
+    file_len: u64,
+) -> std::io::Result<Vec<SparseRange>> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_DATA,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::{
+        FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    if file_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let path = crate::path::to_long_path_safe(path);
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            FILE_READ_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut ranges = Vec::new();
+    let mut next_offset = 0;
+    while next_offset < file_len {
+        let mut query = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: next_offset as i64,
+            Length: (file_len - next_offset) as i64,
+        };
+        let mut output = vec![unsafe { zeroed::<FILE_ALLOCATED_RANGE_BUFFER>() }; 1024];
+        let mut bytes_returned = 0;
+        let result = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                (&mut query as *mut FILE_ALLOCATED_RANGE_BUFFER).cast(),
+                size_of::<FILE_ALLOCATED_RANGE_BUFFER>() as u32,
+                output.as_mut_ptr().cast(),
+                (output.len() * size_of::<FILE_ALLOCATED_RANGE_BUFFER>()) as u32,
+                &mut bytes_returned,
+                null_mut(),
+            )
+        };
+        if result == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_MORE_DATA as i32) || bytes_returned == 0 {
+                let _ = unsafe { CloseHandle(handle) };
+                return Err(error);
+            }
+        }
+
+        let count = bytes_returned as usize / size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
+        if count == 0 {
+            break;
+        }
+        output.truncate(count);
+        let mut last_end = next_offset;
+        for range in output {
+            if range.Length <= 0 || range.FileOffset < 0 {
+                continue;
+            }
+            let offset = range.FileOffset as u64;
+            let len = range.Length as u64;
+            last_end = offset.saturating_add(len);
+            ranges.push(SparseRange { offset, len });
+        }
+        if result != 0 {
+            break;
+        }
+        if last_end <= next_offset {
+            let _ = unsafe { CloseHandle(handle) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows returned sparse ranges without forward progress",
+            ));
+        }
+        next_offset = last_end;
+    }
+    let close_result = unsafe { CloseHandle(handle) };
+    if close_result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(ranges)
+}
+
+#[cfg(not(windows))]
+fn platform_query_sparse_allocated_ranges(
+    path: &Path,
+    file_len: u64,
+) -> std::io::Result<Vec<SparseRange>> {
+    let _ = fs::metadata(path)?;
+    Ok((file_len > 0)
+        .then_some(SparseRange {
+            offset: 0,
+            len: file_len,
+        })
+        .into_iter()
+        .collect())
+}
+
+#[cfg(windows)]
+fn platform_restore_sparse_ranges(
+    path: &Path,
+    file_len: u64,
+    allocated_ranges: &[SparseRange],
+) -> std::io::Result<SparseRangeRestore> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+
+    if file_len == 0 {
+        return Ok(SparseRangeRestore {
+            requested: false,
+            applied: false,
+            available: true,
+            zeroed_ranges: 0,
+            message: None,
+        });
+    }
+
+    let path = crate::path::to_long_path_safe(path);
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut bytes_returned = 0;
+    let sparse_result = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_SPARSE,
+            null(),
+            0,
+            null_mut(),
+            0,
+            &mut bytes_returned,
+            null_mut(),
+        )
+    };
+    if sparse_result == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { CloseHandle(handle) };
+        return Err(error);
+    }
+
+    let mut zeroed_ranges = 0;
+    for hole in sparse_holes(file_len, allocated_ranges) {
+        let mut zero = FILE_ZERO_DATA_INFORMATION {
+            FileOffset: hole.offset as i64,
+            BeyondFinalZero: (hole.offset + hole.len) as i64,
+        };
+        let zero_result = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_ZERO_DATA,
+                (&mut zero as *mut FILE_ZERO_DATA_INFORMATION).cast(),
+                size_of::<FILE_ZERO_DATA_INFORMATION>() as u32,
+                null_mut(),
+                0,
+                &mut bytes_returned,
+                null_mut(),
+            )
+        };
+        if zero_result == 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = unsafe { CloseHandle(handle) };
+            return Err(error);
+        }
+        zeroed_ranges += 1;
+    }
+
+    let close_result = unsafe { CloseHandle(handle) };
+    if close_result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(SparseRangeRestore {
+        requested: true,
+        applied: true,
+        available: true,
+        zeroed_ranges,
+        message: None,
+    })
+}
+
+#[cfg(not(windows))]
+fn platform_restore_sparse_ranges(
+    path: &Path,
+    file_len: u64,
+    allocated_ranges: &[SparseRange],
+) -> std::io::Result<SparseRangeRestore> {
+    let _ = fs::metadata(path)?;
+    Ok(SparseRangeRestore {
+        requested: file_len > 0,
+        applied: false,
+        available: false,
+        zeroed_ranges: 0,
+        message: Some(format!(
+            "sparse range restore is only available on Windows; requested {} allocated ranges",
+            allocated_ranges.len()
+        )),
+    })
+}
+
+fn validate_sparse_ranges(file_len: u64, allocated_ranges: &[SparseRange]) -> std::io::Result<()> {
+    let mut previous_end = 0;
+    for range in allocated_ranges {
+        if range.len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse allocated ranges must not be empty",
+            ));
+        }
+        let end = range.offset.checked_add(range.len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse allocated range overflows u64",
+            )
+        })?;
+        if end > file_len || range.offset < previous_end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse allocated ranges must be sorted, non-overlapping, and within file length",
+            ));
+        }
+        previous_end = end;
+    }
+    Ok(())
+}
+
+fn sparse_holes(file_len: u64, allocated_ranges: &[SparseRange]) -> Vec<SparseRange> {
+    let mut holes = Vec::new();
+    let mut cursor = 0;
+    for range in allocated_ranges {
+        if cursor < range.offset {
+            holes.push(SparseRange {
+                offset: cursor,
+                len: range.offset - cursor,
+            });
+        }
+        cursor = range.offset + range.len;
+    }
+    if cursor < file_len {
+        holes.push(SparseRange {
+            offset: cursor,
+            len: file_len - cursor,
+        });
+    }
+    holes
 }
 
 #[cfg(windows)]
@@ -514,6 +851,47 @@ mod tests {
 
         let restored = read_windows_metadata(&file).unwrap().creation_time.unwrap();
         assert_eq!(restored, requested);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sparse_ranges_restore_punches_unallocated_gaps() {
+        let root = unique_temp_dir("rsync-winfs-sparse-ranges");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("sparse.bin");
+        let len = 1024 * 1024;
+        let range_len = 64 * 1024;
+        fs::write(&file, vec![0_u8; len]).unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut handle = fs::OpenOptions::new().write(true).open(&file).unwrap();
+            handle.write_all(&vec![1_u8; range_len]).unwrap();
+            handle
+                .seek(SeekFrom::Start((len - range_len) as u64))
+                .unwrap();
+            handle.write_all(&vec![2_u8; range_len]).unwrap();
+        }
+        let ranges = vec![
+            SparseRange {
+                offset: 0,
+                len: range_len as u64,
+            },
+            SparseRange {
+                offset: (len - range_len) as u64,
+                len: range_len as u64,
+            },
+        ];
+
+        let restore = restore_sparse_ranges(&file, len as u64, &ranges).unwrap();
+
+        assert!(restore.applied);
+        assert_eq!(
+            query_sparse_allocated_ranges(&file, len as u64).unwrap(),
+            ranges
+        );
+        assert_eq!(fs::metadata(&file).unwrap().len(), len as u64);
+
         fs::remove_dir_all(root).unwrap();
     }
 

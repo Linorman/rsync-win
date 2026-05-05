@@ -459,11 +459,14 @@ impl TransferPlan {
         if cli.no_times {
             preserve_times = false;
         }
-        add_metadata_degradations(
-            &mut report,
-            metadata_policy_degradations(metadata_policy),
-            cli.fail_on_metadata_loss,
-        );
+        let mut policy_degradations = metadata_policy_degradations(metadata_policy);
+        if metadata_policy == MetadataPolicy::NtfsNative {
+            policy_degradations.retain(|degradation| {
+                !((cli.super_flag && degradation.feature == MetadataFeature::SecurityDescriptor)
+                    || (cli.sparse && degradation.feature == MetadataFeature::SparseFile))
+            });
+        }
+        add_metadata_degradations(&mut report, policy_degradations, cli.fail_on_metadata_loss);
         if cli.vss {
             add_metadata_degradations(
                 &mut report,

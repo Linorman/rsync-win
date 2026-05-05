@@ -2973,6 +2973,125 @@ fn local_ntfs_native_sync_copies_alternate_stream_payloads() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn local_ntfs_native_super_restores_security_descriptor_dacl() {
+    let root = unique_temp_dir("rsync-cli-ntfs-security");
+    let source = root.join("source");
+    let dest = root.join("dest");
+    fs::create_dir_all(&source).unwrap();
+    let source_file = source.join("file.txt");
+    fs::write(&source_file, b"secure").unwrap();
+    let source_descriptor = rsync_winfs::SecurityDescriptorSummary {
+        captured: true,
+        byte_len: None,
+        stable_hash: None,
+        sddl: Some("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_string()),
+        message: None,
+    };
+    rsync_winfs::restore_security_descriptor(&source_file, &source_descriptor, false).unwrap();
+    let captured_source = rsync_winfs::capture_security_descriptor_summary(&source_file).unwrap();
+
+    let output = parse_and_execute(vec![
+        "rsync-win".to_string(),
+        "-r".to_string(),
+        "--metadata-policy".to_string(),
+        "ntfs-native".to_string(),
+        "--super".to_string(),
+        source.to_string_lossy().into_owned(),
+        dest.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+
+    let dest_file = dest.join("file.txt");
+    let captured_dest = rsync_winfs::capture_security_descriptor_summary(&dest_file).unwrap();
+    assert_eq!(
+        security_dacl_fragment(captured_dest.sddl.as_deref().unwrap()),
+        security_dacl_fragment(captured_source.sddl.as_deref().unwrap())
+    );
+    assert!(
+        output.contains("ntfs security descriptors: restored 2, degraded 0"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("security-descriptor metadata degraded"),
+        "{output}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn local_ntfs_native_sparse_sync_preserves_sparse_ranges() {
+    let root = unique_temp_dir("rsync-cli-ntfs-sparse-ranges");
+    let source = root.join("source");
+    let dest = root.join("dest");
+    fs::create_dir_all(&source).unwrap();
+    let source_file = source.join("sparse.bin");
+    let len = 1024 * 1024;
+    let range_len = 64 * 1024;
+    fs::write(&source_file, vec![0_u8; len]).unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut handle = fs::OpenOptions::new()
+            .write(true)
+            .open(&source_file)
+            .unwrap();
+        handle.write_all(&vec![1_u8; range_len]).unwrap();
+        handle
+            .seek(SeekFrom::Start((len - range_len) as u64))
+            .unwrap();
+        handle.write_all(&vec![2_u8; range_len]).unwrap();
+    }
+    let ranges = vec![
+        rsync_winfs::SparseRange {
+            offset: 0,
+            len: range_len as u64,
+        },
+        rsync_winfs::SparseRange {
+            offset: (len - range_len) as u64,
+            len: range_len as u64,
+        },
+    ];
+    rsync_winfs::restore_sparse_ranges(&source_file, len as u64, &ranges).unwrap();
+    assert_eq!(
+        rsync_winfs::query_sparse_allocated_ranges(&source_file, len as u64).unwrap(),
+        ranges
+    );
+
+    let output = parse_and_execute(vec![
+        "rsync-win".to_string(),
+        "-r".to_string(),
+        "--sparse".to_string(),
+        "--metadata-policy".to_string(),
+        "ntfs-native".to_string(),
+        source.to_string_lossy().into_owned(),
+        dest.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+
+    let dest_file = dest.join("sparse.bin");
+    assert_eq!(
+        fs::read(&dest_file).unwrap(),
+        fs::read(&source_file).unwrap()
+    );
+    assert_eq!(
+        rsync_winfs::query_sparse_allocated_ranges(&dest_file, len as u64).unwrap(),
+        ranges
+    );
+    assert!(
+        output.contains("ntfs sparse ranges: restored 1, degraded 0"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("sparse-file metadata degraded"),
+        "{output}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn local_executor_honors_files_from_records() {
     let root = unique_temp_dir("rsync-cli-files-from");
@@ -3467,6 +3586,16 @@ fn ntfs_sidecar_source_paths(dest: &Path) -> BTreeSet<PathBuf> {
                 .path
         })
         .collect()
+}
+
+#[cfg(windows)]
+fn security_dacl_fragment(sddl: &str) -> &str {
+    let Some(start) = sddl.find("D:") else {
+        return "";
+    };
+    let rest = &sddl[start..];
+    let end = rest.find("S:").unwrap_or(rest.len());
+    &rest[..end]
 }
 
 fn test_remote_block_signatures(
