@@ -6,7 +6,7 @@
 
 **Architecture:** Add protocol 31 primitives in `rsync-protocol` first, then switch CLI session code one boundary at a time. Keep the existing protocol 27 path intact until real SSH interop passes for both push and pull.
 
-**Tech Stack:** Rust std I/O, existing `rsync-protocol`, existing OpenSSH subprocess transport, upstream rsync 3.2.7 interop fixture.
+**Tech Stack:** Rust std I/O, existing `rsync-protocol`, existing OpenSSH subprocess transport, upstream rsync interop fixture.
 
 ---
 
@@ -20,7 +20,7 @@
 - [x] Add rsync varint read/write tests using captured protocol 31 compat flags.
 - [x] Add rsync vstring read/write tests using captured checksum-list strings.
 - [x] Implement a protocol 31 checksum-negotiated handshake helper.
-- [x] Verify the helper parses the captured rsync 3.2.7 setup bytes.
+- [x] Verify the helper parses captured upstream rsync setup bytes.
 - [x] Run `cargo test -p rsync-protocol --all-features`.
 
 ## Task 2: Protocol 31 File-List Boundary

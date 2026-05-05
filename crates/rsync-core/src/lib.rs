@@ -1,7 +1,11 @@
+pub mod chmod;
+
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use thiserror::Error;
+
+pub use chmod::{ChmodFileKind, ChmodRules};
 
 pub type Result<T> = std::result::Result<T, RsyncCoreError>;
 
@@ -72,6 +76,7 @@ pub enum MetadataFeature {
     FakeSuper,
     SecurityDescriptor,
     AlternateDataStream,
+    AccessTime,
     CreationTime,
     WindowsAttributes,
     SparseFile,
@@ -95,6 +100,7 @@ impl MetadataFeature {
             Self::FakeSuper => "fake-super",
             Self::SecurityDescriptor => "security-descriptor",
             Self::AlternateDataStream => "alternate-data-stream",
+            Self::AccessTime => "access-time",
             Self::CreationTime => "creation-time",
             Self::WindowsAttributes => "windows-attributes",
             Self::SparseFile => "sparse-file",
@@ -202,6 +208,12 @@ pub struct PosixMetadataRequest {
     pub acls: bool,
     pub xattrs: bool,
     pub fake_super: bool,
+    pub atimes: bool,
+    pub crtimes: bool,
+    pub omit_dir_times: bool,
+    pub user_map: bool,
+    pub group_map: bool,
+    pub chown: bool,
 }
 
 impl PosixMetadataRequest {
@@ -216,6 +228,12 @@ impl PosixMetadataRequest {
             || self.acls
             || self.xattrs
             || self.fake_super
+            || self.atimes
+            || self.crtimes
+            || self.omit_dir_times
+            || self.user_map
+            || self.group_map
+            || self.chown
     }
 
     pub fn degradations(self, policy: MetadataPolicy) -> Vec<MetadataDegradation> {
@@ -225,49 +243,85 @@ impl PosixMetadataRequest {
         if self.permissions {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Permissions,
-                MetadataAction::Degraded,
-                format!(
-                    "--perms requests POSIX mode preservation; {policy_label} local transfers record mode intent but do not chmod Windows destinations yet"
-                ),
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--perms requests POSIX mode preservation; mode bits are stored in the fake-super sidecar".to_string()
+                } else {
+                    format!(
+                        "--perms requests POSIX mode preservation; {policy_label} local transfers record mode intent but do not chmod Windows destinations yet"
+                    )
+                },
             ));
         }
         if self.chmod {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Permissions,
-                MetadataAction::Degraded,
-                format!(
-                    "--chmod requests POSIX mode rewriting; {policy_label} local transfers report the request but do not apply chmod expressions yet"
-                ),
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--chmod requests POSIX mode rewriting; rewritten mode bits are stored in the fake-super sidecar".to_string()
+                } else {
+                    format!(
+                        "--chmod requests POSIX mode rewriting; {policy_label} local transfers report the request but do not apply chmod expressions yet"
+                    )
+                },
             ));
         }
         if self.executability {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Executability,
-                MetadataAction::Degraded,
-                "--executability is represented in sender mode mapping for remote uploads; local Windows destinations do not apply executable bits",
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--executability mode intent is stored in the fake-super sidecar"
+                } else {
+                    "--executability is represented in sender mode mapping for remote uploads; local Windows destinations do not apply executable bits"
+                },
             ));
         }
         if self.owner {
-            let message = if self.numeric_ids {
+            let message = if self.fake_super {
+                "owner metadata is stored in the fake-super sidecar"
+            } else if self.numeric_ids {
                 "--numeric-ids requests numeric POSIX owner ids; Windows local transfers do not apply POSIX owners"
             } else {
                 "--owner requests POSIX owner preservation; Windows local transfers do not apply POSIX owners"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Owner,
-                MetadataAction::Ignored,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
                 message,
             ));
         }
         if self.group {
-            let message = if self.numeric_ids {
+            let message = if self.fake_super {
+                "group metadata is stored in the fake-super sidecar"
+            } else if self.numeric_ids {
                 "--numeric-ids requests numeric POSIX group ids; Windows local transfers do not apply POSIX groups"
             } else {
                 "--group requests POSIX group preservation; Windows local transfers do not apply POSIX groups"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Group,
-                MetadataAction::Ignored,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
                 message,
             ));
         }
@@ -279,44 +333,109 @@ impl PosixMetadataRequest {
             ));
         }
         if self.acls {
-            let action = if self.fake_super {
-                MetadataAction::Stored
-            } else {
-                MetadataAction::Ignored
-            };
             let message = if self.fake_super {
-                "--acls metadata is selected for fake-super sidecar storage; POSIX ACLs are not applied as NTFS ACL fidelity"
+                "--acls metadata requested with fake-super; POSIX ACL intent is stored in the fake-super sidecar"
             } else {
                 "--acls requests POSIX ACL preservation; Windows local transfers do not apply POSIX ACLs"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Acl,
-                action,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
                 message,
             ));
         }
         if self.xattrs {
-            let action = if self.fake_super {
-                MetadataAction::Stored
-            } else {
-                MetadataAction::Ignored
-            };
             let message = if self.fake_super {
-                "--xattrs metadata is selected for fake-super sidecar storage; xattrs are not applied to NTFS streams automatically"
+                "--xattrs metadata requested with fake-super; POSIX xattr intent is stored in the fake-super sidecar"
             } else {
                 "--xattrs requests extended attribute preservation; Windows local transfers do not apply POSIX xattrs"
             };
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::Xattr,
-                action,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
                 message,
             ));
         }
         if self.fake_super {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::FakeSuper,
-                MetadataAction::Degraded,
-                "--fake-super sidecar storage is planned explicitly; transfer restore/apply is not wired into the local executor yet",
+                MetadataAction::Stored,
+                "--fake-super metadata is stored in a Windows sidecar for local transfers",
+            ));
+        }
+        if self.atimes {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::AccessTime,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--atimes intent is stored in the fake-super sidecar"
+                } else {
+                    "--atimes preservation is platform-dependent and is not applied by the local Windows executor yet"
+                },
+            ));
+        }
+        if self.crtimes {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::CreationTime,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Degraded
+                },
+                if self.fake_super {
+                    "--crtimes intent is stored in the fake-super sidecar"
+                } else {
+                    "--crtimes preservation requires platform-specific creation-time support"
+                },
+            ));
+        }
+        if self.omit_dir_times {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::Permissions,
+                MetadataAction::Applied,
+                "--omit-dir-times is applied by not scheduling directory mtime preservation in local planning",
+            ));
+        }
+        if self.user_map || self.chown {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::Owner,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
+                if self.fake_super {
+                    "owner mapping intent is stored in the fake-super sidecar"
+                } else {
+                    "owner mapping is meaningful for remote POSIX receivers; local Windows transfers do not apply POSIX owners"
+                },
+            ));
+        }
+        if self.group_map || self.chown {
+            degradations.push(MetadataDegradation::new(
+                MetadataFeature::Group,
+                if self.fake_super {
+                    MetadataAction::Stored
+                } else {
+                    MetadataAction::Ignored
+                },
+                if self.fake_super {
+                    "group mapping intent is stored in the fake-super sidecar"
+                } else {
+                    "group mapping is meaningful for remote POSIX receivers; local Windows transfers do not apply POSIX groups"
+                },
             ));
         }
 
@@ -359,51 +478,39 @@ impl NtfsNativeMetadataRequest {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::SecurityDescriptor,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native captures security descriptor summaries in a sidecar prototype but does not restore them yet",
+                "metadata-policy=ntfs-native captures security descriptor SDDL payloads and restores them for local Windows syncs when elevated restore is explicit",
             ));
         }
         if self.alternate_data_streams {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::AlternateDataStream,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native enumerates alternate data streams for sidecar reporting but does not copy stream payloads yet",
+                "metadata-policy=ntfs-native copies named alternate data stream payloads for local Windows syncs; default data streams remain ordinary file content and unsupported platforms report this as unavailable",
             ));
         }
-        if self.creation_time {
-            degradations.push(MetadataDegradation::new(
-                MetadataFeature::CreationTime,
-                MetadataAction::Ignored,
-                "metadata-policy=ntfs-native requests creation time preservation; the local executor does not apply creation times yet",
-            ));
-        }
+        let _ = self.creation_time;
         if self.windows_attributes {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::WindowsAttributes,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native captures Windows file attributes in sidecar metadata but does not restore all attributes yet",
+                "metadata-policy=ntfs-native restores the tested readonly/hidden/archive/system attribute subset and degrades unsupported attribute bits",
             ));
         }
         if self.sparse_files {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::SparseFile,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native detects sparse files but sparse range preservation is not wired into copying yet",
+                "metadata-policy=ntfs-native captures allocated sparse ranges and restores them for local Windows syncs when --sparse is explicit",
             ));
         }
         if self.reparse_points {
             degradations.push(MetadataDegradation::new(
                 MetadataFeature::ReparsePoint,
                 MetadataAction::Rejected,
-                "metadata-policy=ntfs-native does not preserve arbitrary reparse points yet; unsafe reparse points remain blocked",
+                "metadata-policy=ntfs-native intentionally rejects arbitrary non-symlink reparse point restore; unsafe reparse points remain blocked",
             ));
         }
-        if self.vss_snapshot {
-            degradations.push(MetadataDegradation::new(
-                MetadataFeature::VssSnapshot,
-                MetadataAction::Rejected,
-                "--vss requests snapshot source mode; VSS snapshot creation is not implemented in this build",
-            ));
-        }
+        let _ = self.vss_snapshot;
 
         degradations
     }
@@ -477,27 +584,22 @@ pub fn metadata_policy_degradations(policy: MetadataPolicy) -> Vec<MetadataDegra
             MetadataDegradation::new(
                 MetadataFeature::SecurityDescriptor,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native requests NTFS security descriptor preservation; sidecar capture is available but restore is not wired into the local executor yet",
+                "metadata-policy=ntfs-native requests NTFS security descriptor preservation; local restore requires explicit --super and available Windows permissions",
             ),
             MetadataDegradation::new(
                 MetadataFeature::AlternateDataStream,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native requests alternate data stream preservation; stream enumeration is available but ADS payload copy is not wired into the local executor yet",
-            ),
-            MetadataDegradation::new(
-                MetadataFeature::CreationTime,
-                MetadataAction::Ignored,
-                "metadata-policy=ntfs-native requests creation time preservation; the local executor does not apply creation times yet",
+                "metadata-policy=ntfs-native requests alternate data stream preservation; named ADS payload copy is available for local Windows syncs and unavailable elsewhere",
             ),
             MetadataDegradation::new(
                 MetadataFeature::WindowsAttributes,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native requests Windows file attribute preservation; sidecar capture is available but restore is not wired into the local executor yet",
+                "metadata-policy=ntfs-native requests Windows file attribute preservation; the tested readonly/hidden/archive/system subset is restored while unsupported bits are degraded",
             ),
             MetadataDegradation::new(
                 MetadataFeature::SparseFile,
                 MetadataAction::Degraded,
-                "metadata-policy=ntfs-native requests sparse file preservation; sparse detection is available but sparse range restore is not wired into the local executor yet",
+                "metadata-policy=ntfs-native requests sparse file preservation; exact sparse range restore requires explicit --sparse on local Windows syncs",
             ),
             MetadataDegradation::new(
                 MetadataFeature::ReparsePoint,
@@ -717,7 +819,7 @@ mod tests {
     fn ntfs_native_metadata_policy_reports_policy_capability_loss() {
         let degradations = metadata_policy_degradations(MetadataPolicy::NtfsNative);
 
-        assert!(degradations
+        assert!(!degradations
             .iter()
             .any(|degradation| degradation.feature == MetadataFeature::CreationTime));
         assert!(degradations
@@ -730,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn posix_request_reports_fake_super_storage_and_losses() {
+    fn posix_request_reports_fake_super_as_stored_sidecar_metadata() {
         let request = PosixMetadataRequest {
             permissions: true,
             owner: true,
@@ -749,7 +851,14 @@ mod tests {
                 && !degradation.is_loss()
         }));
         assert!(degradations.iter().any(|degradation| {
-            degradation.feature == MetadataFeature::Permissions && degradation.is_loss()
+            degradation.feature == MetadataFeature::Xattr
+                && degradation.action == MetadataAction::Stored
+                && !degradation.is_loss()
+        }));
+        assert!(degradations.iter().any(|degradation| {
+            degradation.feature == MetadataFeature::Permissions
+                && degradation.action == MetadataAction::Stored
+                && !degradation.is_loss()
         }));
     }
 
@@ -767,14 +876,13 @@ mod tests {
     }
 
     #[test]
-    fn ntfs_native_request_reports_vss_as_rejected() {
+    fn ntfs_native_request_does_not_report_vss_as_static_policy_loss() {
         let degradations = NtfsNativeMetadataRequest::all()
             .with_vss(true)
             .degradations();
 
-        assert!(degradations.iter().any(|degradation| {
-            degradation.feature == MetadataFeature::VssSnapshot
-                && degradation.action == MetadataAction::Rejected
-        }));
+        assert!(!degradations
+            .iter()
+            .any(|degradation| degradation.feature == MetadataFeature::VssSnapshot));
     }
 }

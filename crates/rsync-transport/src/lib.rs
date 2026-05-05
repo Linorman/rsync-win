@@ -1,8 +1,11 @@
+pub mod bandwidth;
 pub mod process;
 pub mod remote_shell;
 pub mod tcp;
 
 use std::io::{Read, Write};
+
+pub use bandwidth::{BandwidthLimit, BandwidthLimitedStream, BandwidthLimiter};
 
 pub trait Transport: Read + Write {}
 

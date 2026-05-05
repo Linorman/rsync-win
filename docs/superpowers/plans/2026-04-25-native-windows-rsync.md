@@ -20,7 +20,7 @@ This plan therefore assumes a greenfield project.
 
 ### Core Compatibility Facts
 
-- Upstream rsync 3.4.1 was released on 2025-01-15; its current source defines `PROTOCOL_VERSION 32`, `MIN_PROTOCOL_VERSION 20`, and TCP daemon port `873`.
+- Upstream rsync defines protocol version bounds and TCP daemon port `873`.
 - Compatibility requires implementing the rsync wire protocol, not just the rolling checksum algorithm.
 - `librsync` is useful as an algorithm reference but explicitly is not wire-compatible with rsync.
 - The first transport to implement should be remote-shell mode, because it is the common path for Linux/macOS interoperability: local process launches remote `rsync --server ...` over SSH and then exchanges protocol bytes over stdin/stdout.
@@ -39,14 +39,14 @@ The implementation should expose three metadata policy modes:
 
 MVP should negotiate and interoperate with these peers:
 
-- Linux rsync 3.2.x/3.4.x, protocol 31/32.
-- Homebrew/macOS rsync 3.x, protocol 30/31/32 depending on version.
+- Upstream Linux rsync-compatible peers using modern protocol versions.
+- Homebrew/macOS rsync-compatible peers using their advertised protocol versions.
 - macOS stock rsync/openrsync compatibility as a later test target, because built-in macOS versions are fragmented and often support only older protocol/option subsets.
 
 Recommended order:
 
 1. Protocol 31/32 happy path with remote-shell transport.
-2. Protocol 30 compatibility for broader Linux/macOS rsync 3.x.
+2. Protocol 30 compatibility for broader Linux/macOS rsync-compatible peers.
 3. Protocol 29/27 compatibility only for explicitly scoped options and tests.
 4. Daemon mode after remote-shell is stable.
 
@@ -336,8 +336,8 @@ Minimum required before calling the first implementation complete:
 
 - `cargo test --workspace`
 - Local Windows-to-Windows directory sync with ordinary files, deletion, mtime preservation.
-- Windows client pushing to Linux rsync 3.4.x over SSH.
-- Windows client pulling from Linux rsync 3.4.x over SSH.
+- Windows client pushing to upstream rsync over SSH.
+- Windows client pulling from upstream rsync over SSH.
 - Windows client pushing to macOS/Homebrew rsync over SSH when available.
 - Case-collision preflight test: `Foo` and `foo` from a case-sensitive source to default NTFS must fail before transfer.
 - Symlink test with Developer Mode or elevated privilege, plus fallback warning test.
@@ -358,7 +358,7 @@ Minimum required before calling the first implementation complete:
 - rsync daemon config manpage: https://download.samba.org/pub/rsync/rsyncd.conf.5
 - rsync algorithm technical report: https://rsync.samba.org/tech_report/
 - practical rsync architecture overview: https://rsync.samba.org/how-rsync-works.html
-- rsync 3.4.1 protocol constants: https://sources.debian.org/src/rsync/3.4.1%2Bds1-7/rsync.h/
+- rsync protocol constants: consult upstream rsync source headers for the target compatibility surface.
 - librsync project note on wire compatibility: https://librsync.sourceforge.net/
 - openrsync implementation notes: https://github.com/kristapsdz/openrsync
 - Microsoft long path behavior: https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation

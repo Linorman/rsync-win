@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -31,6 +32,7 @@ pub struct ChildTransport {
 pub struct ChildProcessReport {
     pub status: std::process::ExitStatus,
     pub stderr: Vec<u8>,
+    pub timed_out: bool,
 }
 
 impl ChildTransport {
@@ -73,28 +75,85 @@ impl ChildTransport {
     pub fn wait(mut self) -> io::Result<std::process::ExitStatus> {
         self.finish_input();
         let status = self.child.wait()?;
-        if let Some(handle) = self.stderr.take() {
-            match handle.join() {
-                Ok(result) => {
-                    let _ = result?;
-                }
-                Err(_) => return Err(io::Error::other("stderr drain thread panicked")),
-            }
-        }
+        let _ = self.join_stderr_io()?;
         Ok(status)
     }
 
     pub fn wait_with_diagnostics(mut self) -> Result<ChildProcessReport, ProcessTransportError> {
         self.finish_input();
         let status = self.child.wait()?;
-        let stderr = match self.stderr.take() {
-            Some(handle) => handle
-                .join()
-                .map_err(|_| ProcessTransportError::StderrDrainPanicked)??,
-            None => Vec::new(),
-        };
+        let stderr = self.join_stderr()?;
 
-        Ok(ChildProcessReport { status, stderr })
+        Ok(ChildProcessReport {
+            status,
+            stderr,
+            timed_out: false,
+        })
+    }
+
+    pub fn wait_with_diagnostics_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<ChildProcessReport, ProcessTransportError> {
+        self.finish_input();
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                let stderr = self.join_stderr()?;
+                return Ok(ChildProcessReport {
+                    status,
+                    stderr,
+                    timed_out: false,
+                });
+            }
+
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let status = self.child.wait()?;
+                let stderr = self.join_stderr()?;
+                return Ok(ChildProcessReport {
+                    status,
+                    stderr,
+                    timed_out: true,
+                });
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(std::cmp::min(remaining, Duration::from_millis(10)));
+        }
+    }
+
+    fn join_stderr(&mut self) -> Result<Vec<u8>, ProcessTransportError> {
+        match self.stderr.take() {
+            Some(handle) => Ok(handle
+                .join()
+                .map_err(|_| ProcessTransportError::StderrDrainPanicked)??),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn join_stderr_io(&mut self) -> io::Result<Vec<u8>> {
+        match self.stderr.take() {
+            Some(handle) => match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::other("stderr drain thread panicked")),
+            },
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+impl Drop for ChildTransport {
+    fn drop(&mut self) {
+        self.stdin.take();
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if let Some(handle) = self.stderr.take() {
+            let _ = handle.join();
+        }
     }
 }
 

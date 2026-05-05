@@ -7,4 +7,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+socket2.workspace = true
 thiserror.workspace = true

@@ -6,7 +6,7 @@
 
 **Architecture:** Extend the portable filesystem write abstraction first, then route local sync and remote pull receiver writes through the same implementation. Pass only receiver-relevant options to remote rsync on push, and keep protocol-dependent or metadata-dependent options rejected with explicit diagnostics.
 
-**Tech Stack:** Rust std filesystem APIs, existing `rsync-fs` sync planner, existing `rsync-cli` protocol 31 remote-shell path, upstream rsync 3.2.7 SSH interop fixture.
+**Tech Stack:** Rust std filesystem APIs, existing `rsync-fs` sync planner, existing `rsync-cli` protocol 31 remote-shell path, upstream rsync SSH interop fixture.
 
 ---
 

@@ -7,4 +7,4 @@ pub use files_from::{
     parse_files_from_bytes, FilesFromError, FilesFromPathError,
 };
 pub use matcher::{glob_matches, normalize_filter_path, EntryKind, MatchDecision, RuleSet};
-pub use rule::{ParseRuleError, Pattern, Rule, RuleAction};
+pub use rule::{ParseRuleError, Pattern, Rule, RuleAction, RuleSide};

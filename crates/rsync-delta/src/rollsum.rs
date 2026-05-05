@@ -7,12 +7,12 @@ pub struct RollingChecksum {
 
 impl RollingChecksum {
     pub fn from_block(block: &[u8]) -> Self {
-        let mut a = 0_u32;
-        let mut b = 0_u32;
+        let mut a = 0_i64;
+        let mut b = 0_i64;
 
         for byte in block {
-            a = (a + u32::from(*byte)) & 0xffff;
-            b = (b + a) & 0xffff;
+            a = i64::from(mod_u16(a + signed_byte(*byte)));
+            b = i64::from(mod_u16(b + a));
         }
 
         Self {
@@ -25,8 +25,10 @@ impl RollingChecksum {
     pub fn roll(&mut self, outgoing: u8, incoming: u8) {
         assert!(self.len > 0, "cannot roll an empty checksum window");
 
-        let a = mod_u16(i64::from(self.a) - i64::from(outgoing) + i64::from(incoming));
-        let b = mod_u16(i64::from(self.b) - (self.len as i64 * i64::from(outgoing)) + i64::from(a));
+        let outgoing = signed_byte(outgoing);
+        let incoming = signed_byte(incoming);
+        let a = mod_u16(i64::from(self.a) - outgoing + incoming);
+        let b = mod_u16(i64::from(self.b) - (self.len as i64 * outgoing) + i64::from(a));
 
         self.a = a;
         self.b = b;
@@ -53,6 +55,10 @@ fn mod_u16(value: i64) -> u16 {
     value.rem_euclid(65_536) as u16
 }
 
+fn signed_byte(byte: u8) -> i64 {
+    i64::from(byte as i8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +68,14 @@ mod tests {
         let checksum = rolling_checksum(b"abc");
         let a = u32::from(b'a') + u32::from(b'b') + u32::from(b'c');
         let b = u32::from(b'a') + (u32::from(b'a') + u32::from(b'b')) + a;
+        assert_eq!(checksum, (b << 16) | a);
+    }
+
+    #[test]
+    fn matches_rsync_signed_byte_checksum_for_binary_data() {
+        let checksum = rolling_checksum(&[0x80, 0xff, 0x01]);
+        let a = 65_408_u32;
+        let b = 65_151_u32;
         assert_eq!(checksum, (b << 16) | a);
     }
 

@@ -1,15 +1,30 @@
+pub mod daemon;
 pub mod flist;
 pub mod io;
 pub mod session;
 pub mod version;
 
+pub use daemon::{
+    authenticate_daemon_module, daemon_auth_response, daemon_auth_response_matches,
+    exchange_daemon_greeting, request_module_list, select_daemon_module,
+    select_no_auth_daemon_module, write_daemon_args, DaemonAuthChecksum, DaemonError,
+    DaemonGreeting, DaemonModule, DaemonModuleList, DaemonModuleSelection, DaemonOperand,
+    DEFAULT_DAEMON_PORT,
+};
 pub use flist::{
-    read_file_list, read_internal_file_list, read_rsync27_file_list,
-    read_rsync27_file_list_with_options, read_rsync31_file_list,
+    check_rsync_file_list_budget, estimated_rsync_file_list_entry_alloc, read_file_list,
+    read_internal_file_list, read_rsync27_file_list, read_rsync27_file_list_with_options,
+    read_rsync31_file_list, read_rsync31_file_list_batch,
+    read_rsync31_file_list_batch_with_metadata, read_rsync31_file_list_with_metadata,
     read_rsync31_file_list_with_options, read_rsync_long, write_file_list,
     write_internal_file_list, write_rsync27_file_list, write_rsync27_file_list_with_options,
-    write_rsync31_file_list, write_rsync31_file_list_with_options, write_rsync_long, FileListEntry,
-    FileListError, RsyncFileListEntry, WireFileType, RSYNC_DIRECTORY_MODE, RSYNC_REGULAR_FILE_MODE,
+    write_rsync31_file_list, write_rsync31_file_list_batch,
+    write_rsync31_file_list_batch_with_metadata, write_rsync31_file_list_with_metadata,
+    write_rsync31_file_list_with_options, write_rsync_long, AllocationBudget, FileListBatch,
+    FileListBatchBuilder, FileListEntry, FileListError, Rsync27FileListWriter,
+    Rsync31FileListWriter, RsyncFileListEntry, RsyncFileListMetadata, RsyncFileListOptions,
+    RsyncHardLinkGroup, RsyncXattrPayload, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
+    DEFAULT_MAX_FILE_LIST_PATH_LEN, RSYNC_DIRECTORY_MODE, RSYNC_REGULAR_FILE_MODE,
     RSYNC_SYMLINK_MODE,
 };
 pub use io::{
@@ -18,16 +33,23 @@ pub use io::{
     RSYNC_INDEX_DONE, RSYNC_INDEX_FLIST_EOF, RSYNC_INDEX_FLIST_OFFSET,
 };
 pub use session::{
-    build_remote_shell_argv, build_remote_shell_argv_for_paths, build_remote_shell_protocol31_argv,
-    build_remote_shell_protocol31_argv_for_paths, build_ssh_remote_command,
-    exchange_remote_shell_handshake, exchange_remote_shell_mvp_handshake,
-    exchange_remote_shell_protocol31_handshake, read_multiplexed_i32, read_multiplexed_long,
-    rsync_plain_md4_checksum, rsync_plain_md4_checksum_reader, rsync_whole_file_checksum,
-    rsync_whole_file_checksum_reader, validate_protocol_stream_prefix, write_multiplex_data_frame,
-    write_rsync_i32, write_rsync_long_value, MultiplexReadState, MultiplexedReader,
-    MultiplexedWriter, RemoteSessionError, RemoteShellHandshake, RemoteShellOperand,
-    RemoteShellOptions, RsyncMd4Checksum, SessionError, TransferDirection,
-    REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL,
+    build_remote_shell_argv, build_remote_shell_argv_for_paths,
+    build_remote_shell_invocation_for_paths, build_remote_shell_protocol31_argv,
+    build_remote_shell_protocol31_argv_for_paths,
+    build_remote_shell_protocol31_invocation_for_paths, build_ssh_remote_command,
+    exchange_protocol31_sender_setup_with_options, exchange_protocol31_setup,
+    exchange_protocol31_setup_with_options, exchange_remote_shell_handshake,
+    exchange_remote_shell_mvp_handshake, exchange_remote_shell_protocol31_handshake,
+    exchange_remote_shell_protocol31_handshake_with_options, read_multiplexed_i32,
+    read_multiplexed_long, rsync_plain_md4_checksum, rsync_plain_md4_checksum_reader,
+    rsync_whole_file_checksum, rsync_whole_file_checksum_reader, validate_protocol_stream_prefix,
+    write_multiplex_data_frame, write_remote_shell_protected_args, write_rsync_i32,
+    write_rsync_long_value, CompressionAlgorithm, CompressionConfig, MultiplexReadState,
+    MultiplexedReader, MultiplexedWriter, NegotiatedCompression, Protocol31SetupOptions,
+    RemoteDeleteMode, RemoteSessionError, RemoteShellHandshake, RemoteShellInvocation,
+    RemoteShellOperand, RemoteShellOptions, RsyncDeflatedToken, RsyncDeflatedTokenMode,
+    RsyncDeflatedTokenReader, RsyncDeflatedTokenWriter, RsyncMd4Checksum, SessionError,
+    TransferDirection, REMOTE_SHELL_MODERN_PROTOCOL, REMOTE_SHELL_MVP_PROTOCOL,
 };
 pub use version::{
     negotiate_protocol_version, negotiate_protocol_version_with_local, ProtocolVersion,

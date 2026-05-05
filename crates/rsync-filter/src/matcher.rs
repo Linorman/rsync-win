@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::rule::{Rule, RuleAction};
+use crate::rule::{Rule, RuleAction, RuleSide};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -31,7 +31,7 @@ impl MatchDecision {
     }
 
     pub fn is_included(&self) -> bool {
-        matches!(self.action, RuleAction::Include | RuleAction::Risk)
+        !matches!(self.action, RuleAction::Exclude | RuleAction::Hide)
     }
 }
 
@@ -50,6 +50,10 @@ impl RuleSet {
     }
 
     pub fn push(&mut self, rule: Rule) {
+        if rule.action() == RuleAction::ClearList {
+            self.rules.clear();
+            return;
+        }
         self.rules.push(rule);
     }
 
@@ -59,6 +63,9 @@ impl RuleSet {
 
     pub fn decide(&self, path: &str, kind: EntryKind) -> MatchDecision {
         for (index, rule) in self.rules.iter().enumerate() {
+            if is_merge_directive(rule.action()) {
+                continue;
+            }
             if rule.matches(path, kind) {
                 return MatchDecision::new(rule.action(), Some(index));
             }
@@ -70,6 +77,27 @@ impl RuleSet {
     pub fn is_included(&self, path: &str, kind: EntryKind) -> bool {
         self.decide(path, kind).is_included()
     }
+
+    pub fn decide_for_side(&self, path: &str, kind: EntryKind, side: RuleSide) -> MatchDecision {
+        for (index, rule) in self.rules.iter().enumerate() {
+            if is_merge_directive(rule.action()) {
+                continue;
+            }
+            if rule.applies_to(side) && rule.matches(path, kind) {
+                return MatchDecision::new(rule.action(), Some(index));
+            }
+        }
+
+        MatchDecision::new(RuleAction::Include, None)
+    }
+
+    pub fn is_included_for_side(&self, path: &str, kind: EntryKind, side: RuleSide) -> bool {
+        self.decide_for_side(path, kind, side).is_included()
+    }
+}
+
+fn is_merge_directive(action: RuleAction) -> bool {
+    matches!(action, RuleAction::Merge | RuleAction::DirMerge)
 }
 
 pub fn normalize_filter_path(path: &str) -> String {
@@ -297,6 +325,42 @@ mod tests {
     }
 
     #[test]
+    fn upstream_include_only_c_sources_example_keeps_directories() {
+        let rules = RuleSet::new(vec![
+            Rule::parse_filter("+ */").unwrap(),
+            Rule::parse_filter("+ *.c").unwrap(),
+            Rule::parse_filter("- *").unwrap(),
+        ]);
+
+        assert!(rules.is_included("src", EntryKind::Directory));
+        assert!(rules.is_included("src/main.c", EntryKind::File));
+        assert!(!rules.is_included("src/main.o", EntryKind::File));
+        assert!(!rules.is_included("README.md", EntryKind::File));
+    }
+
+    #[test]
+    fn upstream_hide_and_protect_examples_are_side_specific() {
+        let rules = RuleSet::new(vec![
+            Rule::parse_filter("hide *.o").unwrap(),
+            Rule::parse_filter("protect *.bak").unwrap(),
+        ]);
+
+        assert_eq!(
+            rules
+                .decide_for_side("build/main.o", EntryKind::File, RuleSide::Sender)
+                .action(),
+            RuleAction::Hide
+        );
+        assert_eq!(
+            rules
+                .decide_for_side("archive/old.bak", EntryKind::File, RuleSide::Receiver)
+                .action(),
+            RuleAction::Protect
+        );
+        assert!(rules.is_included_for_side("archive/old.bak", EntryKind::File, RuleSide::Sender));
+    }
+
+    #[test]
     fn rule_set_exposes_delete_protection_actions() {
         let rules = RuleSet::new(vec![
             Rule::protect("*.bak").unwrap(),
@@ -307,6 +371,7 @@ mod tests {
             rules.decide("archive/old.bak", EntryKind::File).action(),
             RuleAction::Protect
         );
+        assert!(rules.is_included("archive/old.bak", EntryKind::File));
         assert_eq!(
             rules.decide("scratch/tmp.bin", EntryKind::File).action(),
             RuleAction::Risk
@@ -318,5 +383,33 @@ mod tests {
         let rules = RuleSet::new(vec![Rule::exclude("/src/*.obj").unwrap()]);
 
         assert!(!rules.is_included("src\\main.obj", EntryKind::File));
+    }
+
+    #[test]
+    fn rule_set_honors_sender_receiver_side_modifiers_and_clear_list() {
+        let mut rules = RuleSet::empty();
+        rules.push(Rule::parse_filter("-s *.obj").unwrap());
+        rules.push(Rule::parse_filter("-r *.bak").unwrap());
+        rules.push(Rule::parse_filter("!").unwrap());
+        rules.push(Rule::parse_filter("+ keep/***").unwrap());
+        rules.push(Rule::parse_filter("- *").unwrap());
+
+        assert!(!rules.is_included_for_side("main.obj", EntryKind::File, RuleSide::Sender));
+        assert!(!rules.is_included_for_side("main.bak", EntryKind::File, RuleSide::Receiver));
+        assert!(rules.is_included_for_side(
+            "keep/nested/file.txt",
+            EntryKind::File,
+            RuleSide::Sender
+        ));
+        assert!(!rules.is_included_for_side("drop.txt", EntryKind::File, RuleSide::Sender));
+    }
+
+    #[test]
+    fn trailing_triple_star_matches_directory_and_descendants() {
+        let rule = Rule::include("vendor/***").unwrap();
+
+        assert!(rule.matches("vendor", EntryKind::Directory));
+        assert!(rule.matches("vendor/lib.rs", EntryKind::File));
+        assert!(rule.matches("nested/vendor/lib.rs", EntryKind::File));
     }
 }

@@ -13,7 +13,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+digest = "0.10"
+md-5 = "0.10"
 rsync-core = { path = "../rsync-core" }
+rsync-delta = { path = "../rsync-delta" }
 rsync-filter = { path = "../rsync-filter" }
 rsync-fs = { path = "../rsync-fs" }
 rsync-protocol = { path = "../rsync-protocol" }
@@ -26,3 +29,35 @@ embed-manifest = "=1.4.0"
 [[test]]
 name = "interop_discovery"
 path = "../../tests/interop/rsync_discovery.rs"
+
+[[test]]
+name = "daemon"
+path = "../../tests/interop/daemon.rs"
+
+[[test]]
+name = "rsync_compat"
+path = "../../tests/interop/rsync_compat.rs"
+
+[[test]]
+name = "options"
+path = "../../tests/compat/options.rs"
+
+[[test]]
+name = "release_readiness"
+path = "../../tests/compat/release_readiness.rs"
+
+[[test]]
+name = "security_remote_peer"
+path = "../../tests/security/remote_peer.rs"
+
+[[test]]
+name = "large_file"
+path = "../../tests/stress/large_file.rs"
+
+[[test]]
+name = "large_tree"
+path = "../../tests/stress/large_tree.rs"
+
+[[bench]]
+name = "remote_protocol"
+harness = false

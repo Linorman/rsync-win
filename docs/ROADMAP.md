@@ -160,9 +160,9 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 - Unsupported `-a` components on Windows are reported, not ignored silently.
 - Delete behavior respects filter protection rules.
 
-## Phase 6: Daemon Client Mode
+## Phase 6: Daemon Client and Minimal Daemon Server Mode
 
-**Goal:** Support `host::module` and `rsync://host/module` as a client.
+**Goal:** Support `host::module` and `rsync://host/module` as a client, plus a controlled minimal daemon server for tested module workflows.
 
 **Scope:**
 
@@ -174,6 +174,7 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 - No-auth transfer first.
 - Password-file auth second, with explicit warning that daemon auth is not transport encryption.
 - Timeout and MOTD handling.
+- Minimal daemon server module listing, ordinary-file pull, writable-module push, safe module path validation, socket controls, logging, and bandwidth limiting.
 
 **Deliverables:**
 
@@ -185,6 +186,7 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 - Module listing works.
 - Pull from no-auth daemon module works.
 - Push to writable daemon module works in a controlled test.
+- Local daemon server listing, pull, push, read-only rejection, socket options, formatted logging, and bandwidth-limit plumbing are covered by tests.
 - Auth failures and protocol mismatches produce rsync-like errors.
 
 ## Phase 7: POSIX Metadata Expansion
@@ -210,7 +212,7 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 
 - CLI accepts and reports POSIX metadata requests: `-p/--perms`, `-o/--owner`, `-g/--group`, `--executability`, `--acls`, `--xattrs`, `--fake-super`, `--omit-link-times`, `--numeric-ids`, and `--chmod`.
 - Remote-shell sender file lists carry POSIX mode-like bits, including Windows executable-name inference for `--executability`.
-- Owner/group, ACL, xattr, fake-super, and symlink mtime behavior is explicitly reported as applied/stored/degraded/ignored/rejected instead of silently approximated.
+- Owner/group, ACL, xattr, fake-super, and symlink mtime behavior is explicitly reported instead of silently approximated; POSIX ACL/xattr/fake-super payload storage is not release-grade yet.
 
 **Exit Criteria:**
 
@@ -247,7 +249,7 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 
 **Exit Criteria:**
 
-- Windows-to-Windows `ntfs-native` sync preserves selected NTFS metadata in documented cases.
+- Windows-to-Windows `ntfs-native` sync stores and restores selected NTFS metadata in documented cases.
 - VSS mode can read locked/open files from a snapshot in a controlled test.
 - Cross-platform transfers keep `ntfs-native` metadata disabled unless explicitly requested.
 
@@ -258,7 +260,7 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 **Scope:**
 
 - Streaming large files without high memory usage.
-- Incremental recursion or memory-bounded file-list handling.
+- Cross-mode incremental recursion or memory-bounded file-list handling; protocol 31 remote pull now handles upstream incremental file-list markers, while remote push remains non-incremental.
 - Multiplexed message handling robustness.
 - Checksum/compression negotiation hardening.
 - Path traversal and malicious peer defenses.
@@ -277,11 +279,15 @@ This roadmap breaks the greenfield Windows-native rsync project into delivery ph
 
 - Local file copy, append, checksum comparison, prefix comparison, and remote whole-file token IO stream through bounded buffers.
 - Remote pull validates all received file-list paths before filtering or writing, rejects destination escapes and Windows-invalid paths, and rejects literal token streams that exceed or undershoot the advertised file length.
-- Remote file-list readers enforce entry-count and path-length limits; full incremental recursion remains future work.
+- Protocol file-list readers now reject parent escapes, absolute paths, Windows prefixes, reserved names, invalid characters, and trailing dot/space components before entries reach destination planning.
+- Remote file-list readers enforce entry-count and path-length limits; protocol 31 remote pull handles upstream incremental file-list batches, while full cross-mode incremental recursion remains future work.
+- Daemon client and minimal daemon server paths cover module listing, ordinary-file pull/push, daemon client connection controls, proxy/connect-program support, formatted daemon logs, socket options, and daemon-server bandwidth limiting in tested paths.
 - Progress logging, concise summaries, itemized changes, and structured stats are available through existing CLI output.
-- `scripts/package-release.ps1` produces the Windows x64 release zip and SHA-256 checksum used by the GitHub release workflow.
+- `tests/security/remote_peer.rs` covers remote peer path, multiplex, and malformed length regressions as a dedicated security gate.
+- `tests/interop/rsync_compat.rs` provides a gated upstream rsync matrix for SSH, optional peer probes, and daemon listing.
+- `scripts/package-release.ps1` produces the Windows x64 release zip and SHA-256 checksum used by the GitHub release workflow; staged package smoke checks cover `--version`, `--help`, disposable local sync, local delete/filter smoke, and optional SSH/daemon fixture smokes.
 - `cargo bench -p rsync-fs --bench local_sync` provides a small local recursive sync benchmark.
-- `docs/COMPATIBILITY.md` documents Linux rsync, Homebrew/macOS rsync, macOS stock/openrsync, daemon mode, metadata modes, and hardening status.
+- `docs/COMPATIBILITY.md` and `docs/OPTION-STATUS.md` document Linux rsync, Homebrew/macOS rsync, macOS stock/openrsync, daemon mode, metadata modes, hardening status, and current option classifications.
 
 **Exit Criteria:**
 
