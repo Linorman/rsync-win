@@ -22,9 +22,9 @@ This matrix describes the current development build behavior. It is intentionall
 | `ntfs-native` | Narrow local restore path | Writes a parseable sidecar with security descriptor SDDL/hash summaries, alternate stream summaries, Windows attributes, sparse/reparse status, identity fields, and VSS request status. Local Windows syncs restore creation time, the tested readonly/hidden/archive/system attribute subset, named alternate data stream payloads, security descriptors when `--super` is explicit and permissions allow it, and sparse allocated ranges when `--sparse` is explicit. Arbitrary non-symlink reparse restore and cross-platform NTFS restore are rejected or degraded. |
 | VSS snapshot mode | Explicit local source snapshot path | `--vss` is accepted only with `--metadata-policy=ntfs-native` for local Windows syncs. The executor creates a runtime VSS snapshot per source root, reads file data from the snapshot path, and deletes the shadow copy when the transfer finishes. Snapshot creation failures stop before mutation with a diagnostic. |
 
-## Release Candidate Support Matrix
+## Release Support Matrix
 
-| Dimension | Frozen support for `v0.2.0-rc1` |
+| Dimension | Frozen support for `v0.2.0` |
 | --- | --- |
 | Windows versions | Windows 10, Windows 11, and Windows Server with the MSVC Rust toolchain. |
 | Filesystems | NTFS is the primary target; ReFS and SMB shares are best-effort for ordinary-file workflows and should be smoke-tested before production use. |

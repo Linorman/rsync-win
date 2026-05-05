@@ -36,4 +36,4 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Package smoke test
         shell: pwsh
-        run: .\scripts\package-release.ps1 -Tag v0.2.0-rc1
+        run: .\scripts\package-release.ps1 -Tag v0.2.0

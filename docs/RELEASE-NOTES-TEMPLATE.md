@@ -1,6 +1,6 @@
 # rsync-win {{TAG}}
 
-Windows x64 prebuilt executable for the native Rust rsync-win production-readiness release candidate.
+Windows x64 prebuilt executable for the native Rust rsync-win production-readiness release.
 
 ## Capability Status
 
