@@ -304,11 +304,11 @@ git commit -m "feat: enforce transfer memory budgets"
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: `tests/stress/large_tree.rs`
 
-- [ ] **Step 1: Write protocol batch tests**
+- [x] **Step 1: Write protocol batch tests**
 
 Add tests that encode/decode multiple file-list batches and preserve directory ordering.
 
-- [ ] **Step 2: Add internal batch representation**
+- [x] **Step 2: Add internal batch representation**
 
 Represent remote file-list batches as:
 
@@ -320,11 +320,11 @@ struct FileListBatch {
 }
 ```
 
-- [ ] **Step 3: Route local walker into batches**
+- [x] **Step 3: Route local walker into batches**
 
 Emit batches from local traversal instead of requiring a complete tree before transfer.
 
-- [ ] **Step 4: Verify against synthetic large tree**
+- [x] **Step 4: Verify against synthetic large tree**
 
 Run:
 
@@ -334,7 +334,7 @@ cargo test -p rsync-cli --test large_tree --all-features -- --nocapture
 
 Expected: PASS for a tree over 100,000 entries without increasing memory linearly beyond the configured window.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-protocol/src/flist.rs crates/rsync-protocol/src/session.rs crates/rsync-cli/src/lib.rs tests/stress/large_tree.rs
@@ -348,19 +348,19 @@ git commit -m "feat: send incremental file-list batches"
 - Modify: `crates/rsync-fs/src/sync.rs`
 - Test: `tests/stress/large_tree.rs`
 
-- [ ] **Step 1: Add delete timing tests with batches**
+- [x] **Step 1: Add delete timing tests with batches**
 
 Cover `--delete-before`, `--delete-during`, `--delete-delay`, `--delete-after`, and protected filter behavior when file-list entries arrive incrementally.
 
-- [ ] **Step 2: Add receiver state machine**
+- [x] **Step 2: Add receiver state machine**
 
 Track pending directories, pending deletes, and completed file indexes without requiring all entries at once.
 
-- [ ] **Step 3: Preserve destination safety**
+- [x] **Step 3: Preserve destination safety**
 
 Keep path validation, case collision checks, Unicode normalization checks, and destination escape checks before writes.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -371,7 +371,7 @@ cargo test --workspace --all-features
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/lib.rs crates/rsync-fs/src/sync.rs tests/stress/large_tree.rs
