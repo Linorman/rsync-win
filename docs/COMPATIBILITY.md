@@ -24,7 +24,7 @@ This matrix describes the current development build behavior. It is intentionall
 
 ## Release Support Matrix
 
-| Dimension | Frozen support for `v0.2.0` |
+| Dimension | Frozen support for `v0.2.1` |
 | --- | --- |
 | Windows versions | Windows 10, Windows 11, and Windows Server with the MSVC Rust toolchain. |
 | Filesystems | NTFS is the primary target; ReFS and SMB shares are best-effort for ordinary-file workflows and should be smoke-tested before production use. |

@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "rsync-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -315,14 +315,14 @@ dependencies = [
 
 [[package]]
 name = "rsync-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "rsync-delta"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "digest",
  "md-5",
@@ -332,11 +332,11 @@ dependencies = [
 
 [[package]]
 name = "rsync-filter"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "rsync-fs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "filetime",
  "rsync-core",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "rsync-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "digest",
  "flate2",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "rsync-transport"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "socket2",
  "thiserror",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "rsync-winfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rsync-fs",
  "thiserror",
