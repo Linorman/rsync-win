@@ -70,20 +70,20 @@ This matrix describes the current development build behavior. It is intentionall
 
 ## Benchmark Baseline
 
-Measured on 2026-05-05 with `RSYNC_WIN_BENCH_ITERS=1` on the current Windows workspace. These are development-machine numbers, not release promises.
+Measured on 2026-05-17 with `RSYNC_WIN_BENCH_ITERS=1` on the current Windows workspace. These are development-machine numbers, not release promises.
 
 | Benchmark | Scenario | Elapsed |
 | --- | --- | --- |
-| `local_sync` | 10,000 small files, 5.12 MB copied | 15.201 s |
-| `local_sync` | 100,000 empty files | 150.017 s |
-| `local_sync` | 1 GiB ordinary file | 0.540 s |
-| `local_sync` | small edits in 64 MiB large file | 0.061 s |
-| `local_sync` | 10,000 files with 1,024 filter rules | 24.674 s |
-| `local_sync` | delete-heavy receiver tree with 10,000 stale files | 5.248 s |
+| `local_sync` | 10,000 small files, 5.12 MB copied | 14.162 s |
+| `local_sync` | 100,000 empty files | 135.907 s |
+| `local_sync` | 1 GiB ordinary file | 0.632 s |
+| `local_sync` | small edits in 64 MiB large file | 0.098 s |
+| `local_sync` | 10,000 files with 1,024 filter rules | 22.465 s |
+| `local_sync` | delete-heavy receiver tree with 10,000 stale files | 4.888 s |
 | `remote_protocol` | protocol 31 file list for 10,000 small files | 0.006 s |
-| `remote_protocol` | protocol 31 file list for 100,000 empty files | 0.066 s |
-| `remote_protocol` | 1 GiB literal token stream to sink | 0.095 s |
-| `remote_protocol` | small-edit delta over 16 MiB buffer | 0.300 s |
+| `remote_protocol` | protocol 31 file list for 100,000 empty files | 0.062 s |
+| `remote_protocol` | 1 GiB literal token stream to sink | 0.099 s |
+| `remote_protocol` | small-edit delta over 16 MiB buffer | 0.297 s |
 
 ## Option Status
 
