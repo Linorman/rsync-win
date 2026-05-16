@@ -1,7 +1,5 @@
 use anyhow::Result;
 use clap::CommandFactory;
-#[cfg(test)]
-use clap::Parser;
 use rsync_core::MetadataPolicy;
 use rsync_protocol::{
     TransferDirection, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, REMOTE_SHELL_MODERN_PROTOCOL,
@@ -10,35 +8,12 @@ use rsync_protocol::{
 
 use crate::cli::Cli;
 use crate::execute::daemon_client::execute_daemon_sync;
-#[cfg(test)]
-pub(crate) use crate::execute::daemon_client::{
-    daemon_auth_user, daemon_auth_user_from_vars, daemon_password_from_vars,
-    execute_daemon_sync_with_transport, read_password_file,
-};
-#[cfg(test)]
-pub(crate) use crate::execute::local::ntfs_sidecar_root;
 use crate::execute::local::{
     execute_local_sync, execute_local_sync_with_batch, execute_read_batch,
 };
 use crate::execute::remote_shell::execute_remote_shell_sync;
-#[cfg(test)]
-pub(crate) use crate::execute::remote_shell::{
-    protocol31_setup_error, should_fallback_to_protocol27,
-};
 use crate::format::*;
 use crate::plan::*;
-#[cfg(test)]
-pub(crate) use crate::remote::pull::execute_remote_pull;
-#[cfg(test)]
-pub(crate) use crate::remote::push::execute_remote_push;
-pub(crate) use crate::remote::receive::{
-    checked_file_index, delete_local_extras, read_multiplexed_rsync31_index,
-    receive_remote_sender_files_protocol31, remote_entry_is_top_dir, remote_file_index_offset,
-    request_remote_sender_files_protocol31, selected_remote_entries, selected_remote_entry_indexes,
-    selected_remote_transfer_indexes, sort_remote_entries_for_sender_indexes,
-    validate_remote_file_list_paths, windows_destination_path_preflight, write_rsync31_done,
-    write_rsync31_index, RemoteReceiveContext,
-};
 use crate::{daemon_server, options};
 pub fn run_from_env() -> Result<()> {
     let cli = options::parse_cli(std::env::args_os())?;

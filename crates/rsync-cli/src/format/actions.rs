@@ -1,36 +1,5 @@
-use std::path::Path;
-use std::time::Duration;
-
-use anyhow::Result;
-use rsync_core::{MetadataFeature, Report, Severity};
-use rsync_fs::{DeleteMode, FileWriteMode, SymlinkMode, SyncAction, UpdateMode};
-use rsync_protocol::WireFileType;
-
-use crate::cli::Cli;
-use crate::output;
-use crate::remote::flist::RemoteSourceEntry;
-use crate::ProgressLog;
-pub(crate) fn format_bytes(bytes: u64) -> String {
-    output::format_bytes_human(bytes)
-}
-
-pub(crate) fn transfer_rate_label(bytes: u64, elapsed: Duration) -> String {
-    output::transfer_rate_label(bytes, elapsed)
-}
-
-pub(crate) fn append_diagnostics(output: &mut String, report: &Report) {
-    for diagnostic in report.diagnostics() {
-        output.push_str(&format!(
-            "- [{}] {}: {}\n",
-            severity_label(diagnostic.severity()),
-            diagnostic.code(),
-            diagnostic.message()
-        ));
-        if let Some(hint) = diagnostic.hint() {
-            output.push_str(&format!("  hint: {hint}\n"));
-        }
-    }
-}
+use super::names::{format_bytes, output_name};
+use super::prelude::*;
 
 pub(crate) fn append_action_report(output: &mut String, cli: &Cli, actions: &[SyncAction]) {
     append_compact_action_summary(output, actions);
@@ -257,14 +226,6 @@ pub(crate) fn primary_action_path(action: &SyncAction) -> &Path {
         SyncAction::BackupFile { from, .. } => from,
         SyncAction::CreateHardLink { to, .. } => to,
     }
-}
-
-pub(crate) fn output_name(path: &Path, eight_bit_output: bool) -> String {
-    let display_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    output::escape_output_name(&display_name, eight_bit_output)
 }
 
 pub(crate) fn action_len(action: &SyncAction) -> u64 {
@@ -608,51 +569,5 @@ pub(crate) fn metadata_code(feature: MetadataFeature, severity: Severity) -> &'s
         (_, MetadataFeature::Symlink) => "W_METADATA_SYMLINK",
         (_, MetadataFeature::Permissions) => "W_METADATA_PERMISSIONS",
         _ => "W_METADATA_LOSS",
-    }
-}
-
-pub(crate) fn severity_label(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Info => "info",
-        Severity::Warning => "warning",
-        Severity::Error => "error",
-    }
-}
-
-pub(crate) fn update_mode_label(mode: UpdateMode) -> &'static str {
-    match mode {
-        UpdateMode::QuickCheck => "quick-check",
-        UpdateMode::Checksum => "checksum",
-        UpdateMode::SizeOnly => "size-only",
-        UpdateMode::IgnoreTimes => "ignore-times",
-    }
-}
-
-pub(crate) fn delete_mode_label(mode: DeleteMode) -> &'static str {
-    match mode {
-        DeleteMode::None => "none",
-        DeleteMode::Before => "before",
-        DeleteMode::During => "during",
-        DeleteMode::Delay => "delay",
-        DeleteMode::After => "after",
-    }
-}
-
-pub(crate) fn file_write_mode_label(mode: FileWriteMode) -> &'static str {
-    match mode {
-        FileWriteMode::Atomic => "atomic",
-        FileWriteMode::InPlace => "inplace",
-    }
-}
-
-pub(crate) fn symlink_mode_label(mode: SymlinkMode) -> &'static str {
-    match mode {
-        SymlinkMode::Skip => "skip",
-        SymlinkMode::Preserve => "preserve",
-        SymlinkMode::CopyAll => "copy-links",
-        SymlinkMode::CopyDirLinks => "copy-dirlinks",
-        SymlinkMode::CopyUnsafe => "copy-unsafe-links",
-        SymlinkMode::SafeOnly => "safe-links",
-        SymlinkMode::Munge => "munge-links",
     }
 }

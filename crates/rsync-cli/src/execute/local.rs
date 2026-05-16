@@ -17,10 +17,12 @@ use rsync_winfs::{
 
 use crate::cli::Cli;
 use crate::format::*;
+use crate::output::ProgressLog;
 use crate::plan::*;
 use crate::remote::flist::*;
-use crate::remote::receive::{system_time_to_unix_nanos, windows_destination_path_preflight};
-use crate::{batch, output, ProgressLog};
+use crate::remote::receive::system_time_to_unix_nanos;
+use crate::remote::security::windows_destination_path_preflight;
+use crate::{batch, output};
 
 pub(crate) fn execute_local_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     let sources = local_source_paths(cli);

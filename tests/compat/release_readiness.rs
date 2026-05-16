@@ -62,13 +62,13 @@ fn release_metadata_is_frozen_in_docs() {
     let lock = read_repo_file("Cargo.lock");
     let normalized_lock = lock.replace("\r\n", "\n");
 
-    assert!(cargo.contains("version = \"0.2.0\""));
+    assert!(cargo.contains("version = \"0.2.1\""));
     assert!(cargo.contains("clap = { version = \">=4.5,<4.6\""));
     assert!(
         normalized_lock.contains("name = \"clap_lex\"\nversion = \"1.0.0\""),
         "Cargo.lock should keep clap_lex on a Cargo 1.76-compatible release"
     );
-    assert!(readme.contains("v0.2.0"));
+    assert!(readme.contains("v0.2.1"));
     assert!(compatibility.contains("Windows 10"));
     assert!(compatibility.contains("Windows 11"));
     assert!(compatibility.contains("Windows Server"));

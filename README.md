@@ -5,11 +5,11 @@
 
 `rsync-win` is a native Windows rsync-style command line application written in Rust. It aims to provide useful local sync and remote-shell interoperability without requiring a Cygwin/MSYS POSIX runtime.
 
-This is a production-readiness release. Version `v0.2.0` maps to Cargo package version `0.2.0` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, POSIX metadata request reporting, and a narrow NTFS-native sidecar restore path.
+This is a production-readiness release. Version `v0.2.1` maps to Cargo package version `0.2.1` and focuses on ordinary files, directories, explicit metadata degradation, remote-shell push/pull interoperability, streaming file data, POSIX metadata request reporting, and a narrow NTFS-native sidecar restore path.
 
 ## Status
 
-| Area | v0.2.0 status |
+| Area | v0.2.1 status |
 | --- | --- |
 | Local Windows sync | Implemented for the tested ordinary-file and directory subset, including multiple source operands. |
 | Recursion and mtimes | `-r`, `-t`, and `-a` planning are available for ordinary-file workflows, with unsupported archive metadata and symlink mtime limitations reported. |
@@ -26,7 +26,7 @@ This is a production-readiness release. Version `v0.2.0` maps to Cargo package v
 
 See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the current peer, metadata, hardening, and release compatibility matrix. The packaged option status table is maintained in [`docs/OPTION-STATUS.md`](docs/OPTION-STATUS.md).
 
-Known not implemented in this development build: advanced `rsyncd.conf` keys beyond the safe module subset, encrypted daemon transport, arbitrary non-symlink reparse restore, and sender-side remote push incremental recursion. Protocol 31 remote pull supports upstream incremental file-list markers, but cross-mode memory-bounded incremental recursion is not complete. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport. VSS reads require explicit `--metadata-policy=ntfs-native --vss` and a Windows environment where VSS snapshot creation is permitted.
+Known not implemented in this development build: advanced `rsyncd.conf` keys beyond the safe module subset, encrypted daemon transport, arbitrary non-symlink reparse restore, and upstream sender-side remote push incremental recursion. Protocol 31 remote pull supports upstream incremental file-list markers, and remote push streams its local file-list encoding in batches while keeping upstream receivers on `--no-inc-recursive`. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport. VSS reads require explicit `--metadata-policy=ntfs-native --vss` and a Windows environment where VSS snapshot creation is permitted.
 
 ## Install
 
@@ -73,7 +73,7 @@ cargo bench -p rsync-cli --bench remote_protocol
 Build a release zip and SHA-256 checksum locally:
 
 ```powershell
-.\scripts\package-release.ps1 -Tag v0.2.0
+.\scripts\package-release.ps1 -Tag v0.2.1
 ```
 
 The package script verifies the staged binary with `--version`, `--help`, a disposable local sync, a local delete/filter smoke, zip layout checks, and checksum generation. When `RSYNC_WIN_SSH_TARGET` is set it also runs a small optional SSH push/pull smoke under `RSYNC_WIN_SSH_TMP_ROOT` or `/tmp` and removes the remote test directory.

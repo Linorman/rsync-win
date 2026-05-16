@@ -14,13 +14,15 @@ use rsync_protocol::{
 };
 
 use crate::cli::Cli;
-use crate::execute::remote_shell::protocol31_setup_error;
 use crate::format::*;
+use crate::output::{self, ProgressLog};
 use crate::plan::*;
 use crate::remote::flist::*;
 use crate::remote::receive::*;
+use crate::remote::security::*;
+use crate::remote::send::*;
+use crate::remote::session::protocol31_setup_error;
 use crate::transfer::*;
-use crate::{output, ProgressLog};
 
 pub(crate) fn execute_remote_pull<T: Read + Write>(
     cli: &Cli,

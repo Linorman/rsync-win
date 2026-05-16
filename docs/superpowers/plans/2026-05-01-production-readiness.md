@@ -85,7 +85,7 @@ Interop, security, and release:
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: existing workspace tests
 
-- [ ] **Step 1: Reproduce clippy failure**
+- [x] **Step 1: Reproduce clippy failure**
 
 Run:
 
@@ -95,7 +95,7 @@ cargo clippy --workspace --all-features -- -D warnings
 
 Expected: FAIL on `clippy::too_many_arguments` for `serve_remote_receiver_requests` and `write_delta_tokens_from_path`.
 
-- [ ] **Step 2: Extract runtime context structs**
+- [x] **Step 2: Extract runtime context structs**
 
 Add small internal structs near the remote execution helpers:
 
@@ -117,7 +117,7 @@ struct DeltaWriteRuntime<'a> {
 
 Replace long parameter lists with these contexts. Keep behavior unchanged.
 
-- [ ] **Step 3: Run targeted compile check**
+- [x] **Step 3: Run targeted compile check**
 
 Run:
 
@@ -127,7 +127,7 @@ cargo check -p rsync-cli --all-features
 
 Expected: PASS.
 
-- [ ] **Step 4: Run full gates**
+- [x] **Step 4: Run full gates**
 
 Run:
 
@@ -139,7 +139,7 @@ cargo test --workspace --all-features
 
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/lib.rs
@@ -153,11 +153,11 @@ git commit -m "refactor: keep remote transfer helpers lint-clean"
 - Modify: `docs/OPTION-STATUS.md`
 - Modify: `tests/compat/options.rs`
 
-- [ ] **Step 1: Add status model test**
+- [x] **Step 1: Add status model test**
 
 Add tests that prove options such as `--iconv`, `--compress-threads`, `--copy-as`, and `--early-input` cannot be marked as fully implemented unless they have verified execution behavior in each applicable mode.
 
-- [ ] **Step 2: Introduce support levels**
+- [x] **Step 2: Introduce support levels**
 
 Use explicit levels in the registry:
 
@@ -173,7 +173,7 @@ enum OptionSupport {
 
 Map old `implemented` entries into the new model conservatively.
 
-- [ ] **Step 3: Regenerate or update docs**
+- [x] **Step 3: Regenerate or update docs**
 
 Update `docs/OPTION-STATUS.md` to separate:
 
@@ -183,7 +183,7 @@ Update `docs/OPTION-STATUS.md` to separate:
 - Parsed for compatibility only
 - Planned
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -193,7 +193,7 @@ cargo test -p rsync-cli --test options --all-features
 
 Expected: PASS, with tests asserting that partial options are not advertised as full upstream compatibility.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/options.rs docs/OPTION-STATUS.md tests/compat/options.rs
@@ -211,7 +211,7 @@ git commit -m "docs: classify rsync options by execution support"
 - Modify: `crates/rsync-delta/src/matcher.rs` if streaming matcher support is needed
 - Test: `tests/stress/large_file.rs`
 
-- [ ] **Step 1: Write failing stress test**
+- [x] **Step 1: Write failing stress test**
 
 Create `tests/stress/large_file.rs` with a test that pushes and pulls a file larger than the configured `--max-alloc` while using `--whole-file` and a second test for non-whole-file delta mode.
 
@@ -223,11 +223,11 @@ cargo test -p rsync-cli --test large_file --all-features -- --nocapture
 
 Expected: FAIL or OOM-risk path identified because `read_local_file_limited` still returns `Vec<u8>` for delta generation.
 
-- [ ] **Step 2: Stream literal token generation**
+- [x] **Step 2: Stream literal token generation**
 
 Keep whole-file literal token writing on `File`/`Read` streams. Ensure `write_literal_tokens_from_reader_with_checksum` enforces `stop_deadline` and bounded buffers.
 
-- [ ] **Step 3: Replace delta full-buffer matching**
+- [x] **Step 3: Replace delta full-buffer matching**
 
 Implement a memory-bounded block matcher path:
 
@@ -236,7 +236,7 @@ Implement a memory-bounded block matcher path:
 - literal spans are flushed incrementally
 - final checksum is updated while scanning
 
-- [ ] **Step 4: Verify max allocation behavior**
+- [x] **Step 4: Verify max allocation behavior**
 
 Run:
 
@@ -247,7 +247,7 @@ cargo test --workspace --all-features
 
 Expected: PASS; large files transfer with memory bounded by buffers and signature table, not full file size.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/lib.rs crates/rsync-delta/src/matcher.rs tests/stress/large_file.rs
@@ -262,19 +262,19 @@ git commit -m "feat: stream remote delta token generation"
 - Modify: `crates/rsync-fs/src/walk.rs`
 - Test: `tests/stress/large_tree.rs`
 
-- [ ] **Step 1: Add tests for `--max-alloc`**
+- [x] **Step 1: Add tests for `--max-alloc`**
 
 Test local copy, remote push, remote pull, file-list receive, and basis checksum paths with a low `--max-alloc`.
 
-- [ ] **Step 2: Add allocation accounting**
+- [x] **Step 2: Add allocation accounting**
 
 Introduce a shared allocation budget helper for file-list entries, path buffers, signature tables, and transfer buffers.
 
-- [ ] **Step 3: Fail early with clear diagnostics**
+- [x] **Step 3: Fail early with clear diagnostics**
 
 Return rsync-like resource errors before mutation when estimated metadata or signature memory exceeds budget.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -285,7 +285,7 @@ cargo test --workspace --all-features
 
 Expected: PASS; tests prove bounded memory and clean preflight failures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/lib.rs crates/rsync-protocol/src/flist.rs crates/rsync-fs/src/walk.rs tests/stress/large_tree.rs
@@ -304,11 +304,11 @@ git commit -m "feat: enforce transfer memory budgets"
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: `tests/stress/large_tree.rs`
 
-- [ ] **Step 1: Write protocol batch tests**
+- [x] **Step 1: Write protocol batch tests**
 
 Add tests that encode/decode multiple file-list batches and preserve directory ordering.
 
-- [ ] **Step 2: Add internal batch representation**
+- [x] **Step 2: Add internal batch representation**
 
 Represent remote file-list batches as:
 
@@ -320,11 +320,11 @@ struct FileListBatch {
 }
 ```
 
-- [ ] **Step 3: Route local walker into batches**
+- [x] **Step 3: Route local walker into batches**
 
 Emit batches from local traversal instead of requiring a complete tree before transfer.
 
-- [ ] **Step 4: Verify against synthetic large tree**
+- [x] **Step 4: Verify against synthetic large tree**
 
 Run:
 
@@ -334,7 +334,7 @@ cargo test -p rsync-cli --test large_tree --all-features -- --nocapture
 
 Expected: PASS for a tree over 100,000 entries without increasing memory linearly beyond the configured window.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-protocol/src/flist.rs crates/rsync-protocol/src/session.rs crates/rsync-cli/src/lib.rs tests/stress/large_tree.rs
@@ -348,19 +348,19 @@ git commit -m "feat: send incremental file-list batches"
 - Modify: `crates/rsync-fs/src/sync.rs`
 - Test: `tests/stress/large_tree.rs`
 
-- [ ] **Step 1: Add delete timing tests with batches**
+- [x] **Step 1: Add delete timing tests with batches**
 
 Cover `--delete-before`, `--delete-during`, `--delete-delay`, `--delete-after`, and protected filter behavior when file-list entries arrive incrementally.
 
-- [ ] **Step 2: Add receiver state machine**
+- [x] **Step 2: Add receiver state machine**
 
 Track pending directories, pending deletes, and completed file indexes without requiring all entries at once.
 
-- [ ] **Step 3: Preserve destination safety**
+- [x] **Step 3: Preserve destination safety**
 
 Keep path validation, case collision checks, Unicode normalization checks, and destination escape checks before writes.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -371,7 +371,7 @@ cargo test --workspace --all-features
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/lib.rs crates/rsync-fs/src/sync.rs tests/stress/large_tree.rs
@@ -388,7 +388,7 @@ git commit -m "feat: receive large trees incrementally"
 - Modify: `tests/interop/rsync_compat.rs`
 - Modify: `docs/COMPATIBILITY.md`
 
-- [ ] **Step 1: Add command-family fixtures**
+- [x] **Step 1: Add command-family fixtures**
 
 Cover:
 
@@ -403,11 +403,11 @@ Cover:
 - multiple source operands
 - remote source names with spaces and Unicode
 
-- [ ] **Step 2: Compare manifests with upstream rsync**
+- [x] **Step 2: Compare manifests with upstream rsync**
 
 For each fixture, run upstream rsync on the Linux host into a parallel destination and compare file content, mtimes, mode bits where supported, and delete results.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run:
 
@@ -419,7 +419,7 @@ cargo test -p rsync-cli --test rsync_compat --all-features -- --nocapture
 
 Expected: PASS; all remote temp dirs are removed after each test.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add tests/interop/rsync_compat.rs docs/COMPATIBILITY.md
@@ -433,19 +433,19 @@ git commit -m "test: expand upstream ssh rsync compatibility matrix"
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: `tests/security/remote_peer.rs`
 
-- [ ] **Step 1: Add failure tests**
+- [x] **Step 1: Add failure tests**
 
 Cover remote command not found, auth failure, remote stderr noise, early EOF, hung remote process, unsupported protocol, checksum mismatch, and local cancellation/timeout.
 
-- [ ] **Step 2: Implement deterministic cleanup**
+- [x] **Step 2: Implement deterministic cleanup**
 
 Ensure partial files, temp files, child stdin/stdout/stderr handles, and remote transport state are closed predictably.
 
-- [ ] **Step 3: Verify exit codes**
+- [x] **Step 3: Verify exit codes**
 
 Ensure errors map to rsync-like exit codes in `crates/rsync-cli/src/output.rs`.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -456,7 +456,7 @@ cargo test --workspace --all-features
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-transport/src/process.rs crates/rsync-cli/src/lib.rs crates/rsync-cli/src/output.rs tests/security/remote_peer.rs
@@ -475,7 +475,7 @@ git commit -m "fix: harden remote shell failure handling"
 - Modify: `tests/interop/daemon.rs`
 - Modify: `docs/COMPATIBILITY.md`
 
-- [ ] **Step 1: Add failing daemon auth tests**
+- [x] **Step 1: Add failing daemon auth tests**
 
 Cover:
 
@@ -486,15 +486,15 @@ Cover:
 - writable module with auth
 - secrets file permissions warning on Windows
 
-- [ ] **Step 2: Parse safe config subset**
+- [x] **Step 2: Parse safe config subset**
 
 Support `auth users`, `secrets file`, `read only`, `write only`, `list`, `uid`, `gid` as documented safe behavior or explicit diagnostics where Windows cannot apply them.
 
-- [ ] **Step 3: Implement challenge-response**
+- [x] **Step 3: Implement challenge-response**
 
 Use the existing daemon digest helpers and never log password material or full secrets paths.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -504,7 +504,7 @@ cargo test -p rsync-cli --test daemon --all-features -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/daemon_server.rs crates/rsync-protocol/src/daemon.rs tests/interop/daemon.rs docs/COMPATIBILITY.md
@@ -518,7 +518,7 @@ git commit -m "feat: support daemon auth users and secrets files"
 - Modify: `scripts/package-release.ps1`
 - Modify: `docs/COMPATIBILITY.md`
 
-- [ ] **Step 1: Add external daemon fixture tests**
+- [x] **Step 1: Add external daemon fixture tests**
 
 Support environment variables:
 
@@ -528,11 +528,11 @@ Support environment variables:
 - `RSYNC_WIN_DAEMON_USER`
 - `RSYNC_WIN_DAEMON_PASSWORD_FILE`
 
-- [ ] **Step 2: Test no-auth and auth flows**
+- [x] **Step 2: Test no-auth and auth flows**
 
 Cover module listing, pull, push, auth failure, read-only rejection, timeout, `--no-motd`, `--bwlimit`, `--sockopts`, and proxy/connect-program where feasible.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run:
 
@@ -542,7 +542,7 @@ cargo test -p rsync-cli --test daemon --all-features -- --nocapture
 
 Expected: PASS with configured daemon fixture; skipped cleanly when missing.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add tests/interop/daemon.rs scripts/package-release.ps1 docs/COMPATIBILITY.md
@@ -561,11 +561,11 @@ git commit -m "test: add upstream daemon parity fixtures"
 - Modify: `README.md`
 - Test: `tests/compat/options.rs`
 
-- [ ] **Step 1: Write documentation tests or assertions**
+- [x] **Step 1: Write documentation tests or assertions**
 
 Add tests that ensure `--metadata-policy=portable`, `posix`, and `ntfs-native` produce clear diagnostics for every unsupported metadata class.
 
-- [ ] **Step 2: Document supported metadata by mode**
+- [x] **Step 2: Document supported metadata by mode**
 
 For each mode, state whether the project applies, stores in sidecar, reports only, rejects, or ignores:
 
@@ -583,7 +583,7 @@ For each mode, state whether the project applies, stores in sidecar, reports onl
 - reparse points
 - VSS
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run:
 
@@ -593,7 +593,7 @@ cargo test -p rsync-cli --test options --all-features
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add docs/COMPATIBILITY.md docs/OPTION-STATUS.md README.md tests/compat/options.rs
@@ -610,11 +610,11 @@ git commit -m "docs: define metadata support contract"
 - Modify: `crates/rsync-winfs/src/sidecar.rs`
 - Modify: `crates/rsync-cli/src/lib.rs`
 
-- [ ] **Step 1: Add Windows-only integration tests**
+- [x] **Step 1: Add Windows-only integration tests**
 
 Cover readonly/hidden/archive/system attributes, creation time, ADS payloads, hardlinks, safe symlinks when capability is present, and security descriptor restore when elevated.
 
-- [ ] **Step 2: Implement restore capabilities one at a time**
+- [x] **Step 2: Implement restore capabilities one at a time**
 
 Recommended order:
 
@@ -626,11 +626,11 @@ Recommended order:
 6. security descriptor restore behind explicit elevated mode
 7. sparse range preservation
 
-- [ ] **Step 3: Keep explicit degradation**
+- [x] **Step 3: Keep explicit degradation**
 
 When a capability is unavailable, emit a warning or fail with `--fail-on-metadata-loss`.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -641,7 +641,7 @@ cargo test -p rsync-cli --all-features local_ntfs -- --nocapture
 
 Expected: PASS on non-elevated tests; elevated-only tests skip cleanly when permissions are unavailable.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-winfs crates/rsync-cli/src/lib.rs
@@ -656,19 +656,19 @@ git commit -m "feat: restore documented ntfs-native metadata"
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Modify: `docs/VSS-DESIGN.md`
 
-- [ ] **Step 1: Add source abstraction test**
+- [x] **Step 1: Add source abstraction test**
 
 Write tests proving local sync can read through a source abstraction rather than directly from live paths.
 
-- [ ] **Step 2: Implement VSS provider behind explicit `--vss`**
+- [x] **Step 2: Implement VSS provider behind explicit `--vss`**
 
 Create snapshots only when `--metadata-policy=ntfs-native --vss` is explicit. Do not enable VSS by default.
 
-- [ ] **Step 3: Add cleanup and failure tests**
+- [x] **Step 3: Add cleanup and failure tests**
 
 Cover snapshot creation failure, locked-file read success, cancellation cleanup, and non-admin diagnostics.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run elevated Windows tests:
 
@@ -679,7 +679,7 @@ cargo test -p rsync-cli --all-features vss -- --nocapture
 
 Expected: PASS when elevated; clear SKIP/diagnostic when not elevated.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-winfs/src/vss.rs crates/rsync-fs/src/walk.rs crates/rsync-cli/src/lib.rs docs/VSS-DESIGN.md
@@ -697,15 +697,15 @@ git commit -m "feat: read sources through explicit vss snapshots"
 - Modify: `crates/rsync-protocol/src/flist.rs`
 - Modify: `crates/rsync-cli/src/lib.rs`
 
-- [ ] **Step 1: Add malicious file-list cases**
+- [x] **Step 1: Add malicious file-list cases**
 
 Cover parent escapes, absolute paths, Windows prefixes, reserved names, trailing dots/spaces, Unicode normalization collisions, case collisions, symlink escapes, hardlink escapes, oversized paths, oversized counts, malformed varints, corrupt compressed tokens, and token length mismatches.
 
-- [ ] **Step 2: Verify all fail before mutation**
+- [x] **Step 2: Verify all fail before mutation**
 
 Use temporary destinations with sentinel files and assert no writes occur on rejection.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run:
 
@@ -715,7 +715,7 @@ cargo test -p rsync-cli --test security_remote_peer --all-features
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add tests/security/remote_peer.rs crates/rsync-protocol/src/flist.rs crates/rsync-cli/src/lib.rs
@@ -729,15 +729,15 @@ git commit -m "test: expand malicious peer hardening matrix"
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: `tests/security/remote_peer.rs`
 
-- [ ] **Step 1: Add interruption tests**
+- [x] **Step 1: Add interruption tests**
 
 Simulate checksum mismatch, short literal stream, timeout, and write failure. Assert final destination remains old content and temp files are removed.
 
-- [ ] **Step 2: Make temp files isolated**
+- [x] **Step 2: Make temp files isolated**
 
 Ensure temp roots are destination-local, collision-resistant, and never follow untrusted links.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run:
 
@@ -747,7 +747,7 @@ cargo test --workspace --all-features
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add crates/rsync-fs/src/walk.rs crates/rsync-cli/src/lib.rs tests/security/remote_peer.rs
@@ -765,7 +765,7 @@ git commit -m "fix: preserve receiver state on failed transfers"
 - Create: `crates/rsync-cli/benches/remote_protocol.rs`
 - Modify: `Cargo.toml` or crate `Cargo.toml` files if bench targets are needed
 
-- [ ] **Step 1: Add benchmark scenarios**
+- [x] **Step 1: Add benchmark scenarios**
 
 Cover:
 
@@ -776,7 +776,7 @@ Cover:
 - filters with many rules
 - delete-heavy receiver tree
 
-- [ ] **Step 2: Record baseline**
+- [x] **Step 2: Record baseline**
 
 Run:
 
@@ -787,7 +787,7 @@ cargo bench -p rsync-cli --bench remote_protocol
 
 Expected: benchmarks complete and record throughput/memory notes in `docs/COMPATIBILITY.md`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```powershell
 git add crates/rsync-fs/benches/local_sync.rs crates/rsync-cli/benches/remote_protocol.rs Cargo.toml
@@ -801,15 +801,15 @@ git commit -m "bench: add production workload benchmarks"
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Modify: `README.md`
 
-- [ ] **Step 1: Add output snapshot tests**
+- [x] **Step 1: Add output snapshot tests**
 
 Cover quiet mode, verbose mode, progress, itemized changes, stats, log-file, log-file-format, and machine-readable summaries.
 
-- [ ] **Step 2: Stabilize output contract**
+- [x] **Step 2: Stabilize output contract**
 
 Document what scripts can parse and what is human-only.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run:
 
@@ -820,7 +820,7 @@ cargo test -p rsync-cli --test options --all-features
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/output.rs crates/rsync-cli/src/lib.rs README.md
@@ -839,7 +839,7 @@ git commit -m "feat: stabilize production logging output"
 - Modify: `.github/workflows/release.yml`
 - Modify: `README.md`
 
-- [ ] **Step 1: Add packaging tests**
+- [x] **Step 1: Add packaging tests**
 
 The release script must run:
 
@@ -852,11 +852,11 @@ The release script must run:
 - SHA-256 checksum generation
 - zip layout validation
 
-- [ ] **Step 2: Add CI matrix**
+- [x] **Step 2: Add CI matrix**
 
 Run Windows stable Rust, minimum supported Rust, and optional nightly lint if useful.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run:
 
@@ -866,7 +866,7 @@ Run:
 
 Expected: release zip and `.sha256` are created and smoke checks pass.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add scripts/package-release.ps1 .github/workflows/ci.yml .github/workflows/release.yml README.md
@@ -881,7 +881,7 @@ git commit -m "build: strengthen release package gates"
 - Modify: `docs/RELEASE-NOTES-TEMPLATE.md`
 - Modify: `README.md`
 
-- [ ] **Step 1: Freeze supported matrix**
+- [x] **Step 1: Freeze supported matrix**
 
 Document supported:
 
@@ -893,7 +893,7 @@ Document supported:
 - max tested file size
 - max tested file count
 
-- [ ] **Step 2: Run full release candidate verification**
+- [x] **Step 2: Run full release candidate verification**
 
 Run:
 
@@ -909,7 +909,7 @@ cargo test -p rsync-cli --test rsync_compat --all-features -- --nocapture
 
 Expected: all PASS; remote test directories are cleaned.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```powershell
 git add docs/COMPATIBILITY.md docs/OPTION-STATUS.md docs/RELEASE-NOTES-TEMPLATE.md README.md

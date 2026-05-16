@@ -7,127 +7,21 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use rsync_filter::{EntryKind, RuleAction, RuleSet, RuleSide};
 use rsync_fs::{
-    walk_tree, FileType, FileWriteMode, FileWriteOptions, FsError, LocalFileSystem,
-    PortableFileSystem, SyncAction, UpdateMode,
+    walk_tree, FileType, FileWriteMode, FileWriteOptions, LocalFileSystem, PortableFileSystem,
+    SyncAction, UpdateMode,
 };
 use rsync_protocol::{
     read_multiplexed_i32, read_rsync31_file_list_with_metadata, read_rsync_index, read_u16_le,
-    read_varlong, write_rsync_index, write_u16_le, MultiplexReadState, MultiplexedReader,
-    MultiplexedWriter, RemoteSessionError, RsyncFileListEntry, RsyncFileListOptions,
-    RsyncIndexState, TransferDirection, WireFileType, DEFAULT_MAX_FILE_LIST_ENTRIES,
-    DEFAULT_MAX_FILE_LIST_PATH_LEN, RSYNC_INDEX_DONE, RSYNC_INDEX_FLIST_EOF,
-    RSYNC_INDEX_FLIST_OFFSET,
+    read_varlong, write_rsync_index, MultiplexReadState, MultiplexedReader, MultiplexedWriter,
+    RemoteSessionError, RsyncFileListEntry, RsyncFileListOptions, RsyncIndexState, WireFileType,
+    DEFAULT_MAX_FILE_LIST_ENTRIES, DEFAULT_MAX_FILE_LIST_PATH_LEN, RSYNC_INDEX_DONE,
+    RSYNC_INDEX_FLIST_EOF, RSYNC_INDEX_FLIST_OFFSET,
 };
 
+use crate::output::ProgressLog;
 use crate::plan::*;
 use crate::remote::flist::*;
 use crate::transfer::*;
-use crate::ProgressLog;
-
-pub(crate) struct RemoteSenderFileRequest<'a> {
-    pub(crate) entries: &'a [RsyncFileListEntry],
-    pub(crate) selected_indexes: &'a BTreeSet<usize>,
-    pub(crate) index_offset: i32,
-    pub(crate) dry_run: bool,
-    pub(crate) dest: &'a Path,
-    pub(crate) block_size: usize,
-    pub(crate) whole_file: bool,
-    pub(crate) checksum: RemoteFileChecksum,
-    pub(crate) max_alloc: Option<u64>,
-    pub(crate) stop_deadline: Option<Instant>,
-}
-
-pub(crate) fn request_remote_sender_files_protocol31<T: Write>(
-    transport: &mut T,
-    request: RemoteSenderFileRequest<'_>,
-) -> Result<()> {
-    let RemoteSenderFileRequest {
-        entries,
-        selected_indexes,
-        index_offset,
-        dry_run,
-        dest,
-        block_size,
-        whole_file,
-        checksum,
-        max_alloc,
-        stop_deadline,
-    } = request;
-    let mut index_state = RsyncIndexState::default();
-    let mut requested_indexes = BTreeSet::new();
-    request_remote_sender_file_indexes_protocol31(
-        transport,
-        entries,
-        selected_indexes,
-        &mut requested_indexes,
-        index_offset,
-        dry_run,
-        dest,
-        block_size,
-        whole_file,
-        checksum,
-        max_alloc,
-        stop_deadline,
-        &mut index_state,
-    )?;
-    write_rsync31_index(transport, &mut index_state, RSYNC_INDEX_DONE)?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn request_remote_sender_file_indexes_protocol31<T: Write>(
-    transport: &mut T,
-    entries: &[RsyncFileListEntry],
-    selected_indexes: &BTreeSet<usize>,
-    requested_indexes: &mut BTreeSet<usize>,
-    index_offset: i32,
-    dry_run: bool,
-    dest: &Path,
-    block_size: usize,
-    whole_file: bool,
-    checksum: RemoteFileChecksum,
-    max_alloc: Option<u64>,
-    stop_deadline: Option<Instant>,
-    index_state: &mut RsyncIndexState,
-) -> Result<usize> {
-    let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
-    let mut requests = 0_usize;
-    for (index, entry) in entries.iter().enumerate() {
-        check_transfer_deadline(stop_deadline)?;
-        if entry.file_type != WireFileType::File || !selected_indexes.contains(&index) {
-            continue;
-        }
-        if requested_indexes.contains(&index) {
-            continue;
-        }
-        write_rsync_index(
-            &mut writer,
-            index_state,
-            remote_wire_index(index, index_offset)?,
-        )?;
-        let iflags = if dry_run {
-            RSYNC_ITEM_IS_NEW | RSYNC_ITEM_LOCAL_CHANGE
-        } else {
-            RSYNC_ITEM_TRANSFER | RSYNC_ITEM_IS_NEW
-        };
-        write_u16_le(&mut writer, iflags)?;
-        if !dry_run {
-            let (sum_head, signatures) = local_basis_signature_request(
-                &dest.join(&entry.path),
-                block_size,
-                checksum,
-                whole_file,
-                max_alloc,
-            )?;
-            write_sum_head(&mut writer, sum_head)?;
-            write_remote_block_signatures(&mut writer, &signatures)?;
-        }
-        requested_indexes.insert(index);
-        requests += 1;
-    }
-    writer.flush()?;
-    Ok(requests)
-}
 
 pub(crate) struct RemoteReceiveContext<'a> {
     pub(crate) fs: &'a mut LocalFileSystem,
@@ -740,14 +634,7 @@ pub(crate) fn remote_file_index_offset(entries: &[RsyncFileListEntry]) -> i32 {
     0
 }
 
-fn remote_wire_index(index: usize, offset: i32) -> Result<i32> {
-    let index = i32::try_from(index).context("remote file list index exceeded i32 range")?;
-    index
-        .checked_add(offset)
-        .context("remote file list index overflow")
-}
-
-fn remote_source_path_is_filtered(
+pub(super) fn remote_source_path_is_filtered(
     rules: &RuleSet,
     relative: &Path,
     file_type: WireFileType,
@@ -779,7 +666,7 @@ fn remote_source_path_is_filtered(
     false
 }
 
-fn remote_receiver_path_is_filtered(
+pub(super) fn remote_receiver_path_is_filtered(
     rules: &RuleSet,
     relative: &Path,
     file_type: WireFileType,
@@ -950,86 +837,4 @@ pub(crate) fn append_remote_messages(output: &mut String, mux: &MultiplexReadSta
         output.push_str(message);
         output.push('\n');
     }
-}
-
-pub(crate) fn windows_destination_path_preflight(paths: &[PathBuf]) -> Result<(), FsError> {
-    rsync_winfs::path::preflight_destination_paths(paths)
-        .map_err(|err| FsError::DestinationPathPreflight(err.to_string()))
-}
-
-pub(crate) fn validate_remote_file_list_paths(entries: &[RsyncFileListEntry]) -> Result<()> {
-    let destination_relatives: Vec<_> = entries
-        .iter()
-        .filter(|entry| !remote_entry_is_top_dir(entry))
-        .map(|entry| entry.path.clone())
-        .collect();
-    windows_destination_path_preflight(&destination_relatives)?;
-    Ok(())
-}
-
-pub(crate) fn validate_remote_sender_claims(
-    plan: &TransferPlan,
-    entries: &[RsyncFileListEntry],
-    _files_from: Option<&[PathBuf]>,
-) -> Result<()> {
-    if plan.trust_sender {
-        return Ok(());
-    }
-    let allowed_single_file_sources = if plan.old_args {
-        Vec::new()
-    } else {
-        remote_single_file_source_basenames(plan)
-    };
-    for entry in entries {
-        if remote_entry_is_top_dir(entry) {
-            continue;
-        }
-        if !remote_entry_matches_single_file_sources(&entry.path, &allowed_single_file_sources) {
-            bail!(
-                "remote sender sent unrequested path `{}`; use --trust-sender to accept remote file-list names",
-                entry.path.display()
-            );
-        }
-        if remote_source_path_is_filtered(&plan.filter_rules, &entry.path, entry.file_type)
-            || remote_receiver_path_is_filtered(&plan.filter_rules, &entry.path, entry.file_type)
-        {
-            bail!(
-                "remote sender sent filtered path `{}`; use --trust-sender to accept remote file-list names",
-                entry.path.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn remote_single_file_source_basenames(plan: &TransferPlan) -> Vec<String> {
-    if plan.remote_direction != Some(TransferDirection::Pull) {
-        return Vec::new();
-    }
-    plan.remote_operands
-        .iter()
-        .filter_map(|operand| remote_single_file_source_basename(&operand.path))
-        .collect()
-}
-
-fn remote_single_file_source_basename(path: &str) -> Option<String> {
-    if path.ends_with('/') || path.ends_with('\\') {
-        return None;
-    }
-    let normalized = path.replace('\\', "/");
-    let basename = normalized.rsplit('/').next()?.trim();
-    if basename.is_empty() || !basename.contains('.') {
-        return None;
-    }
-    Some(basename.to_string())
-}
-
-fn remote_entry_matches_single_file_sources(relative: &Path, allowed: &[String]) -> bool {
-    if allowed.is_empty() {
-        return true;
-    }
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    allowed
-        .iter()
-        .any(|basename| relative == *basename || relative.starts_with(&format!("{basename}/")))
 }
