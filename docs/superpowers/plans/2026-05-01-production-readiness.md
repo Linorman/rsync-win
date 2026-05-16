@@ -211,7 +211,7 @@ git commit -m "docs: classify rsync options by execution support"
 - Modify: `crates/rsync-delta/src/matcher.rs` if streaming matcher support is needed
 - Test: `tests/stress/large_file.rs`
 
-- [ ] **Step 1: Write failing stress test**
+- [x] **Step 1: Write failing stress test**
 
 Create `tests/stress/large_file.rs` with a test that pushes and pulls a file larger than the configured `--max-alloc` while using `--whole-file` and a second test for non-whole-file delta mode.
 
@@ -223,11 +223,11 @@ cargo test -p rsync-cli --test large_file --all-features -- --nocapture
 
 Expected: FAIL or OOM-risk path identified because `read_local_file_limited` still returns `Vec<u8>` for delta generation.
 
-- [ ] **Step 2: Stream literal token generation**
+- [x] **Step 2: Stream literal token generation**
 
 Keep whole-file literal token writing on `File`/`Read` streams. Ensure `write_literal_tokens_from_reader_with_checksum` enforces `stop_deadline` and bounded buffers.
 
-- [ ] **Step 3: Replace delta full-buffer matching**
+- [x] **Step 3: Replace delta full-buffer matching**
 
 Implement a memory-bounded block matcher path:
 
@@ -236,7 +236,7 @@ Implement a memory-bounded block matcher path:
 - literal spans are flushed incrementally
 - final checksum is updated while scanning
 
-- [ ] **Step 4: Verify max allocation behavior**
+- [x] **Step 4: Verify max allocation behavior**
 
 Run:
 
@@ -247,7 +247,7 @@ cargo test --workspace --all-features
 
 Expected: PASS; large files transfer with memory bounded by buffers and signature table, not full file size.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/lib.rs crates/rsync-delta/src/matcher.rs tests/stress/large_file.rs
@@ -262,19 +262,19 @@ git commit -m "feat: stream remote delta token generation"
 - Modify: `crates/rsync-fs/src/walk.rs`
 - Test: `tests/stress/large_tree.rs`
 
-- [ ] **Step 1: Add tests for `--max-alloc`**
+- [x] **Step 1: Add tests for `--max-alloc`**
 
 Test local copy, remote push, remote pull, file-list receive, and basis checksum paths with a low `--max-alloc`.
 
-- [ ] **Step 2: Add allocation accounting**
+- [x] **Step 2: Add allocation accounting**
 
 Introduce a shared allocation budget helper for file-list entries, path buffers, signature tables, and transfer buffers.
 
-- [ ] **Step 3: Fail early with clear diagnostics**
+- [x] **Step 3: Fail early with clear diagnostics**
 
 Return rsync-like resource errors before mutation when estimated metadata or signature memory exceeds budget.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -285,7 +285,7 @@ cargo test --workspace --all-features
 
 Expected: PASS; tests prove bounded memory and clean preflight failures.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/lib.rs crates/rsync-protocol/src/flist.rs crates/rsync-fs/src/walk.rs tests/stress/large_tree.rs
