@@ -1,12 +1,11 @@
-use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use rsync_fs::{FileWriteMode, SymlinkMode, UpdateMode};
 use rsync_protocol::{
-    build_remote_shell_invocation_for_paths, write_remote_shell_protected_args, RemoteSessionError,
-    RemoteShellOptions, SessionError, TransferDirection, REMOTE_SHELL_MVP_PROTOCOL,
+    build_remote_shell_invocation_for_paths, write_remote_shell_protected_args, RemoteShellOptions,
+    TransferDirection, REMOTE_SHELL_MVP_PROTOCOL,
 };
 use rsync_transport::remote_shell::{
     build_custom_remote_shell_command_with_options, build_ssh_remote_command_with_options,
@@ -16,12 +15,13 @@ use rsync_transport::remote_shell::{
 use rsync_transport::BandwidthLimitedStream;
 
 use crate::cli::Cli;
+use crate::output::ProgressLog;
 use crate::plan::*;
 use crate::remote::flist::*;
 use crate::remote::pull::{execute_remote_pull, execute_remote_pull_protocol27};
 use crate::remote::push::{execute_remote_push, execute_remote_push_protocol27};
+use crate::remote::session::should_fallback_to_protocol27;
 use crate::transfer::*;
-use crate::ProgressLog;
 
 pub(crate) fn execute_remote_shell_sync(cli: &Cli, plan: TransferPlan) -> Result<String> {
     ensure_remote_execution_options_supported(cli, &plan)?;
@@ -350,63 +350,4 @@ fn remote_shell_command_options_from_cli(cli: &Cli) -> RemoteShellCommandOptions
         blocking_io: cli.blocking_io,
         old_args: cli.old_args,
     }
-}
-
-pub(crate) fn should_fallback_to_protocol27(err: &anyhow::Error) -> bool {
-    if let Some(setup_err) = err.downcast_ref::<Protocol31SetupError>() {
-        return should_fallback_to_protocol27_from_setup(&setup_err.source);
-    }
-
-    should_fallback_to_protocol27_from_negotiation(err)
-}
-
-fn should_fallback_to_protocol27_from_setup(err: &anyhow::Error) -> bool {
-    should_fallback_to_protocol27_from_negotiation(err) || is_unexpected_eof(err)
-}
-
-fn should_fallback_to_protocol27_from_negotiation(err: &anyhow::Error) -> bool {
-    matches!(
-        err.downcast_ref::<RemoteSessionError>(),
-        Some(
-            RemoteSessionError::UnsupportedProtocol { .. }
-                | RemoteSessionError::UnsupportedChecksumNegotiation
-                | RemoteSessionError::InvalidChecksumList
-                | RemoteSessionError::Session(
-                    SessionError::NonProtocolOutput(_)
-                        | SessionError::IncompleteProtocolPrefix
-                        | SessionError::InvalidProtocolPrefix(_)
-                )
-        )
-    )
-}
-
-fn is_unexpected_eof(err: &anyhow::Error) -> bool {
-    if let Some(io_error) = err.downcast_ref::<std::io::Error>() {
-        return io_error.kind() == std::io::ErrorKind::UnexpectedEof;
-    }
-    matches!(
-        err.downcast_ref::<RemoteSessionError>(),
-        Some(RemoteSessionError::Io(io_error))
-            if io_error.kind() == std::io::ErrorKind::UnexpectedEof
-    )
-}
-
-#[derive(Debug)]
-struct Protocol31SetupError {
-    source: anyhow::Error,
-}
-
-impl fmt::Display for Protocol31SetupError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "protocol 31 setup failed: {}", self.source)
-    }
-}
-
-impl std::error::Error for Protocol31SetupError {}
-
-pub(crate) fn protocol31_setup_error<E>(err: E) -> anyhow::Error
-where
-    E: Into<anyhow::Error>,
-{
-    anyhow::Error::new(Protocol31SetupError { source: err.into() })
 }

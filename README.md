@@ -26,7 +26,7 @@ This is a production-readiness release. Version `v0.2.0` maps to Cargo package v
 
 See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the current peer, metadata, hardening, and release compatibility matrix. The packaged option status table is maintained in [`docs/OPTION-STATUS.md`](docs/OPTION-STATUS.md).
 
-Known not implemented in this development build: advanced `rsyncd.conf` keys beyond the safe module subset, encrypted daemon transport, arbitrary non-symlink reparse restore, and sender-side remote push incremental recursion. Protocol 31 remote pull supports upstream incremental file-list markers, but cross-mode memory-bounded incremental recursion is not complete. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport. VSS reads require explicit `--metadata-policy=ntfs-native --vss` and a Windows environment where VSS snapshot creation is permitted.
+Known not implemented in this development build: advanced `rsyncd.conf` keys beyond the safe module subset, encrypted daemon transport, arbitrary non-symlink reparse restore, and upstream sender-side remote push incremental recursion. Protocol 31 remote pull supports upstream incremental file-list markers, and remote push streams its local file-list encoding in batches while keeping upstream receivers on `--no-inc-recursive`. Daemon `--password-file` auth is only rsync daemon challenge-response authentication; it does not encrypt the transport. VSS reads require explicit `--metadata-policy=ntfs-native --vss` and a Windows environment where VSS snapshot creation is permitted.
 
 ## Install
 

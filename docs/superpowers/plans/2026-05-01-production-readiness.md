@@ -85,7 +85,7 @@ Interop, security, and release:
 - Modify: `crates/rsync-cli/src/lib.rs`
 - Test: existing workspace tests
 
-- [ ] **Step 1: Reproduce clippy failure**
+- [x] **Step 1: Reproduce clippy failure**
 
 Run:
 
@@ -95,7 +95,7 @@ cargo clippy --workspace --all-features -- -D warnings
 
 Expected: FAIL on `clippy::too_many_arguments` for `serve_remote_receiver_requests` and `write_delta_tokens_from_path`.
 
-- [ ] **Step 2: Extract runtime context structs**
+- [x] **Step 2: Extract runtime context structs**
 
 Add small internal structs near the remote execution helpers:
 
@@ -117,7 +117,7 @@ struct DeltaWriteRuntime<'a> {
 
 Replace long parameter lists with these contexts. Keep behavior unchanged.
 
-- [ ] **Step 3: Run targeted compile check**
+- [x] **Step 3: Run targeted compile check**
 
 Run:
 
@@ -127,7 +127,7 @@ cargo check -p rsync-cli --all-features
 
 Expected: PASS.
 
-- [ ] **Step 4: Run full gates**
+- [x] **Step 4: Run full gates**
 
 Run:
 
@@ -139,7 +139,7 @@ cargo test --workspace --all-features
 
 Expected: all PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/lib.rs
@@ -153,11 +153,11 @@ git commit -m "refactor: keep remote transfer helpers lint-clean"
 - Modify: `docs/OPTION-STATUS.md`
 - Modify: `tests/compat/options.rs`
 
-- [ ] **Step 1: Add status model test**
+- [x] **Step 1: Add status model test**
 
 Add tests that prove options such as `--iconv`, `--compress-threads`, `--copy-as`, and `--early-input` cannot be marked as fully implemented unless they have verified execution behavior in each applicable mode.
 
-- [ ] **Step 2: Introduce support levels**
+- [x] **Step 2: Introduce support levels**
 
 Use explicit levels in the registry:
 
@@ -173,7 +173,7 @@ enum OptionSupport {
 
 Map old `implemented` entries into the new model conservatively.
 
-- [ ] **Step 3: Regenerate or update docs**
+- [x] **Step 3: Regenerate or update docs**
 
 Update `docs/OPTION-STATUS.md` to separate:
 
@@ -183,7 +183,7 @@ Update `docs/OPTION-STATUS.md` to separate:
 - Parsed for compatibility only
 - Planned
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
@@ -193,7 +193,7 @@ cargo test -p rsync-cli --test options --all-features
 
 Expected: PASS, with tests asserting that partial options are not advertised as full upstream compatibility.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add crates/rsync-cli/src/options.rs docs/OPTION-STATUS.md tests/compat/options.rs

@@ -61,7 +61,7 @@ This matrix describes the current development build behavior. It is intentionall
 | Remote file-list paths | Protocol file-list readers reject parent escapes, absolute paths, Windows prefixes, reserved Windows names, invalid characters, and trailing dots/spaces before the CLI maps entries to a destination. Remote pull still performs destination preflight for case/normalization collisions before filtering or writing. |
 | Remote pull selection | Filters and `--files-from` are applied locally after receiving the remote sender file-list. Remote push routes include/exclude/filter rules to the remote receiver for delete protection; `--files-from` is not routed to the receiver yet. |
 | Remote token lengths | Remote pull rejects literal token streams that exceed or undershoot the advertised file-list length and removes temporary receive files on error. |
-| File-list size | Remote file-list readers enforce a 100,000 entry limit and 32 KiB path limit. Protocol 31 remote pull can receive upstream incremental file-list markers; remote push still uses `--no-inc-recursive`. |
+| File-list size | Remote file-list readers enforce a 100,000 entry limit and 32 KiB path limit. Protocol 31 remote pull can receive upstream incremental file-list markers. Remote push streams its local file-list encoding in bounded batches, but still uses `--no-inc-recursive` with upstream receivers. |
 | Multiplexing | Data frames are streamed; remote error messages are surfaced; unsupported multiplex tags are rejected. |
 | SSH process lifecycle | Child stderr is drained for diagnostics, hung child processes can be terminated through the transport timeout path, and dropped child transports close stdin and kill still-running children. Remote-shell startup failures such as command-not-found and SSH auth errors map to rsync start-protocol exit code 5; unsupported protocol maps to 2; checksum/protocol-stream errors map to 12; timeout maps to 30. |
 | Compression | `-z/--compress` negotiates and applies zlib/zlibx token compression on the remote protocol 31 transfer path, including `--compress-choice`, `--compress-level`, and `--skip-compress`. Local Windows-to-Windows copies are not compressed, and `--compress-threads` is parsed/forwarded but does not add a parallel local compressor. |
@@ -95,7 +95,7 @@ The packaged option table is in [`docs/OPTION-STATUS.md`](OPTION-STATUS.md). It 
 - Advanced daemon-server `rsyncd.conf` keys beyond `path`, `comment`, `auth users`, `secrets file`, `read only`, `write only`, `list`, `uid`, and `gid` are not implemented. `uid` and `gid` are parsed for compatibility diagnostics but process identity changes are not applied.
 - Arbitrary non-symlink reparse restore is intentionally rejected rather than recreated.
 - Alternate data stream payload copying is implemented only for named streams in explicit `ntfs-native` local Windows syncs.
-- Full cross-mode memory-bounded incremental recursion is not implemented; remote-shell push remains sender-side non-incremental.
+- Full upstream sender-side incremental recursion for remote-shell push is not implemented; push uses batched local file-list streaming with `--no-inc-recursive`.
 
 ## Recommended Smoke Tests
 

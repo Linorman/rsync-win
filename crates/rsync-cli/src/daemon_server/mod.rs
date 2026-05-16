@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Component, Path, PathBuf};
@@ -21,20 +21,30 @@ use rsync_protocol::{
 };
 use rsync_transport::tcp::{TcpAddressFamily, TcpSocketOptions};
 
-use crate::remote::receive::RemoteSenderFileRequest;
-use crate::{
-    checked_file_index, collect_local_source_entries, delete_local_extras, read_multiplexed_i32,
-    read_multiplexed_rsync31_index, read_remote_block_signatures_from_reader,
-    read_rsync31_optional_item_attrs, read_sum_head, receive_remote_sender_files_protocol31,
-    request_remote_sender_files_protocol31, selected_remote_entries, selected_remote_entry_indexes,
-    selected_remote_transfer_indexes, sort_remote_entries_for_sender_indexes,
-    validate_remote_file_list_paths, windows_destination_path_preflight,
-    write_delta_tokens_from_path, write_rsync31_done, write_rsync31_index,
-    write_rsync31_optional_item_attrs, write_sum_head, Cli, DeltaWriteRuntime,
-    LocalSourceCollectOptions, ProgressLog, RemoteCompressionConfig, RemoteExecutionStats,
-    RemoteFileChecksum, RemoteFinalChecksum, RemoteReceiveContext, RemoteSessionError,
-    RemoteSourceEntry, RSYNC31_MUX_FRAME_SIZE, RSYNC_ITEM_TRANSFER,
+use crate::output::ProgressLog;
+use crate::remote::flist::{
+    collect_local_source_entries, LocalSourceCollectOptions, RemoteSourceEntry,
 };
+use crate::remote::receive::{
+    checked_file_index, delete_local_extras, read_multiplexed_rsync31_index,
+    receive_remote_sender_files_protocol31, remote_entry_is_top_dir, remote_file_index_offset,
+    selected_remote_entries, selected_remote_entry_indexes, selected_remote_transfer_indexes,
+    sort_remote_entries_for_sender_indexes, write_rsync31_done, write_rsync31_index,
+    RemoteReceiveContext,
+};
+use crate::remote::security::{
+    validate_remote_file_list_paths, windows_destination_path_preflight,
+};
+use crate::remote::send::request_remote_sender_files_protocol31;
+use crate::remote::send::RemoteSenderFileRequest;
+use crate::transfer::{
+    read_remote_block_signatures_from_reader, read_rsync31_optional_item_attrs, read_sum_head,
+    write_delta_tokens_from_path, write_rsync31_optional_item_attrs, write_sum_head,
+    DeltaWriteRuntime, RemoteCompressionConfig, RemoteExecutionStats, RemoteFileChecksum,
+    RemoteFinalChecksum, RSYNC31_MUX_FRAME_SIZE, RSYNC_ITEM_TRANSFER,
+};
+use crate::Cli;
+use rsync_protocol::{read_multiplexed_i32, RemoteSessionError};
 
 #[derive(Debug, Clone)]
 struct DaemonServerConfig {
@@ -77,6 +87,14 @@ struct DaemonTransferArgs {
 
 use rsync_transport::{BandwidthLimit, BandwidthLimitedStream};
 
+mod logging;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+use logging::render_daemon_log_format;
+use logging::{log_daemon_message, log_daemon_record, DaemonLogRecord};
+
 #[derive(Debug)]
 enum DaemonConnection {
     Plain(TcpStream),
@@ -115,16 +133,6 @@ impl Write for DaemonConnection {
             Self::Limited(stream) => stream.flush(),
         }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct DaemonLogRecord {
-    message: String,
-    module: Option<String>,
-    operation: Option<String>,
-    path: Option<String>,
-    bytes: Option<u64>,
-    client: Option<String>,
 }
 
 pub fn run(cli: &Cli) -> Result<String> {
@@ -507,7 +515,7 @@ fn serve_daemon_receiver_protocol31<T: Read + Write>(
 
     let destination_relatives: Vec<_> = selected_entries
         .iter()
-        .filter(|entry| !crate::remote_entry_is_top_dir(entry))
+        .filter(|entry| !remote_entry_is_top_dir(entry))
         .map(|entry| entry.path.clone())
         .collect();
     windows_destination_path_preflight(&destination_relatives)?;
@@ -520,7 +528,7 @@ fn serve_daemon_receiver_protocol31<T: Read + Write>(
         }
         actions.push(SyncAction::CreateDir(destination.clone()));
     }
-    let index_offset = crate::remote_file_index_offset(&entries);
+    let index_offset = remote_file_index_offset(&entries);
     let transfer_indexes = selected_remote_transfer_indexes(
         &fs,
         &destination,
@@ -540,7 +548,7 @@ fn serve_daemon_receiver_protocol31<T: Read + Write>(
         )?;
     }
     for entry in &selected_entries {
-        if crate::remote_entry_is_top_dir(entry) {
+        if remote_entry_is_top_dir(entry) {
             continue;
         }
         if entry.file_type == WireFileType::Directory {
@@ -1362,267 +1370,4 @@ fn daemon_secrets_file_warnings(module: &DaemonServerModule) -> Vec<String> {
 #[cfg(not(windows))]
 fn daemon_secrets_file_warnings(_module: &DaemonServerModule) -> Vec<String> {
     Vec::new()
-}
-
-fn log_daemon_message(cli: &Cli, message: &str) -> Result<()> {
-    log_daemon_record(
-        cli,
-        DaemonLogRecord {
-            message: message.to_string(),
-            ..DaemonLogRecord::default()
-        },
-    )
-}
-
-fn log_daemon_record(cli: &Cli, record: DaemonLogRecord) -> Result<()> {
-    let Some(path) = &cli.daemon_log_file else {
-        return Ok(());
-    };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open daemon log file {}", path.display()))?;
-    let line = if let Some(format) = &cli.daemon_log_file_format {
-        render_daemon_log_format(format, &record)
-    } else {
-        record.message
-    };
-    writeln!(file, "{line}")?;
-    Ok(())
-}
-
-fn render_daemon_log_format(format: &str, record: &DaemonLogRecord) -> String {
-    let mut output = String::with_capacity(format.len() + record.message.len());
-    let mut chars = format.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            output.push(ch);
-            continue;
-        }
-        let Some(token) = chars.next() else {
-            output.push('%');
-            break;
-        };
-        match token {
-            '%' => output.push('%'),
-            'm' => output.push_str(record.module.as_deref().unwrap_or("-")),
-            'o' => output.push_str(record.operation.as_deref().unwrap_or("-")),
-            'f' => output.push_str(record.path.as_deref().unwrap_or("-")),
-            'l' => output.push_str(
-                &record
-                    .bytes
-                    .map(|bytes| bytes.to_string())
-                    .unwrap_or_else(|| "0".to_string()),
-            ),
-            'h' | 'a' => output.push_str(record.client.as_deref().unwrap_or("-")),
-            'p' => output.push_str(&std::process::id().to_string()),
-            't' => output.push_str(&daemon_log_timestamp()),
-            'M' => output.push_str(&record.message),
-            other => {
-                output.push('%');
-                output.push(other);
-            }
-        }
-    }
-    output
-}
-
-fn daemon_log_timestamp() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_minimal_module_config() {
-        let config = parse_config(
-            "[public]\npath = C:/data\ncomment = Public files\nread only = yes\nlist = true\n",
-            Path::new("rsyncd.conf"),
-        )
-        .unwrap();
-
-        assert_eq!(config.modules.len(), 1);
-        assert_eq!(config.modules[0].name, "public");
-        assert_eq!(config.modules[0].comment, "Public files");
-        assert!(config.modules[0].read_only);
-        assert!(config.modules[0].list);
-    }
-
-    #[test]
-    fn parses_daemon_auth_and_safe_subset_keys() {
-        let config = parse_config(
-            "[private]\npath = C:/data\nauth users = alice, bob\nsecrets file = C:/secrets/rsyncd.secrets\nread only = no\nwrite only = yes\nlist = false\nuid = nobody\ngid = nogroup\n",
-            Path::new("rsyncd.conf"),
-        )
-        .unwrap();
-
-        let module = &config.modules[0];
-        assert_eq!(module.auth_users, vec!["alice", "bob"]);
-        assert_eq!(
-            module.secrets_file.as_deref(),
-            Some(Path::new("C:/secrets/rsyncd.secrets"))
-        );
-        assert!(!module.read_only);
-        assert!(module.write_only);
-        assert!(!module.list);
-        assert_eq!(module.uid.as_deref(), Some("nobody"));
-        assert_eq!(module.gid.as_deref(), Some("nogroup"));
-    }
-
-    #[test]
-    fn daemon_auth_challenge_accepts_valid_user_and_rejects_bad_credentials() {
-        let temp =
-            std::env::temp_dir().join(format!("rsync-win-daemon-auth-unit-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp).unwrap();
-        let module_root = temp.join("module");
-        fs::create_dir_all(&module_root).unwrap();
-        let secrets_file = temp.join("rsyncd.secrets");
-        fs::write(&secrets_file, "alice:secret\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&secrets_file, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let config = parse_config(
-            &format!(
-                "[private]\npath = {}\nauth users = alice\nsecrets file = {}\n",
-                module_root.display(),
-                secrets_file.display()
-            ),
-            Path::new("rsyncd.conf"),
-        )
-        .unwrap();
-        validate_config(&config).unwrap();
-
-        let challenge = daemon_auth_challenge("private", Some("127.0.0.1:8730"));
-        let response = rsync_protocol::daemon_auth_response(
-            "secret",
-            &challenge,
-            rsync_protocol::DaemonAuthChecksum::Md5,
-        );
-        authenticate_daemon_client(
-            &config.modules[0],
-            Some("127.0.0.1:8730".to_string()),
-            rsync_protocol::DaemonAuthChecksum::Md5,
-            &mut CursorStream::new(format!("alice {response}\n").into_bytes()),
-            Some(challenge.clone()),
-        )
-        .unwrap();
-
-        let bad_response = rsync_protocol::daemon_auth_response(
-            "wrong",
-            &challenge,
-            rsync_protocol::DaemonAuthChecksum::Md5,
-        );
-        let err = authenticate_daemon_client(
-            &config.modules[0],
-            Some("127.0.0.1:8730".to_string()),
-            rsync_protocol::DaemonAuthChecksum::Md5,
-            &mut CursorStream::new(format!("alice {bad_response}\n").into_bytes()),
-            Some(challenge),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("daemon authentication failed"));
-
-        fs::remove_dir_all(temp).unwrap();
-    }
-
-    #[test]
-    fn dparam_overrides_module_values() {
-        let mut config = parse_config(
-            "[public]\npath = C:/data\ncomment = Old\n",
-            Path::new("rsyncd.conf"),
-        )
-        .unwrap();
-
-        apply_dparams(&mut config, &["public.comment=New".to_string()]).unwrap();
-
-        assert_eq!(config.modules[0].comment, "New");
-    }
-
-    #[test]
-    fn daemon_log_format_expands_core_tokens() {
-        let record = DaemonLogRecord {
-            message: "module public transfer args: --server --sender . file.txt".to_string(),
-            module: Some("public".to_string()),
-            operation: Some("send".to_string()),
-            path: Some("file.txt".to_string()),
-            bytes: Some(12),
-            client: Some("127.0.0.1:8730".to_string()),
-        };
-
-        assert_eq!(
-            render_daemon_log_format("%m %o %f %l %h %M %% %q", &record),
-            "public send file.txt 12 127.0.0.1:8730 module public transfer args: --server --sender . file.txt % %q"
-        );
-    }
-
-    #[test]
-    fn daemon_bwlimit_parses_rsync_rate_units() {
-        assert_eq!(
-            parse_daemon_bwlimit("128").unwrap().bytes_per_second,
-            128 * 1024
-        );
-        assert_eq!(
-            parse_daemon_bwlimit("2M").unwrap().bytes_per_second,
-            2 * 1024 * 1024
-        );
-        assert!(parse_daemon_bwlimit("0").is_err());
-        assert!(parse_daemon_bwlimit("nonsense").is_err());
-    }
-
-    #[test]
-    fn daemon_bandwidth_limiter_computes_required_delay() {
-        let limit = BandwidthLimit::new(1024);
-        let start = std::time::Instant::now();
-        let mut limiter = rsync_transport::BandwidthLimiter::new(limit, start);
-
-        assert_eq!(
-            limiter.delay_after_write(512, start),
-            std::time::Duration::from_millis(500)
-        );
-        assert_eq!(
-            limiter.delay_after_write(512, start + std::time::Duration::from_millis(1000)),
-            std::time::Duration::ZERO
-        );
-    }
-
-    #[derive(Debug)]
-    struct CursorStream {
-        input: std::io::Cursor<Vec<u8>>,
-        written: Vec<u8>,
-    }
-
-    impl CursorStream {
-        fn new(input: Vec<u8>) -> Self {
-            Self {
-                input: std::io::Cursor::new(input),
-                written: Vec::new(),
-            }
-        }
-    }
-
-    impl Read for CursorStream {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.input.read(buf)
-        }
-    }
-
-    impl Write for CursorStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.written.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
 }

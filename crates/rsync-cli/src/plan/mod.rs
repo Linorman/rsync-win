@@ -22,7 +22,7 @@ use rsync_transport::BandwidthLimit;
 use crate::cli::{Cli, CliMetadataPolicy};
 use crate::execute::remote_shell::build_remote_transport_command;
 use crate::format::metadata_code;
-use crate::RemoteCompressionConfig;
+use crate::transfer::RemoteCompressionConfig;
 
 mod diagnostics;
 mod filters;
@@ -674,7 +674,7 @@ impl TransferPlan {
         if requested_incremental_recursion && remote_direction == Some(TransferDirection::Push) {
             report.warn(
                 "W_INC_RECURSIVE_PUSH_DISABLED",
-                "--inc-recursive currently applies to protocol 31 remote pulls; remote-shell push is kept on --no-inc-recursive until sender-side upstream incremental recursion is implemented",
+                "--inc-recursive currently applies to protocol 31 remote pulls; remote-shell push streams its local file list in batches but keeps the upstream receiver on --no-inc-recursive until sender-side upstream incremental recursion is implemented",
             );
         }
 

@@ -51,6 +51,26 @@ fn protocol_file_list_batch_builder_stays_within_window_for_large_tree() {
 }
 
 #[test]
+fn protocol31_push_streams_file_list_batches_without_encoded_prebuffer() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let push_source =
+        fs::read_to_string(manifest_dir.join("src/remote/push.rs")).expect("read push source");
+
+    assert!(
+        push_source.contains("collect_local_push_source_entries_with_batches"),
+        "protocol31 push should route the local walker through file-list batches"
+    );
+    assert!(
+        push_source.contains(".write_batch(&mut writer"),
+        "protocol31 push should stream each file-list batch to the multiplexed writer"
+    );
+    assert!(
+        !push_source.contains("let mut file_list_bytes = Vec::new()"),
+        "protocol31 push must not prebuffer the encoded file-list before sending"
+    );
+}
+
+#[test]
 fn incremental_receiver_state_plans_deletes_after_all_batches_and_protects_filters() {
     let mut state = IncrementalReceiverState::new(DeleteMode::Delay);
     state

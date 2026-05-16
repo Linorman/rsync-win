@@ -9,13 +9,13 @@ use rsync_protocol::{
 };
 
 use crate::cli::Cli;
-use crate::execute::remote_shell::protocol31_setup_error;
 use crate::format::*;
+use crate::output::{self, ProgressLog};
 use crate::plan::*;
 use crate::remote::flist::*;
 use crate::remote::receive::*;
+use crate::remote::session::protocol31_setup_error;
 use crate::transfer::*;
-use crate::{output, ProgressLog};
 
 pub(crate) fn execute_remote_push<T: Read + Write>(
     cli: &Cli,
@@ -162,7 +162,7 @@ pub(crate) fn execute_remote_push_protocol31_with_handshake<T: Read + Write>(
         writer.flush().map_err(protocol31_setup_error)?;
     }
     let (mut entries, batch_count) = {
-        let mut file_list_bytes = Vec::new();
+        let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
         let mut file_list_writer = Rsync31FileListWriter::new(rsync31_file_list_options_from_plan(
             plan,
             plan.update_mode == UpdateMode::Checksum,
@@ -176,18 +176,14 @@ pub(crate) fn execute_remote_push_protocol31_with_handshake<T: Read + Write>(
                 plan.max_alloc,
                 |batch| {
                     file_list_writer
-                        .write_batch(&mut file_list_bytes, &batch.entries)
+                        .write_batch(&mut writer, &batch.entries)
                         .map_err(protocol31_setup_error)?;
                     Ok(())
                 },
             )
             .context("local upload file-list batch exceeds allocation budget")?;
         file_list_writer
-            .finish(&mut file_list_bytes)
-            .map_err(protocol31_setup_error)?;
-        let mut writer = MultiplexedWriter::new(transport, RSYNC31_MUX_FRAME_SIZE);
-        writer
-            .write_all(&file_list_bytes)
+            .finish(&mut writer)
             .map_err(protocol31_setup_error)?;
         writer.flush().map_err(protocol31_setup_error)?;
         (collected_entries, collected_batch_count)
