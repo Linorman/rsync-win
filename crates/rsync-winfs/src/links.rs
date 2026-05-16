@@ -43,7 +43,7 @@ pub fn detect_link_capabilities() -> LinkCapabilities {
 
     let symlink_files = create_file_symlink(&source_file, &file_link).is_ok();
     let symlink_dirs = create_dir_symlink(&source_dir, &dir_link).is_ok();
-    let hardlinks = fs::hard_link(&source_file, &hard_link).is_ok();
+    let hardlinks = fs::hard_link(&source_file, hard_link).is_ok();
 
     let _ = fs::remove_dir_all(&root);
 

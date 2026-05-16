@@ -8,6 +8,7 @@ use super::progress::{FileProgress, RemoteCompressionConfig};
 use super::sum_head::{
     block_index_to_copy_token, block_span, copy_token_to_block_index, RemoteSumHead,
 };
+use std::cmp::Ordering;
 
 pub(crate) fn write_append_verify_file_tokens_from_path<T: Write>(
     transport: &mut T,
@@ -243,86 +244,89 @@ pub(crate) fn read_file_tokens_to_path_with_basis<T: Read>(
     loop {
         check_transfer_deadline(stop_deadline)?;
         let token = read_multiplexed_i32(transport, mux)?;
-        if token > 0 {
-            let literal_len = token as u64;
-            let next_total =
-                total
-                    .checked_add(literal_len)
-                    .ok_or(RemoteSessionError::FileLengthExceeded {
+        match token.cmp(&0) {
+            Ordering::Greater => {
+                let literal_len = token as u64;
+                let next_total = total.checked_add(literal_len).ok_or(
+                    RemoteSessionError::FileLengthExceeded {
                         path: path.display().to_string(),
                         expected: expected_len,
                         actual: u64::MAX,
-                    })?;
-            if next_total > expected_len {
-                return Err(RemoteSessionError::FileLengthExceeded {
-                    path: path.display().to_string(),
-                    expected: expected_len,
-                    actual: next_total,
+                    },
+                )?;
+                if next_total > expected_len {
+                    return Err(RemoteSessionError::FileLengthExceeded {
+                        path: path.display().to_string(),
+                        expected: expected_len,
+                        actual: next_total,
+                    }
+                    .into());
                 }
-                .into());
-            }
 
-            let mut remaining = token as usize;
-            while remaining > 0 {
-                let len = buf.len().min(remaining);
-                read_multiplexed_exact(transport, mux, &mut buf[..len])?;
-                output.write_all(&buf[..len])?;
-                remaining -= len;
-                total += len as u64;
+                let mut remaining = token as usize;
+                while remaining > 0 {
+                    let len = buf.len().min(remaining);
+                    read_multiplexed_exact(transport, mux, &mut buf[..len])?;
+                    output.write_all(&buf[..len])?;
+                    remaining -= len;
+                    total += len as u64;
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.advance(len as u64);
+                    }
+                }
+            }
+            Ordering::Equal => {
+                output.sync_all()?;
+                drop(output);
+                if total != expected_len {
+                    return Err(RemoteSessionError::FileLengthShort {
+                        path: path.display().to_string(),
+                        expected: expected_len,
+                        actual: total,
+                    }
+                    .into());
+                }
+                let mut remote_checksum = [0_u8; 16];
+                read_multiplexed_exact(transport, mux, &mut remote_checksum)?;
+                let local_checksum = remote_file_checksum_for_path(checksum, output_path)?;
+                if remote_checksum != local_checksum {
+                    return Err(RemoteSessionError::FileChecksumMismatch {
+                        path: path.display().to_string(),
+                    }
+                    .into());
+                }
+                return Ok(total);
+            }
+            Ordering::Less => {
+                let Some((basis_file, sum_head)) = basis_file.as_mut() else {
+                    return Err(RemoteSessionError::UnexpectedToken {
+                        token,
+                        path: path.display().to_string(),
+                    }
+                    .into());
+                };
+                let block_index = copy_token_to_block_index(token)?;
+                let bytes = read_basis_block(basis_file, *sum_head, block_index, path)?;
+                let next_total = total.checked_add(bytes.len() as u64).ok_or(
+                    RemoteSessionError::FileLengthExceeded {
+                        path: path.display().to_string(),
+                        expected: expected_len,
+                        actual: u64::MAX,
+                    },
+                )?;
+                if next_total > expected_len {
+                    return Err(RemoteSessionError::FileLengthExceeded {
+                        path: path.display().to_string(),
+                        expected: expected_len,
+                        actual: next_total,
+                    }
+                    .into());
+                }
+                output.write_all(&bytes)?;
+                total = next_total;
                 if let Some(progress) = progress.as_deref_mut() {
-                    progress.advance(len as u64);
+                    progress.advance(bytes.len() as u64);
                 }
-            }
-        } else if token == 0 {
-            output.sync_all()?;
-            drop(output);
-            if total != expected_len {
-                return Err(RemoteSessionError::FileLengthShort {
-                    path: path.display().to_string(),
-                    expected: expected_len,
-                    actual: total,
-                }
-                .into());
-            }
-            let mut remote_checksum = [0_u8; 16];
-            read_multiplexed_exact(transport, mux, &mut remote_checksum)?;
-            let local_checksum = remote_file_checksum_for_path(checksum, output_path)?;
-            if remote_checksum != local_checksum {
-                return Err(RemoteSessionError::FileChecksumMismatch {
-                    path: path.display().to_string(),
-                }
-                .into());
-            }
-            return Ok(total);
-        } else {
-            let Some((basis_file, sum_head)) = basis_file.as_mut() else {
-                return Err(RemoteSessionError::UnexpectedToken {
-                    token,
-                    path: path.display().to_string(),
-                }
-                .into());
-            };
-            let block_index = copy_token_to_block_index(token)?;
-            let bytes = read_basis_block(basis_file, *sum_head, block_index, path)?;
-            let next_total = total.checked_add(bytes.len() as u64).ok_or(
-                RemoteSessionError::FileLengthExceeded {
-                    path: path.display().to_string(),
-                    expected: expected_len,
-                    actual: u64::MAX,
-                },
-            )?;
-            if next_total > expected_len {
-                return Err(RemoteSessionError::FileLengthExceeded {
-                    path: path.display().to_string(),
-                    expected: expected_len,
-                    actual: next_total,
-                }
-                .into());
-            }
-            output.write_all(&bytes)?;
-            total = next_total;
-            if let Some(progress) = progress.as_deref_mut() {
-                progress.advance(bytes.len() as u64);
             }
         }
     }
